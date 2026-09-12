@@ -2,6 +2,7 @@ import { formatEndpoint, MINICODE_VERSION } from "@minicode/protocol";
 
 import type { CoreEndpoint } from "@minicode/protocol";
 import type { CoreConfig } from "./config.ts";
+import { PingHandler } from "./handlers/ping-handler.ts";
 import { createLogger } from "./logger.ts";
 import { createRpcDispatcher } from "./rpc-dispatcher.ts";
 import { NdjsonRpcServer } from "./transport/ndjson-server.ts";
@@ -24,7 +25,7 @@ export class CoreApp {
 
     this.#startedAt = performance.now();
     const dispatcher = createRpcDispatcher({
-      uptimeMs: () => performance.now() - this.#startedAt,
+      handlers: [new PingHandler({ uptimeMs: () => performance.now() - this.#startedAt })],
     });
     this.#server = new NdjsonRpcServer(this.#config, dispatcher, this.#logger);
     const endpoint = this.#server.start();

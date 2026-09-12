@@ -4,6 +4,7 @@ import { createConnection } from "node:net";
 import { JsonRpcErrorCode } from "@minicode/protocol";
 
 import type { CoreEndpoint } from "@minicode/protocol";
+import { PingHandler } from "../src/handlers/ping-handler.ts";
 import type { Logger } from "../src/logger.ts";
 import { createRpcDispatcher } from "../src/rpc-dispatcher.ts";
 import { MAX_FRAME_BYTES, NdjsonRpcServer } from "../src/transport/ndjson-server.ts";
@@ -17,8 +18,14 @@ const silentLogger: Logger = {
 
 const runningServers: NdjsonRpcServer[] = [];
 
+function createPingDispatcher() {
+  return createRpcDispatcher({
+    handlers: [new PingHandler({ uptimeMs: () => 1 })],
+  });
+}
+
 function startServer(): { readonly server: NdjsonRpcServer; readonly endpoint: CoreEndpoint } {
-  const dispatcher = createRpcDispatcher({ uptimeMs: () => 1 });
+  const dispatcher = createPingDispatcher();
   const server = new NdjsonRpcServer({ host: "127.0.0.1", port: 0 }, dispatcher, silentLogger);
   const endpoint = server.start();
   runningServers.push(server);
@@ -183,11 +190,7 @@ describe("NDJSON RPC server", () => {
 
   test("fails when another server already owns the endpoint", () => {
     const { endpoint } = startServer();
-    const second = new NdjsonRpcServer(
-      endpoint,
-      createRpcDispatcher({ uptimeMs: () => 1 }),
-      silentLogger,
-    );
+    const second = new NdjsonRpcServer(endpoint, createPingDispatcher(), silentLogger);
 
     expect(() => second.start()).toThrow();
   });

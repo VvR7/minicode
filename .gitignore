@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Bun
+.bun/
+bun-error.log*
+
+# Build and test output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Local runtime state
+.minicode/
+*.log
+tmp/
+temp/
+
+# Environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

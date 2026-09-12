@@ -32,6 +32,7 @@ export type RpcFrameHandler = (value: unknown) => Promise<JsonRpcDispatchResult>
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
+/** 创建一条 TCP 连接专属的输入缓冲、请求队列、写队列和关闭通知。 */
 function createConnectionState(): ConnectionState {
   let resolveClosed = (): void => {};
   const closed = new Promise<void>((resolve) => {
@@ -49,6 +50,7 @@ function createConnectionState(): ConnectionState {
   };
 }
 
+/** 合并已有的未完成输入与本次收到的字节，保留跨 TCP 回调的半帧。 */
 function concatenate(left: Uint8Array, right: Uint8Array): Uint8Array {
   const output = new Uint8Array(left.byteLength + right.byteLength);
   output.set(left);
@@ -56,10 +58,12 @@ function concatenate(left: Uint8Array, right: Uint8Array): Uint8Array {
   return output;
 }
 
+/** 将 JSON-RPC 响应编码为以换行符结尾的一条 UTF-8 NDJSON 帧。 */
 function encodeResponse(response: JsonRpcDispatchResult | JsonRpcErrorResponse): Uint8Array {
   return encoder.encode(`${JSON.stringify(response)}\n`);
 }
 
+/** 尽可能写出队列中的响应；遇到背压时由 socket 的 drain 回调继续。 */
 function flushWrites(socket: Bun.Socket<ConnectionState>): void {
   const state = socket.data;
   // socket.write 可能只接受部分字节；保留 offset，等 drain 回调继续写，避免截断 JSON 帧。
@@ -90,6 +94,7 @@ function flushWrites(socket: Bun.Socket<ConnectionState>): void {
   }
 }
 
+/** 将一个响应加入连接的写队列，并立即尝试发送。 */
 function enqueueResponse(
   socket: Bun.Socket<ConnectionState>,
   response: JsonRpcDispatchResult | JsonRpcErrorResponse,
@@ -98,6 +103,7 @@ function enqueueResponse(
   flushWrites(socket);
 }
 
+/** 将一条 UTF-8 NDJSON 帧解析为未知 JSON 值；编码或 JSON 无效时返回失败。 */
 function parseFrame(
   bytes: Uint8Array,
 ): { readonly ok: true; readonly value: unknown } | { readonly ok: false } {
@@ -108,6 +114,10 @@ function parseFrame(
   }
 }
 
+/**
+ * 提供 loopback TCP 上的 JSON-RPC NDJSON 服务。
+ * 每条连接独立排队，连接内串行处理，连接间可并发处理。
+ */
 export class NdjsonRpcServer {
   readonly #endpoint: CoreEndpoint;
   readonly #handler: RpcFrameHandler;
@@ -116,12 +126,14 @@ export class NdjsonRpcServer {
   #listener: Bun.TCPSocketListener | undefined;
   #stopping = false;
 
+  /** 保存监听地址、RPC 分发函数和生命周期日志记录器。 */
   constructor(endpoint: CoreEndpoint, handler: RpcFrameHandler, logger: Logger) {
     this.#endpoint = endpoint;
     this.#handler = handler;
     this.#logger = logger;
   }
 
+  /** 开始监听并注册各类 socket 回调；返回实际绑定的地址（端口为 0 时尤其有用）。 */
   start(): CoreEndpoint {
     if (this.#listener !== undefined) {
       throw new Error("server already started");
@@ -164,6 +176,7 @@ export class NdjsonRpcServer {
     return { host: this.#endpoint.host, port: this.#listener.port };
   }
 
+  /** 停止接收新连接，等待已入队请求完成，并在宽限期结束后强制关闭残留连接。 */
   async stop(graceMs = DEFAULT_SHUTDOWN_GRACE_MS): Promise<void> {
     if (this.#listener === undefined) {
       return;
@@ -197,6 +210,7 @@ export class NdjsonRpcServer {
     this.#stopping = false;
   }
 
+  /** 接收 TCP 字节流、切分 LF 结尾的帧，并将完整帧放入该连接的处理队列。 */
   #acceptData(socket: Bun.Socket<ConnectionState>, data: Uint8Array): void {
     const state = socket.data;
     if (!state.acceptingInput || this.#stopping) {
@@ -225,12 +239,14 @@ export class NdjsonRpcServer {
     this.#scheduleJobs(socket);
   }
 
+  /** 记录超限帧，清空输入，并停止该连接继续接收请求。 */
   #queueOversize(state: ConnectionState): void {
     state.jobs.push({ kind: "oversize" });
     state.input = new Uint8Array();
     state.acceptingInput = false;
   }
 
+  /** 串行执行已入队帧，并把解析、分发或内部异常映射为 JSON-RPC 响应。 */
   #scheduleJobs(socket: Bun.Socket<ConnectionState>): void {
     const state = socket.data;
     // 把新任务接到前一个 Promise 后，保证同一连接严格按帧顺序处理；不同连接各有队列。

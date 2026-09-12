@@ -32,6 +32,9 @@ jobs:
       - name: Type-check
         run: bun run typecheck
 
+      - name: Check wire protocol documentation
+        run: bun run protocol:docs:check
+
       - name: Test
         run: bun run test
 

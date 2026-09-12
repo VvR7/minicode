@@ -1,15 +1,19 @@
 {
   "name": "@minicode/core",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
   },
+  "bin": {
+    "mc-core": "./src/bin.ts"
+  },
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm --sourcemap=external"
+    "build": "bun build ./src/index.ts ./src/bin.ts --outdir ./dist --target bun --format esm --sourcemap=external"
   },
   "dependencies": {
-    "@minicode/protocol": "workspace:*"
+    "@minicode/protocol": "workspace:*",
+    "zod": "4.6.2"
   }
 }

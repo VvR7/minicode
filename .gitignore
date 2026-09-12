@@ -26,3 +26,6 @@ temp/
 .vscode/
 .DS_Store
 Thumbs.db
+
+AGENTS.md
+docs

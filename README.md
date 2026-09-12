@@ -60,8 +60,4 @@ bun run build
 
 ## 文档
 
-- [项目概览与原型调研](docs/03_Project_Overview.md)
 - [Wire protocol](WIRE_PROTOCOL.md)
-- [TypeScript 编码规范](docs/04_TypeScript_Coding_Standards.md)
-- [AI Issue 规划流程](docs/01_AI_Issue_Planning.md)
-- [AI Issue 开发流程](docs/02_AI_Issue_Development.md)

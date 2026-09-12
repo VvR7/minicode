@@ -52,6 +52,7 @@ function settleError(state: ClientState, message: string): void {
 
 function flushWrites(socket: Bun.Socket<ClientState>): void {
   const state = socket.data;
+  // 处理部分写入；未写完的部分由 drain 回调继续发送。
   while (state.writes.length > 0) {
     const pending = state.writes[0];
     if (pending === undefined) {
@@ -89,6 +90,7 @@ function processResponse(state: ClientState, requestId: JsonRpcId, startedAt: nu
 
   let raw: unknown;
   try {
+    // fatal UTF-8 decoder 会把无效字节视为协议错误，而不是替换为不可见字符后继续解析。
     raw = JSON.parse(decoder.decode(state.input.slice(0, newlineIndex))) as unknown;
   } catch {
     settleError(state, "core returned invalid JSON");
@@ -101,6 +103,7 @@ function processResponse(state: ClientState, requestId: JsonRpcId, startedAt: nu
     return;
   }
   if (response.data.id !== requestId) {
+    // 同一端口上的旧响应或错误实现不能被误认为本次 ping 的结果。
     settleError(state, "core returned a mismatched response id");
     return;
   }
@@ -197,6 +200,7 @@ export async function pingCore(
     timeout = setTimeout(() => {
       if (state !== undefined) {
         settleError(state, `ping timed out after ${timeoutMs}ms`);
+        // 超时必须主动释放 socket；否则仍在连接中的请求会遗留句柄并阻止 CLI 退出。
         state.socket?.terminate();
       }
     }, timeoutMs);

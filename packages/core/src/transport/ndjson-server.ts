@@ -62,6 +62,7 @@ function encodeResponse(response: JsonRpcDispatchResult | JsonRpcErrorResponse):
 
 function flushWrites(socket: Bun.Socket<ConnectionState>): void {
   const state = socket.data;
+  // socket.write 可能只接受部分字节；保留 offset，等 drain 回调继续写，避免截断 JSON 帧。
   while (state.writes.length > 0) {
     const pending = state.writes[0];
     if (pending === undefined) {
@@ -175,6 +176,7 @@ export class NdjsonRpcServer {
     const sockets = [...this.#activeSockets];
     for (const socket of sockets) {
       socket.data.acceptingInput = false;
+      // 已入队的请求仍要得到响应；处理完才半关闭连接，避免中途丢失响应。
       void socket.data.processing.finally(() => {
         socket.data.closeAfterWrites = true;
         flushWrites(socket);
@@ -202,6 +204,7 @@ export class NdjsonRpcServer {
     }
 
     state.input = concatenate(state.input, new Uint8Array(data));
+    // TCP 是字节流而不是消息流：一次 data 回调可能包含半帧或多帧，因此按 LF 自行切帧。
     while (state.acceptingInput) {
       const newlineIndex = state.input.indexOf(0x0a);
       if (newlineIndex === -1) {
@@ -230,6 +233,7 @@ export class NdjsonRpcServer {
 
   #scheduleJobs(socket: Bun.Socket<ConnectionState>): void {
     const state = socket.data;
+    // 把新任务接到前一个 Promise 后，保证同一连接严格按帧顺序处理；不同连接各有队列。
     state.processing = state.processing
       .then(async () => {
         while (state.jobs.length > 0) {

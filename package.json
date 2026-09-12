@@ -1,6 +1,6 @@
 {
   "name": "@minicode/root",
-  "version": "0.0.0",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "packageManager": "bun@1.4.2",
@@ -10,10 +10,14 @@
   "scripts": {
     "build": "bun run --workspaces --if-present build",
     "check": "biome check .",
+    "core": "bun run packages/core/src/bin.ts",
     "format": "biome format --write .",
     "format:check": "biome format .",
     "lint": "biome lint .",
-    "test": "bun test --pass-with-no-tests",
+    "ping": "bun run packages/cli/src/bin.ts",
+    "protocol:docs": "bun run packages/protocol/scripts/generate-wire-protocol.ts",
+    "protocol:docs:check": "bun run packages/protocol/scripts/generate-wire-protocol.ts --check",
+    "test": "bun test",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "devDependencies": {

@@ -73,7 +73,8 @@ parse。对 ID 使用 branded schema，避免把 `runId`、`sessionId` 和普通
 - 禁止跨包导入另一个包的 `src/` 深层路径，只能使用包的公开 exports。
 - `protocol` 不导入任何其他内部包；CLI/TUI 不导入 Core。
 - 领域逻辑依赖接口或函数参数，不读取进程级 singleton。
-- 文件名使用 `kebab-case.ts`，测试与源码同目录并命名为 `*.test.ts`。
+- 文件名使用 `kebab-case.ts`；源码放在 `src/`，测试放在独立的 `test/` 或根 `tests/` 目录，
+  并命名为 `*.test.ts`。
 - 避免 `utils.ts`、`helpers.ts` 等无边界集合；按领域能力命名。
 
 ## 6. 异步与资源生命周期
@@ -95,7 +96,7 @@ parse。对 ID 使用 branded schema，避免把 `runId`、`sessionId` 和普通
 
 ## 8. 测试要求
 
-- 使用 `bun:test`；单元测试与源码同目录，跨包/进程测试放在根 `tests/`。
+- 使用 `bun:test`；包级单元测试放在对应 package 的 `test/`，跨包/进程测试放在根 `tests/`。
 - 每个 Zod 边界同时测试成功和拒绝路径。
 - IPC 测试必须覆盖缺失/错误 session scope、跨会话事件泄漏和越权审批。
 - 异步测试必须验证取消、超时、断连和资源清理，不使用不稳定的固定 sleep。
@@ -119,6 +120,7 @@ bun install --frozen-lockfile
 bun run format:check
 bun run lint
 bun run typecheck
+bun run protocol:docs:check
 bun run test
 bun run build
 ```

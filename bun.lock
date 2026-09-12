@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "minicode",
+      "name": "@minicode/root",
       "devDependencies": {
         "@biomejs/biome": "2.5.13",
         "@types/bun": "1.4.2",
@@ -12,28 +12,35 @@
     },
     "packages/cli": {
       "name": "@minicode/cli",
-      "version": "0.0.0",
+      "version": "0.0.1",
+      "bin": {
+        "mc-ping": "./src/bin.ts",
+      },
       "dependencies": {
         "@minicode/protocol": "workspace:*",
       },
     },
     "packages/core": {
       "name": "@minicode/core",
-      "version": "0.0.0",
+      "version": "0.0.1",
+      "bin": {
+        "mc-core": "./src/bin.ts",
+      },
       "dependencies": {
         "@minicode/protocol": "workspace:*",
+        "zod": "4.6.2",
       },
     },
     "packages/protocol": {
       "name": "@minicode/protocol",
-      "version": "0.0.0",
+      "version": "0.0.1",
       "dependencies": {
         "zod": "4.6.2",
       },
     },
     "packages/tui": {
       "name": "@minicode/tui",
-      "version": "0.0.0",
+      "version": "0.0.1",
       "dependencies": {
         "@minicode/protocol": "workspace:*",
       },

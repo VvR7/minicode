@@ -29,7 +29,8 @@ token、工具调用、权限请求和状态事件可能被其他 TUI 收到，�
 minicode 后续设计 IPC、事件和权限系统时，必须把会话隔离作为验收要求：服务端和客户端都要
 验证事件归属，权限响应也不能只依赖一个工具调用 ID。具体方案留给相应 Issue 决定。
 
-## 当前脚手架边界
+## 当前实现边界
 
-仓库暂时建立 `protocol`、`core`、`cli`、`tui` 四个空 workspace，并配置 Bun、TypeScript、
-Biome、Zod、基础环境变量模板和 CI。当前不包含协议 schema、daemon、Agent 或前端实现。
+仓库建立了 `protocol`、`core`、`cli`、`tui` 四个 workspace，并配置 Bun、TypeScript、Biome、
+Zod、环境变量模板和 CI。当前仅实现前台 `mc-core` 与一次性 `mc-ping` 的 TCP/JSON-RPC 健康
+检查；事件流、会话、TUI 和 Agent 能力仍未实现。

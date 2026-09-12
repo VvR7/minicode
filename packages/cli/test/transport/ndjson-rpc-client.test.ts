@@ -2,8 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { createServer } from "node:net";
 
 import type { Socket } from "node:net";
-import type { CoreEndpoint } from "@minicode/protocol";
-import { pingCore, PingClientError } from "../src/ping-client.ts";
+import { CORE_PING_METHOD, PongResultSchema } from "@minicode/protocol";
+
+import type { CoreEndpoint, JsonRpcId } from "@minicode/protocol";
+import { NdjsonRpcClient, RpcClientError } from "../../src/transport/ndjson-rpc-client.ts";
 
 interface MockServer {
   readonly endpoint: CoreEndpoint;
@@ -17,6 +19,19 @@ interface RawRequest extends Record<string, unknown> {
 }
 
 const mockServers: MockServer[] = [];
+
+function pingCore(
+  endpoint: CoreEndpoint,
+  options: { readonly timeoutMs?: number; readonly requestId?: JsonRpcId } = {},
+) {
+  const client = new NdjsonRpcClient(endpoint, options);
+  return client.request(
+    CORE_PING_METHOD,
+    { clientName: "mc-ping", clientVersion: "0.0.1" },
+    PongResultSchema,
+    options,
+  );
+}
 
 async function startMockServer(
   respond: (request: RawRequest, socket: Socket) => void,
@@ -65,7 +80,7 @@ afterEach(async () => {
   await Promise.all(mockServers.splice(0).map((server) => server.close()));
 });
 
-describe("ping client", () => {
+describe("NDJSON RPC client", () => {
   test("returns a valid pong and checks the request shape", async () => {
     const server = await startMockServer((request, socket) => {
       expect(request.method).toBe("core.ping");
@@ -147,11 +162,11 @@ describe("ping client", () => {
       await pingCore(server.endpoint, { timeoutMs: 30 });
       throw new Error("expected ping to time out");
     } catch (error) {
-      expect(error).toBeInstanceOf(PingClientError);
-      if (!(error instanceof PingClientError)) {
+      expect(error).toBeInstanceOf(RpcClientError);
+      if (!(error instanceof RpcClientError)) {
         throw error;
       }
-      expect(error.message).toContain("timed out after 30ms");
+      expect(error.message).toContain("request timed out after 30ms");
     }
   });
 });

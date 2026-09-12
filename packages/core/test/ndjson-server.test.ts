@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createConnection } from "node:net";
 
-import { JsonRpcErrorCode } from "@minicode/protocol";
+import { JsonRpcErrorCode, MAX_JSON_RPC_FRAME_BYTES } from "@minicode/protocol";
 
 import type { CoreEndpoint } from "@minicode/protocol";
 import { PingHandler } from "../src/handlers/ping-handler.ts";
 import type { Logger } from "../src/logger.ts";
 import { createRpcDispatcher } from "../src/rpc-dispatcher.ts";
-import { MAX_FRAME_BYTES, NdjsonRpcServer } from "../src/transport/ndjson-server.ts";
+import { NdjsonRpcServer } from "../src/transport/ndjson-server.ts";
 
 const silentLogger: Logger = {
   debug: () => {},
@@ -181,7 +181,7 @@ describe("NDJSON RPC server", () => {
 
   test("rejects an oversized frame and closes the connection", async () => {
     const { endpoint } = startServer();
-    const response = await exchange(endpoint, `${"x".repeat(MAX_FRAME_BYTES + 1)}\n`, 1);
+    const response = await exchange(endpoint, `${"x".repeat(MAX_JSON_RPC_FRAME_BYTES + 1)}\n`, 1);
     const parsed = JSON.parse(response[0] ?? "null");
 
     expect(parsed.error.code).toBe(JsonRpcErrorCode.invalidRequest);

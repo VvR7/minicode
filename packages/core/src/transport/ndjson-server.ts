@@ -1,5 +1,5 @@
 // 导入协议层定义的标准错误码，以及构造 JSON-RPC 错误响应的函数。
-import { JsonRpcErrorCode, makeJsonRpcError } from "@minicode/protocol";
+import { JsonRpcErrorCode, makeJsonRpcError, MAX_JSON_RPC_FRAME_BYTES } from "@minicode/protocol";
 
 // 这里只导入类型；编译后的 JavaScript 不会包含这些导入。
 import type { CoreEndpoint, JsonRpcErrorResponse } from "@minicode/protocol";
@@ -9,7 +9,6 @@ import type { Logger } from "../logger.ts";
 import type { JsonRpcDispatchResult } from "../rpc-dispatcher.ts";
 
 // 单条 NDJSON 请求的最大字节数：1 MiB，防止无限制占用内存。
-export const MAX_FRAME_BYTES = 1024 * 1024;
 // 停止服务时，最多等待在途请求与连接关闭的时间。
 export const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
 
@@ -310,13 +309,13 @@ export class NdjsonRpcServer {
       // 没有 LF 表示当前只有半帧，需要保留到下一次 data 回调。
       if (newlineIndex === -1) {
         // 无 LF 的半帧也不能无限增长，超过限制即拒绝。
-        if (state.input.byteLength > MAX_FRAME_BYTES) {
+        if (state.input.byteLength > MAX_JSON_RPC_FRAME_BYTES) {
           this.#queueOversize(state);
         }
         break;
       }
 
-      if (newlineIndex > MAX_FRAME_BYTES) {
+      if (newlineIndex > MAX_JSON_RPC_FRAME_BYTES) {
         this.#queueOversize(state);
         break;
       }

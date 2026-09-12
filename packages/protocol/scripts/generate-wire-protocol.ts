@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   JsonRpcErrorResponseSchema,
   JsonRpcRequestEnvelopeSchema,
+  MAX_JSON_RPC_FRAME_BYTES,
   PingParamsSchema,
   PingRequestSchema,
   PingSuccessResponseSchema,
@@ -16,6 +17,7 @@ function schemaBlock(name: string, schema: z.ZodType): string {
 }
 
 export function renderWireProtocol(): string {
+  const maxFrameMiB = MAX_JSON_RPC_FRAME_BYTES / (1024 * 1024);
   const schemas = [
     schemaBlock("JsonRpcRequestEnvelope", JsonRpcRequestEnvelopeSchema),
     schemaBlock("PingParams", PingParamsSchema),
@@ -35,7 +37,7 @@ export function renderWireProtocol(): string {
 - TCP loopback only: \`127.0.0.1:7437\` by default, configurable with
   \`MINICODE_CORE_HOST\` / \`MINICODE_CORE_PORT\`.
 - UTF-8 NDJSON: one non-empty JSON value per LF-terminated frame; CRLF is accepted.
-- Maximum payload is 1 MiB per frame, excluding the newline delimiter.
+- Maximum payload is ${maxFrameMiB} MiB per frame, excluding the newline delimiter.
 - A Core connection accepts multiple requests serially. \`mc-ping\` sends one request and closes.
 
 ## JSON-RPC profile

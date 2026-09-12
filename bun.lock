@@ -18,6 +18,7 @@
       },
       "dependencies": {
         "@minicode/protocol": "workspace:*",
+        "zod": "4.6.2",
       },
     },
     "packages/core": {

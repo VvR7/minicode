@@ -79,6 +79,29 @@ parse。对 ID 使用 branded schema，避免把 `runId`、`sessionId` 和普通
   “为什么”；不为名称和控制流已清晰的语句逐行重复代码含义。
 - 避免 `utils.ts`、`helpers.ts` 等无边界集合；按领域能力命名。
 
+各前端与 Core 按职责组织目录，入口文件不承载具体功能：
+
+```text
+packages/cli/src/
+  bin.ts          # 只负责进程入口和参数/配置边界
+  commands/       # 每个 CLI 命令的处理流程
+  transport/      # 所有命令共用的 Core IPC 客户端
+
+packages/core/src/
+  app.ts          # 组合并注册依赖
+  handlers/       # 每个 RPC method 的独立 handler
+  transport/      # TCP/NDJSON server 等传输实现
+
+packages/tui/src/
+  app.ts          # TUI 组合入口
+  screens/        # 页面级交互流程
+  widgets/        # 可复用终端组件
+  transport/      # TUI 共用的 Core IPC 客户端
+```
+
+如果 CLI 与 TUI 需要共享完整的持久连接客户端，应提取独立 workspace；禁止在不同命令、页面中
+复制 TCP 分帧、超时、背压或 JSON-RPC 响应匹配代码。
+
 ## 6. 异步与资源生命周期
 
 - 所有可能阻塞的 I/O 使用异步 API。

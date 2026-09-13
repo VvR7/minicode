@@ -17,7 +17,11 @@
     "ping": "bun run packages/cli/src/bin.ts",
     "protocol:docs": "bun run packages/protocol/scripts/generate-wire-protocol.ts",
     "protocol:docs:check": "bun run packages/protocol/scripts/generate-wire-protocol.ts --check",
-    "test": "bun test",
+    "test": "bun test packages tests/integration",
+    "test:coverage": "bun test packages tests/integration --coverage",
+    "test:integration": "bun test tests/integration",
+    "test:unit": "bun test packages",
+    "coverage:check": "bun run scripts/check-coverage.ts",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "devDependencies": {

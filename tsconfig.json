@@ -22,6 +22,6 @@
     "useUnknownInCatchVariables": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["packages/**/*.ts"],
+  "include": ["packages/**/*.ts", "scripts/**/*.ts", "tests/**/*.ts"],
   "exclude": ["**/dist/**", "node_modules"]
 }

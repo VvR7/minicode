@@ -229,6 +229,40 @@ describe("NDJSON RPC client", () => {
     connection.close();
   });
 
+  test("delivers a coalesced notification after the preceding response continuation", async () => {
+    const server = await startMockServer((request, socket) => {
+      socket.write(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: {
+            serverVersion: "0.0.1",
+            uptimeMs: 1,
+            receivedAt: "2026-09-13T08:00:00.000Z",
+          },
+        })}\n${JSON.stringify({
+          jsonrpc: "2.0",
+          method: "event.push",
+          params: { subscriptionId: "subscription-1", event: { sequence: 1 } },
+        })}\n`,
+      );
+    });
+    const connection = await NdjsonRpcConnection.connect(server.endpoint);
+    const order: string[] = [];
+    const received = Promise.withResolvers<void>();
+
+    await connection.request(CORE_PING_METHOD, {}, PongResultSchema, { requestId: "ordered" });
+    order.push("response");
+    connection.onNotification(() => {
+      order.push("notification");
+      received.resolve();
+    });
+    await received.promise;
+
+    expect(order).toEqual(["response", "notification"]);
+    connection.close();
+  });
+
   test("rejects every pending request when the persistent socket disconnects", async () => {
     let requestCount = 0;
     const server = await startMockServer((_request, socket) => {

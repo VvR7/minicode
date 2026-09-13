@@ -161,13 +161,17 @@ function dispatchNotification(state: ClientState, raw: unknown): boolean {
   if (!notification.success) {
     return false;
   }
-  for (const listener of state.notificationListeners) {
-    try {
-      listener(notification.data);
-    } catch {
-      // 一个 UI listener 的异常不能破坏连接，也不能影响其他 listener。
+  // response Promise 的 continuation 已在解析前一帧时入微任务队列；通知随后排队，
+  // 让调用方能先拿到 agent.run 的 subscriptionId，再注册首事件 listener。
+  queueMicrotask(() => {
+    for (const listener of state.notificationListeners) {
+      try {
+        listener(notification.data);
+      } catch {
+        // 一个 UI listener 的异常不能破坏连接，也不能影响其他 listener。
+      }
     }
-  }
+  });
   return true;
 }
 

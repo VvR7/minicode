@@ -64,12 +64,7 @@ describe("typed IPC event stream", () => {
     const endpoint = server.start();
     const connection = await NdjsonRpcConnection.connect(endpoint);
     const eventReceived = Promise.withResolvers<EventPushNotification>();
-    const unsubscribe = connection.onNotification((notification) => {
-      const parsed = EventPushNotificationSchema.safeParse(notification);
-      if (parsed.success) {
-        eventReceived.resolve(parsed.data);
-      }
-    });
+    let unsubscribe = (): void => {};
 
     try {
       const response = await connection.request(
@@ -78,6 +73,12 @@ describe("typed IPC event stream", () => {
         AgentRunResultSchema,
         { requestId: "run-request" },
       );
+      unsubscribe = connection.onNotification((notification) => {
+        const parsed = EventPushNotificationSchema.safeParse(notification);
+        if (parsed.success) {
+          eventReceived.resolve(parsed.data);
+        }
+      });
       const notification = await eventReceived.promise;
 
       expect(response.result).toEqual({ status: "accepted", sessionId, runId, subscriptionId });

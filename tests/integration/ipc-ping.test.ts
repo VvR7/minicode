@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { createServer, createConnection } from "node:net";
 import { fileURLToPath } from "node:url";
 
-const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
-const coreBin = fileURLToPath(new URL("../packages/core/src/bin.ts", import.meta.url));
-const pingBin = fileURLToPath(new URL("../packages/cli/src/bin.ts", import.meta.url));
+const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
+const coreBin = fileURLToPath(new URL("../../packages/core/src/bin.ts", import.meta.url));
+const pingBin = fileURLToPath(new URL("../../packages/cli/src/bin.ts", import.meta.url));
 
 async function getFreePort(): Promise<number> {
   const server = createServer();

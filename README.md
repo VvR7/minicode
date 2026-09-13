@@ -43,9 +43,16 @@ bun run format:check
 bun run lint
 bun run typecheck
 bun run protocol:docs:check
-bun run test
+bun run test:unit
+bun run test:integration
+bun run test:coverage
+bun run coverage:check
 bun run build
 ```
+
+`test:coverage` 会生成 text 与 LCOV 报告；`coverage:check` 要求所有生产源码进入
+LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run test` 仍可用于一次运行全部
+单元测试和集成测试。
 
 需要自动修复格式时运行 `bun run format`。
 

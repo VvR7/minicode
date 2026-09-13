@@ -25,6 +25,12 @@ export interface CoverageEvaluation extends CoverageSummary {
   readonly missingFiles: readonly string[];
 }
 
+export interface CoveragePolicyResult {
+  readonly functionPercent: number;
+  readonly linePercent: number;
+  readonly violations: readonly string[];
+}
+
 export class CoverageReportError extends Error {
   override readonly name = "CoverageReportError";
 }
@@ -135,7 +141,36 @@ export function evaluateCoverage(
 }
 
 function percent(counts: CoverageCounts): number {
-  return counts.total === 0 ? 100 : (counts.found / counts.total) * 100;
+  return counts.total === 0 ? 0 : (counts.found / counts.total) * 100;
+}
+
+/** 对聚合分母采用 fail-closed，单个纯类型文件仍可合法地贡献零个可执行项。 */
+export function assessCoveragePolicy(
+  evaluation: CoverageEvaluation,
+  productionFileCount: number,
+): CoveragePolicyResult {
+  const linePercent = percent(evaluation.lines);
+  const functionPercent = percent(evaluation.functions);
+  const violations: string[] = [];
+
+  if (productionFileCount === 0) {
+    violations.push("no production source files were discovered");
+  }
+  if (evaluation.missingFiles.length > 0) {
+    violations.push(`${evaluation.missingFiles.length} production file(s) are missing from LCOV`);
+  }
+  if (evaluation.lines.total === 0) {
+    violations.push("aggregate line coverage denominator is zero");
+  } else if (linePercent < MINIMUM_COVERAGE_PERCENT) {
+    violations.push(`line coverage is below ${MINIMUM_COVERAGE_PERCENT}%`);
+  }
+  if (evaluation.functions.total === 0) {
+    violations.push("aggregate function coverage denominator is zero");
+  } else if (functionPercent < MINIMUM_COVERAGE_PERCENT) {
+    violations.push(`function coverage is below ${MINIMUM_COVERAGE_PERCENT}%`);
+  }
+
+  return { functionPercent, linePercent, violations };
 }
 
 export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise<number> {
@@ -163,6 +198,7 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
     return 1;
   }
   const evaluation = evaluateCoverage(productionFiles, records);
+  const policy = assessCoveragePolicy(evaluation, productionFiles.length);
 
   if (evaluation.missingFiles.length > 0) {
     console.error("coverage error: production files missing from LCOV:");
@@ -171,20 +207,14 @@ export async function main(args: readonly string[] = Bun.argv.slice(2)): Promise
     }
   }
 
-  const linePercent = percent(evaluation.lines);
-  const functionPercent = percent(evaluation.functions);
   console.log(
-    `coverage: lines=${linePercent.toFixed(2)}% functions=${functionPercent.toFixed(2)}% files=${productionFiles.length}`,
+    `coverage: lines=${policy.linePercent.toFixed(2)}% functions=${policy.functionPercent.toFixed(2)}% files=${productionFiles.length}`,
   );
 
-  const belowThreshold =
-    linePercent < MINIMUM_COVERAGE_PERCENT || functionPercent < MINIMUM_COVERAGE_PERCENT;
-  if (belowThreshold) {
-    console.error(
-      `coverage error: lines and functions must each be at least ${MINIMUM_COVERAGE_PERCENT}%`,
-    );
+  for (const violation of policy.violations) {
+    console.error(`coverage error: ${violation}`);
   }
-  return evaluation.missingFiles.length > 0 || belowThreshold ? 1 : 0;
+  return policy.violations.length > 0 ? 1 : 0;
 }
 
 if (import.meta.main) {

@@ -11,6 +11,12 @@ import type { ExecutionContext, FailedReason, RunFinishReason } from "./context.
 export const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful coding agent. Use the provided read-only tools to inspect the workspace, then respond with your final answer in plain text.";
 
+/**
+ * AgentRunner 用该 reason abort 信号表示“整 run 超时”而非用户取消；
+ * loop 据此区分 cancelled 与 run_timeout。
+ */
+export const RUN_TIMEOUT_REASON = "run-timeout";
+
 /** 协议层 llm.text_delta 的单事件文本上限（字符数），超出时按此分段发布。 */
 const MAX_TEXT_DELTA_CHARS = 16 * 1024;
 /** run.finished.finalText 的协议层上限（字符数）。 */
@@ -105,8 +111,13 @@ export class AgentLoop {
           outcome = await this.#runStep(context, signal);
         } catch (error) {
           if (signal.aborted) {
-            context.markCancelled();
-            outcome = "cancelled";
+            if (signal.reason === RUN_TIMEOUT_REASON) {
+              context.markFailed("run_timeout");
+              outcome = "failed";
+            } else {
+              context.markCancelled();
+              outcome = "cancelled";
+            }
           } else {
             context.markFailed(this.#mapError(error));
             outcome = "failed";

@@ -1,4 +1,6 @@
-import { readdir, realpath, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, readdir, realpath } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Dirent, Stats } from "node:fs";
 import { ToolError } from "./types.ts";
@@ -118,39 +120,35 @@ export interface TextFileContent {
  * stream 解码避免截断位置的多字节序列被误判为无效 UTF-8。
  */
 export async function readTextFileSafe(path: string, limitBytes: number): Promise<TextFileContent> {
-  // Bun.file().size 对不存在文件返回 0 而不抛错，因此先用 stat 校验存在性与类型。
-  let info: Stats;
+  // O_NOFOLLOW + 同一 FileHandle 的 fstat/read 消除 realpath 校验与实际读取之间的末端 symlink 竞态。
+  let handle: FileHandle;
   try {
-    info = await stat(path);
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
     if (isNotFound(error)) {
       throw new ToolError("not_found", "file not found");
     }
     throw new ToolError("io_error", "failed to read file", true);
   }
-  if (!info.isFile()) {
-    throw new ToolError("invalid_params", "path does not refer to a file");
-  }
-
-  let buffer: ArrayBuffer;
   try {
-    buffer = await Bun.file(path).slice(0, limitBytes).arrayBuffer();
-  } catch (error) {
-    if (isNotFound(error)) {
-      throw new ToolError("not_found", "file not found");
+    const info: Stats = await handle.stat();
+    if (!info.isFile()) {
+      throw new ToolError("invalid_params", "path does not refer to a file");
     }
-    throw new ToolError("io_error", "failed to read file", true);
+    const bytes = new Uint8Array(Math.min(info.size, limitBytes));
+    await handle.read(bytes, 0, bytes.byteLength, 0);
+    if (isBinary(bytes)) {
+      throw new ToolError("binary_file", "file appears to be binary");
+    }
+    let text: string;
+    try {
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      text = decoder.decode(bytes, { stream: true }) + decoder.decode();
+    } catch {
+      throw new ToolError("invalid_utf8", "file is not valid UTF-8");
+    }
+    return { text, outputBytes: info.size, truncated: info.size > limitBytes };
+  } finally {
+    await handle.close();
   }
-
-  const bytes = new Uint8Array(buffer);
-  if (isBinary(bytes)) {
-    throw new ToolError("binary_file", "file appears to be binary");
-  }
-  let text: string;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes, { stream: true });
-  } catch {
-    throw new ToolError("invalid_utf8", "file is not valid UTF-8");
-  }
-  return { text, outputBytes: info.size, truncated: info.size > limitBytes };
 }

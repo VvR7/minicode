@@ -15,8 +15,10 @@
       "version": "0.1.0",
       "bin": {
         "mc-ping": "./src/bin.ts",
+        "mc": "./src/mc.ts",
       },
       "dependencies": {
+        "@minicode/core": "workspace:*",
         "@minicode/protocol": "workspace:*",
         "zod": "4.6.2",
       },

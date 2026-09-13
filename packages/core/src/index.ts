@@ -8,4 +8,5 @@ export * from "./rpc-context.ts";
 export * from "./rpc-dispatcher.ts";
 export * from "./run/index.ts";
 export * from "./tools/index.ts";
+export * from "./transport/ndjson-rpc-client.ts";
 export * from "./transport/ndjson-server.ts";

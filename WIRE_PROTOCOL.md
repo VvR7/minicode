@@ -31,6 +31,20 @@
 - Event sequence numbers are positive and scoped to a run; durable events can be replayed by a
   later event-store implementation.
 
+`agent.run` request (the response identifies the session, run, and initial subscription):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "550e8400-e29b-41d4-a716-446655440001",
+  "method": "agent.run",
+  "params": {
+    "goal": "Summarize the README",
+    "workspaceRoot": "/absolute/path/to/workspace"
+  }
+}
+```
+
 ## Ping
 
 Request:
@@ -42,7 +56,7 @@ Request:
   "method": "core.ping",
   "params": {
     "clientName": "mc-ping",
-    "clientVersion": "0.0.1"
+    "clientVersion": "0.1.0"
   }
 }
 ```
@@ -54,7 +68,7 @@ Success response:
   "jsonrpc": "2.0",
   "id": "550e8400-e29b-41d4-a716-446655440000",
   "result": {
-    "serverVersion": "0.0.1",
+    "serverVersion": "0.1.0",
     "uptimeMs": 12,
     "receivedAt": "2026-09-12T06:00:00.000Z"
   }

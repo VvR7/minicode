@@ -45,6 +45,18 @@ class ImmediateExecutor implements RunExecutor {
   }
 }
 
+/** 激活后失败的 executor，用于验证 manager 不产生未处理拒绝。 */
+class RejectExecutor implements RunExecutor {
+  async run(
+    _request: AgentRunRequest,
+    _signal: AbortSignal,
+    onStarted: () => Promise<void> = async () => {},
+  ): Promise<void> {
+    await onStarted();
+    throw new Error("boom");
+  }
+}
+
 function request(sessionId = SESSION_A, runId = RUN_A): AgentRunRequest {
   return { sessionId, runId, goal: "x", workspaceRoot: "/workspace" };
 }
@@ -87,6 +99,15 @@ describe("RunManager", () => {
     activate();
     await flushMicrotasks();
 
+    expect(manager.activeCount).toBe(0);
+    expect(manager.cancel(SESSION_A, RUN_A)).toBe("already_finished");
+  });
+
+  test("cleans up a rejected executor without an unhandled rejection", async () => {
+    const manager = new RunManager(new RejectExecutor());
+    const activate = await manager.start(request());
+    activate();
+    await flushMicrotasks();
     expect(manager.activeCount).toBe(0);
     expect(manager.cancel(SESSION_A, RUN_A)).toBe("already_finished");
   });

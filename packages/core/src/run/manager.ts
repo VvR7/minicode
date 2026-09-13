@@ -76,10 +76,12 @@ export class RunManager {
       },
       (error) => rejectStarted(error),
     );
-    void promise.finally(() => {
+    const cleanup = (): void => {
       this.#active.delete(key);
       this.#finished.add(key);
-    });
+    };
+    // 同时处理成功与失败，避免 finally 派生出无人接管的 rejected Promise。
+    void promise.then(cleanup, cleanup);
     return started.then(() => releaseRun);
   }
 

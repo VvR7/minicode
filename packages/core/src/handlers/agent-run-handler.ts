@@ -49,6 +49,8 @@ export class AgentRunHandler extends RpcMethodHandler {
         workspaceRoot: params.data.workspaceRoot,
       });
       const activateSubscription = subscribed.value.afterResponseEnqueued;
+      // response 尚未入队连接就关闭时，订阅关闭负责放行 run；普通断连不取消执行。
+      void subscribed.value.closed.then(() => activateRun());
       const result: AgentRunResult = {
         status: "accepted",
         sessionId,

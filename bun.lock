@@ -12,7 +12,7 @@
     },
     "packages/cli": {
       "name": "@minicode/cli",
-      "version": "0.0.1",
+      "version": "0.1.0",
       "bin": {
         "mc-ping": "./src/bin.ts",
       },
@@ -23,7 +23,7 @@
     },
     "packages/core": {
       "name": "@minicode/core",
-      "version": "0.0.1",
+      "version": "0.1.0",
       "bin": {
         "mc-core": "./src/bin.ts",
       },
@@ -34,14 +34,14 @@
     },
     "packages/protocol": {
       "name": "@minicode/protocol",
-      "version": "0.0.1",
+      "version": "0.1.0",
       "dependencies": {
         "zod": "4.6.2",
       },
     },
     "packages/tui": {
       "name": "@minicode/tui",
-      "version": "0.0.1",
+      "version": "0.1.0",
       "dependencies": {
         "@minicode/protocol": "workspace:*",
       },

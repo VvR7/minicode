@@ -94,7 +94,7 @@ describe("mc-core and mc-ping processes", () => {
 
         expect(ping.exitCode).toBe(0);
         expect(ping.stderr).toBe("");
-        expect(ping.stdout).toMatch(/^pong server=0\.0\.1 uptime=\d+ms latency=\d+ms\n$/);
+        expect(ping.stdout).toMatch(/^pong server=0\.1\.0 uptime=\d+ms latency=\d+ms\n$/);
 
         core.kill(signal);
         expect(await core.exited).toBe(0);

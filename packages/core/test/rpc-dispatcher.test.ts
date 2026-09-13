@@ -65,7 +65,7 @@ describe("RPC dispatcher", () => {
         jsonrpc: "2.0",
         id: 7,
         result: {
-          serverVersion: "0.0.1",
+          serverVersion: "0.1.0",
           uptimeMs: 12,
           receivedAt: "2026-09-12T06:00:00.000Z",
         },

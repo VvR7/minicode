@@ -372,7 +372,8 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
           subscriptionId = response.result.subscriptionId;
           // Ctrl-C 可能发生在断线期间；每次重连后幂等补发取消请求。
           if (cancelledByUser) {
-            await requestCancel();
+            // 不等待响应，确保 replay notification 到达前 drain 已注册 listener。
+            void requestCancel();
           }
         }
 

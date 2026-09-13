@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { open, readdir, realpath } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Dirent, Stats } from "node:fs";
 import { ToolError } from "./types.ts";
 
@@ -49,14 +49,34 @@ export async function resolveSafePath(workspaceRoot: string, inputPath: string):
     throw new ToolError("path_escape", "path escapes the workspace");
   }
 
-  // realpath 解析 symlink 并校验最终落在 workspace 内；目标不存在时交给调用方处理。
-  let realRoot: string;
+  // realpath 解析 symlink 并校验最终落在 workspace 内；目标不存在时仍校验最近存在的父目录。
+  let realRoot = workspaceRoot;
   let realTarget: string;
   try {
     realRoot = await realpath(workspaceRoot);
     realTarget = await realpath(resolved);
   } catch (error) {
     if (isNotFound(error)) {
+      let ancestor = dirname(resolved);
+      while (ancestor !== dirname(ancestor)) {
+        try {
+          const realAncestor = await realpath(ancestor);
+          const ancestorRelative = relative(realRoot, realAncestor);
+          if (
+            ancestorRelative === ".." ||
+            ancestorRelative.startsWith(`..${sep}`) ||
+            isAbsolute(ancestorRelative)
+          ) {
+            throw new ToolError("path_escape", "path resolves outside the workspace");
+          }
+          return resolved;
+        } catch (ancestorError) {
+          if (!isNotFound(ancestorError)) {
+            throw ancestorError;
+          }
+          ancestor = dirname(ancestor);
+        }
+      }
       return resolved;
     }
     throw new ToolError("io_error", "failed to resolve path", true);

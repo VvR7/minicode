@@ -35,6 +35,7 @@ bun run ping
 
 Core 默认监听 `127.0.0.1:7437`。可通过 `.env` 中的 `MINICODE_CORE_HOST` 和
 `MINICODE_CORE_PORT` 修改 loopback 地址；当前不允许监听非本机地址。
+持久化事件默认写入 `~/.minicode`，可通过绝对路径 `MINICODE_HOME` 覆盖。
 
 提交前运行：
 

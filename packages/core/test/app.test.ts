@@ -4,14 +4,21 @@ import { CoreApp } from "../src/app.ts";
 
 describe("CoreApp", () => {
   test("starts once and stops idempotently", async () => {
-    const app = new CoreApp({ host: "127.0.0.1", port: 0, logLevel: "error" });
+    const app = new CoreApp({
+      host: "127.0.0.1",
+      port: 0,
+      logLevel: "error",
+      homeDirectory: "/tmp/minicode-core-test",
+    });
 
     const endpoint = app.start();
+    expect(app.eventBus).toBeDefined();
     expect(endpoint.host).toBe("127.0.0.1");
     expect(endpoint.port).toBeGreaterThan(0);
     expect(() => app.start()).toThrow("core already started");
 
     await app.stop();
     await app.stop();
+    expect(() => app.eventBus).toThrow("core is not started");
   });
 });

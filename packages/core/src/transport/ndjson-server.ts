@@ -19,6 +19,8 @@ type OutboundMessage = JsonRpcSuccessEnvelope | JsonRpcErrorResponse | JsonRpcNo
 // 单条 NDJSON 请求的最大字节数：1 MiB，防止无限制占用内存。
 // 停止服务时，最多等待在途请求与连接关闭的时间。
 export const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
+export const MAX_CONNECTION_WRITE_FRAMES = 256;
+export const MAX_CONNECTION_WRITE_BYTES = 4 * 1024 * 1024;
 
 // 队列中的工作项：要么是一条完整帧，要么是已经确认超限的输入。
 type FrameJob =
@@ -45,6 +47,8 @@ interface ConnectionState {
   processing: Promise<void>;
   // writes 保存等待写入或因背压未写完的响应。
   readonly writes: PendingWrite[];
+  // queuedWriteBytes 统计尚未交给内核的出站字节，用于隔离慢客户端。
+  queuedWriteBytes: number;
   // true 表示写队列清空后应调用 socket.end()。
   closeAfterWrites: boolean;
   // false 后不再从客户端接受新的请求字节。
@@ -97,6 +101,7 @@ function createConnectionState(socket: Bun.Socket<ConnectionState>): ConnectionS
     processing: Promise.resolve(),
     // 新连接还没有等待发送的响应。
     writes: [],
+    queuedWriteBytes: 0,
     // 默认不会在写完后关闭连接。
     closeAfterWrites: false,
     // 默认允许客户端发送请求。
@@ -151,10 +156,12 @@ function flushWrites(socket: Bun.Socket<ConnectionState>): void {
     // 小于 0 表示写入失败，无法安全恢复，因此丢弃队列并立即终止连接。
     if (written < 0) {
       state.writes.length = 0;
+      state.queuedWriteBytes = 0;
       socket.terminate();
       return;
     }
     pending.offset += written;
+    state.queuedWriteBytes -= written;
     // 没写完时返回；Bun 稍后会调用 drain，届时继续写。
     if (pending.offset < pending.bytes.byteLength) {
       return;
@@ -179,8 +186,15 @@ function enqueueMessage(socket: Bun.Socket<ConnectionState>, message: OutboundMe
   if (bytes.byteLength - 1 > MAX_JSON_RPC_FRAME_BYTES) {
     return false;
   }
+  if (
+    state.writes.length >= MAX_CONNECTION_WRITE_FRAMES ||
+    state.queuedWriteBytes + bytes.byteLength > MAX_CONNECTION_WRITE_BYTES
+  ) {
+    return false;
+  }
   // 先把响应转为字节并加入队尾，保持响应顺序与请求顺序一致。
   state.writes.push({ bytes, offset: 0 });
+  state.queuedWriteBytes += bytes.byteLength;
   // 若 socket 当前可写，立即开始发送。
   flushWrites(socket);
   return true;

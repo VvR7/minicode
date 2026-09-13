@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { NdjsonRpcConnection } from "../../packages/cli/src/index.ts";
 import type { RpcInvocationContext } from "../../packages/core/src/index.ts";
 import {
+  CoreApp,
   createRpcDispatcher,
   NdjsonRpcServer,
   RpcMethodHandler,
@@ -11,7 +15,11 @@ import type { EventPushNotification } from "../../packages/protocol/src/index.ts
 import {
   AGENT_RUN_METHOD,
   AgentRunResultSchema,
+  EVENT_SUBSCRIBE_METHOD,
+  EVENT_UNSUBSCRIBE_METHOD,
   EventPushNotificationSchema,
+  EventSubscribeResultSchema,
+  EventUnsubscribeResultSchema,
 } from "../../packages/protocol/src/index.ts";
 
 const sessionId = "550e8400-e29b-41d4-a716-446655440000";
@@ -88,6 +96,57 @@ describe("typed IPC event stream", () => {
       unsubscribe();
       connection.close();
       await server.stop(100);
+    }
+  });
+
+  test("subscribes, publishes, and unsubscribes through the composed CoreApp", async () => {
+    const homeDirectory = await mkdtemp(join(tmpdir(), "minicode-ipc-events-"));
+    const app = new CoreApp({
+      host: "127.0.0.1",
+      port: 0,
+      logLevel: "error",
+      homeDirectory,
+    });
+    const connection = await NdjsonRpcConnection.connect(app.start());
+    const received = Promise.withResolvers<EventPushNotification>();
+    const stopListening = connection.onNotification((notification) => {
+      const parsed = EventPushNotificationSchema.safeParse(notification);
+      if (parsed.success) {
+        received.resolve(parsed.data);
+      }
+    });
+
+    try {
+      const subscribed = await connection.request(
+        EVENT_SUBSCRIBE_METHOD,
+        { sessionId, runId, afterSequence: 0 },
+        EventSubscribeResultSchema,
+        { requestId: "subscribe" },
+      );
+      const published = await app.eventBus.publish({
+        sessionId,
+        runId,
+        timestamp: "2026-09-13T08:00:00.000Z",
+        durable: true,
+        type: "run.started",
+        payload: {},
+      });
+      const notification = await received.promise;
+      expect(published.ok).toBe(true);
+      expect(notification.params.subscriptionId).toBe(subscribed.result.subscriptionId);
+
+      const unsubscribed = await connection.request(
+        EVENT_UNSUBSCRIBE_METHOD,
+        { subscriptionId: subscribed.result.subscriptionId },
+        EventUnsubscribeResultSchema,
+        { requestId: "unsubscribe" },
+      );
+      expect(unsubscribed.result.removed).toBe(true);
+    } finally {
+      stopListening();
+      connection.close();
+      await app.stop();
+      await rm(homeDirectory, { recursive: true, force: true });
     }
   });
 });

@@ -13,6 +13,7 @@ export type CoreEndpoint = z.infer<typeof CoreEndpointSchema>;
 export interface Environment {
   readonly MINICODE_CORE_HOST?: string;
   readonly MINICODE_CORE_PORT?: string;
+  readonly MINICODE_HOME?: string;
   readonly MINICODE_LOG_LEVEL?: string;
   readonly [name: string]: string | undefined;
 }

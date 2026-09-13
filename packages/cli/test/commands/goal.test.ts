@@ -197,4 +197,53 @@ describe("runGoalCommand", () => {
     expect(removed).toBe(1);
     expect(stderr.join("")).toContain("acceptance could be confirmed");
   });
+
+  test("re-sends cancel after reconnect and bounds terminal waiting", async () => {
+    const controller = new AbortController();
+    const firstClosed = Promise.withResolvers<void>();
+    const runAccepted = Promise.withResolvers<void>();
+    let connections = 0;
+    let cancelRequests = 0;
+    const identity = {
+      sessionId: "550e8400-e29b-41d4-a716-446655440001",
+      runId: "6ba7b810-9dad-41d1-80b4-00c04fd430c9",
+      subscriptionId: "750e8400-e29b-41d4-a716-446655440001",
+    };
+    const makeConnection = (first: boolean): NdjsonRpcConnection =>
+      ({
+        request: async (method: string) => {
+          if (method === "agent.run") {
+            runAccepted.resolve();
+            return { result: { status: "accepted", ...identity } };
+          }
+          if (method === "agent.cancel") {
+            if (first) throw new Error("disconnected");
+            cancelRequests += 1;
+            return { result: { outcome: "cancellation_requested" } };
+          }
+          return { result: identity };
+        },
+        onNotification: () => () => {},
+        waitUntilClosed: () => (first ? firstClosed.promise : new Promise<void>(() => {})),
+        close: () => {},
+      }) as unknown as NdjsonRpcConnection;
+
+    const running = runGoalCommand({
+      goal: "x",
+      workspaceRoot: "/workspace",
+      endpoint: { host: "127.0.0.1", port: 7437 },
+      signal: controller.signal,
+      reconnectDelayMs: 0,
+      cancelTimeoutMs: 20,
+      connect: async () => makeConnection(connections++ === 0),
+      stderr: () => {},
+    });
+    await runAccepted.promise;
+    controller.abort();
+    firstClosed.resolve();
+
+    expect(await running).toBe(130);
+    expect(connections).toBeGreaterThanOrEqual(2);
+    expect(cancelRequests).toBe(1);
+  });
 });

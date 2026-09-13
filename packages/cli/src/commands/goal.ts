@@ -222,6 +222,7 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
   let runIdentity: RunIdentity | undefined;
   let currentConnection: NdjsonRpcConnection | undefined;
   let cancelDeadline: number | undefined;
+  const cancelRequested = Promise.withResolvers<void>();
 
   /** Ctrl-C 触发：向当前连接发 agent.cancel，run 随后会发布 run.finished(cancelled)。 */
   const requestCancel = async (): Promise<void> => {
@@ -245,6 +246,7 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
     }
     cancelledByUser = true;
     cancelDeadline = Date.now() + cancelTimeoutMs;
+    cancelRequested.resolve();
     void requestCancel();
   };
   if (signal !== undefined) {
@@ -261,6 +263,14 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
     subscriptionId: SubscriptionId,
   ): Promise<DrainResult> => {
     const finished = Promise.withResolvers<void>();
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const deadlineReached = cancelRequested.promise.then(
+      () =>
+        new Promise<void>((resolve) => {
+          const remaining = Math.max(0, (cancelDeadline ?? Date.now()) - Date.now());
+          deadlineTimer = setTimeout(resolve, remaining);
+        }),
+    );
     const stopListening = connection.onNotification((notification) => {
       const parsed = EventPushNotificationSchema.safeParse(notification);
       if (!parsed.success) {
@@ -283,9 +293,12 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
 
     const run = async (): Promise<DrainResult> => {
       try {
-        await Promise.race([finished.promise, connection.waitUntilClosed()]);
+        await Promise.race([finished.promise, connection.waitUntilClosed(), deadlineReached]);
         return reducer.outcome !== undefined ? "finished" : "disconnected";
       } finally {
+        if (deadlineTimer !== undefined) {
+          clearTimeout(deadlineTimer);
+        }
         stopListening();
       }
     };
@@ -352,6 +365,10 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
             EventSubscribeResultSchema,
           );
           subscriptionId = response.result.subscriptionId;
+          // Ctrl-C 可能发生在断线期间；每次重连后幂等补发取消请求。
+          if (cancelledByUser) {
+            await requestCancel();
+          }
         }
 
         const status = await drain(connection, subscriptionId);

@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createConnection } from "node:net";
-
-import { JsonRpcErrorCode, MAX_JSON_RPC_FRAME_BYTES } from "@minicode/protocol";
-
 import type { CoreEndpoint } from "@minicode/protocol";
+import { JsonRpcErrorCode, MAX_JSON_RPC_FRAME_BYTES } from "@minicode/protocol";
 import { PingHandler } from "../src/handlers/ping-handler.ts";
+import { RpcMethodHandler } from "../src/handlers/rpc-method-handler.ts";
 import type { Logger } from "../src/logger.ts";
+import type { RpcInvocationContext } from "../src/rpc-context.ts";
 import { createRpcDispatcher } from "../src/rpc-dispatcher.ts";
 import { NdjsonRpcServer } from "../src/transport/ndjson-server.ts";
 
@@ -38,7 +38,7 @@ afterEach(async () => {
 
 function exchange(
   endpoint: CoreEndpoint,
-  payload: string | Uint8Array,
+  payload: string | Uint8Array | readonly (string | Uint8Array)[],
   expectedLines: number,
 ): Promise<string[]> {
   return new Promise((resolve, reject) => {
@@ -63,7 +63,13 @@ function exchange(
     };
 
     socket.on("connect", () => {
-      socket.write(payload);
+      if (typeof payload === "string" || payload instanceof Uint8Array) {
+        socket.write(payload);
+        return;
+      }
+      payload.forEach((part, index) => {
+        setTimeout(() => socket.write(part), index * 5);
+      });
     });
     socket.on("data", (data) => {
       buffer = Buffer.concat([buffer, data]);
@@ -99,6 +105,15 @@ function pingFrame(id: string | number): string {
 }
 
 describe("NDJSON RPC server", () => {
+  test("reassembles a request split across socket reads", async () => {
+    const { endpoint } = startServer();
+    const frame = pingFrame("fragmented");
+    const midpoint = Math.floor(frame.length / 2);
+    const response = await exchange(endpoint, [frame.slice(0, midpoint), frame.slice(midpoint)], 1);
+
+    expect(JSON.parse(response[0] ?? "null").id).toBe("fragmented");
+  });
+
   test("handles multiple frames serially and preserves IDs", async () => {
     const { endpoint } = startServer();
     const responses = await exchange(endpoint, `${pingFrame("first")}${pingFrame(2)}`, 2);
@@ -160,6 +175,55 @@ describe("NDJSON RPC server", () => {
     expect(response.error).toEqual({
       code: JsonRpcErrorCode.internalError,
       message: "Internal error",
+    });
+  });
+
+  test("queues the RPC response before an after-response notification", async () => {
+    class EventHandler extends RpcMethodHandler {
+      readonly method = "test.subscribe";
+
+      async invoke(_params: unknown, context: RpcInvocationContext) {
+        return {
+          kind: "success" as const,
+          result: { subscriptionId: "subscription-1" },
+          afterResponseEnqueued: () => {
+            context.connection.sendNotification({
+              jsonrpc: "2.0",
+              method: "test.event",
+              params: { sequence: 1 },
+            });
+          },
+        };
+      }
+    }
+
+    const server = new NdjsonRpcServer(
+      { host: "127.0.0.1", port: 0 },
+      createRpcDispatcher({ handlers: [new EventHandler()] }),
+      silentLogger,
+    );
+    const endpoint = server.start();
+    runningServers.push(server);
+    const frames = await exchange(
+      endpoint,
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: "subscribe-1",
+        method: "test.subscribe",
+        params: {},
+      })}\n`,
+      2,
+    );
+
+    expect(JSON.parse(frames[0] ?? "null")).toEqual({
+      jsonrpc: "2.0",
+      id: "subscribe-1",
+      result: { subscriptionId: "subscription-1" },
+    });
+    expect(JSON.parse(frames[1] ?? "null")).toEqual({
+      jsonrpc: "2.0",
+      method: "test.event",
+      params: { sequence: 1 },
     });
   });
 

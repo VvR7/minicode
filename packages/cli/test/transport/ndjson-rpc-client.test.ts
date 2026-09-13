@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createServer } from "node:net";
-
 import type { Socket } from "node:net";
-import { CORE_PING_METHOD, PongResultSchema } from "@minicode/protocol";
-
-import type { CoreEndpoint, JsonRpcId } from "@minicode/protocol";
-import { NdjsonRpcClient, RpcClientError } from "../../src/transport/ndjson-rpc-client.ts";
+import { createServer } from "node:net";
+import type { CoreEndpoint, JsonRpcId, JsonRpcNotificationEnvelope } from "@minicode/protocol";
+import { CORE_PING_METHOD, MAX_JSON_RPC_FRAME_BYTES, PongResultSchema } from "@minicode/protocol";
+import {
+  NdjsonRpcClient,
+  NdjsonRpcConnection,
+  RpcClientError,
+} from "../../src/transport/ndjson-rpc-client.ts";
 
 interface MockServer {
   readonly endpoint: CoreEndpoint;
@@ -43,12 +45,15 @@ async function startMockServer(
     let input = "";
     socket.on("data", (data) => {
       input += data.toString("utf8");
-      const newlineIndex = input.indexOf("\n");
-      if (newlineIndex === -1) {
-        return;
+      while (true) {
+        const newlineIndex = input.indexOf("\n");
+        if (newlineIndex === -1) {
+          return;
+        }
+        const request = JSON.parse(input.slice(0, newlineIndex)) as RawRequest;
+        input = input.slice(newlineIndex + 1);
+        respond(request, socket);
       }
-      const request = JSON.parse(input.slice(0, newlineIndex)) as RawRequest;
-      respond(request, socket);
     });
   });
 
@@ -168,5 +173,99 @@ describe("NDJSON RPC client", () => {
       }
       expect(error.message).toContain("request timed out after 30ms");
     }
+  });
+
+  test("correlates out-of-order responses while receiving interleaved notifications", async () => {
+    const requests: RawRequest[] = [];
+    const server = await startMockServer((request, socket) => {
+      requests.push(request);
+      if (requests.length !== 2) {
+        return;
+      }
+      const response = (id: unknown, uptimeMs: number) =>
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          result: {
+            serverVersion: "0.0.1",
+            uptimeMs,
+            receivedAt: "2026-09-13T08:00:00.000Z",
+          },
+        })}\n`;
+      const notification = `${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "event.push",
+        params: { subscriptionId: "subscription-1", event: { sequence: 1 } },
+      })}\n`;
+      const firstWrite = `${response(request.id, 2)}${notification}`;
+      // 主动拆帧，验证同一数据流中半帧、多帧和 notification 都能正确处理。
+      const midpoint = Math.floor(firstWrite.length / 2);
+      socket.write(firstWrite.slice(0, midpoint));
+      setTimeout(() => {
+        socket.write(`${firstWrite.slice(midpoint)}${response(requests[0]?.id, 1)}`);
+      }, 5);
+    });
+    const connection = await NdjsonRpcConnection.connect(server.endpoint);
+    const notifications: JsonRpcNotificationEnvelope[] = [];
+    connection.onNotification((notification) => notifications.push(notification));
+
+    const first = connection.request(CORE_PING_METHOD, {}, PongResultSchema, {
+      requestId: "first",
+    });
+    const second = connection.request(CORE_PING_METHOD, {}, PongResultSchema, {
+      requestId: "second",
+    });
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(firstResult.result.uptimeMs).toBe(1);
+    expect(secondResult.result.uptimeMs).toBe(2);
+    expect(notifications).toEqual([
+      {
+        jsonrpc: "2.0",
+        method: "event.push",
+        params: { subscriptionId: "subscription-1", event: { sequence: 1 } },
+      },
+    ]);
+    connection.close();
+  });
+
+  test("rejects every pending request when the persistent socket disconnects", async () => {
+    let requestCount = 0;
+    const server = await startMockServer((_request, socket) => {
+      requestCount += 1;
+      if (requestCount === 2) {
+        socket.destroy();
+      }
+    });
+    const connection = await NdjsonRpcConnection.connect(server.endpoint);
+    const first = connection.request(CORE_PING_METHOD, {}, PongResultSchema, {
+      requestId: "first",
+    });
+    const second = connection.request(CORE_PING_METHOD, {}, PongResultSchema, {
+      requestId: "second",
+    });
+
+    const outcomes = await Promise.allSettled([first, second]);
+    expect(outcomes).toHaveLength(2);
+    for (const outcome of outcomes) {
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status === "rejected") {
+        expect(outcome.reason).toBeInstanceOf(RpcClientError);
+        expect((outcome.reason as Error).message).toContain("closed the connection");
+      }
+    }
+    expect(connection.closed).toBe(true);
+  });
+
+  test("closes a persistent connection on an oversized inbound frame", async () => {
+    const server = await startMockServer((_request, socket) => {
+      socket.write(`${"x".repeat(MAX_JSON_RPC_FRAME_BYTES + 1)}\n`);
+    });
+    const connection = await NdjsonRpcConnection.connect(server.endpoint);
+
+    await expect(
+      connection.request(CORE_PING_METHOD, {}, PongResultSchema, { requestId: "large" }),
+    ).rejects.toThrow("frame exceeds 1 MiB");
+    expect(connection.closed).toBe(true);
   });
 });

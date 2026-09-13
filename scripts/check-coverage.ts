@@ -54,7 +54,11 @@ export function parseLcov(contents: string, repositoryRoot: string): Map<string,
     if (!/^\d+$/u.test(value)) {
       throw new CoverageReportError(`invalid ${prefix.slice(0, -1)} count: ${value}`);
     }
-    return Number.parseInt(value, 10);
+    const count = Number.parseInt(value, 10);
+    if (!Number.isSafeInteger(count)) {
+      throw new CoverageReportError(`unsafe ${prefix.slice(0, -1)} count: ${value}`);
+    }
+    return count;
   };
 
   const saveRecord = (): void => {
@@ -152,19 +156,35 @@ export function assessCoveragePolicy(
   const linePercent = percent(evaluation.lines);
   const functionPercent = percent(evaluation.functions);
   const violations: string[] = [];
+  const lineCountsValid =
+    Number.isSafeInteger(evaluation.lines.found) &&
+    Number.isSafeInteger(evaluation.lines.total) &&
+    evaluation.lines.found >= 0 &&
+    evaluation.lines.total >= 0 &&
+    evaluation.lines.found <= evaluation.lines.total;
+  const functionCountsValid =
+    Number.isSafeInteger(evaluation.functions.found) &&
+    Number.isSafeInteger(evaluation.functions.total) &&
+    evaluation.functions.found >= 0 &&
+    evaluation.functions.total >= 0 &&
+    evaluation.functions.found <= evaluation.functions.total;
 
-  if (productionFileCount === 0) {
+  if (!Number.isSafeInteger(productionFileCount) || productionFileCount <= 0) {
     violations.push("no production source files were discovered");
   }
   if (evaluation.missingFiles.length > 0) {
     violations.push(`${evaluation.missingFiles.length} production file(s) are missing from LCOV`);
   }
-  if (evaluation.lines.total === 0) {
+  if (!lineCountsValid || !Number.isFinite(linePercent)) {
+    violations.push("aggregate line coverage counts are invalid");
+  } else if (evaluation.lines.total === 0) {
     violations.push("aggregate line coverage denominator is zero");
   } else if (linePercent < MINIMUM_COVERAGE_PERCENT) {
     violations.push(`line coverage is below ${MINIMUM_COVERAGE_PERCENT}%`);
   }
-  if (evaluation.functions.total === 0) {
+  if (!functionCountsValid || !Number.isFinite(functionPercent)) {
+    violations.push("aggregate function coverage counts are invalid");
+  } else if (evaluation.functions.total === 0) {
     violations.push("aggregate function coverage denominator is zero");
   } else if (functionPercent < MINIMUM_COVERAGE_PERCENT) {
     violations.push(`function coverage is below ${MINIMUM_COVERAGE_PERCENT}%`);

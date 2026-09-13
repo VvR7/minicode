@@ -104,4 +104,33 @@ describe("coverage policy", () => {
       parseLcov("SF:packages/core/src/app.ts\nFNF:1\nend_of_record\n", repositoryRoot),
     ).toThrow("incomplete LCOV record");
   });
+
+  test("rejects unsafe integer counts and non-finite aggregate values", () => {
+    const hugeCount = "9".repeat(400);
+    expect(() =>
+      parseLcov(
+        [
+          "SF:packages/core/src/app.ts",
+          `FNF:${hugeCount}`,
+          `FNH:${hugeCount}`,
+          `LF:${hugeCount}`,
+          `LH:${hugeCount}`,
+          "end_of_record",
+          "",
+        ].join("\n"),
+        repositoryRoot,
+      ),
+    ).toThrow("unsafe FNF count");
+
+    const policy = assessCoveragePolicy(
+      {
+        functions: { found: Number.POSITIVE_INFINITY, total: Number.POSITIVE_INFINITY },
+        lines: { found: Number.NaN, total: Number.NaN },
+        missingFiles: [],
+      },
+      1,
+    );
+    expect(policy.violations).toContain("aggregate line coverage counts are invalid");
+    expect(policy.violations).toContain("aggregate function coverage counts are invalid");
+  });
 });

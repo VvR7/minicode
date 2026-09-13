@@ -4,7 +4,8 @@ minicode 是一个本地运行的 TypeScript coding agent。目标形态包括�
 TUI 前端、类型化 IPC、事件流、工具与权限系统、任务规划、会话记忆、上下文压缩、子 Agent
 以及 MCP 外部工具接入。
 
-当前版本实现了第一阶段通信闭环：`mc-core` 前台进程与一次性 `mc-ping` 健康检查。
+当前版本实现了本地 coding agent 闭环：常驻 `mc-core` 前台进程、一次性 `mc-ping` 健康检查，
+以及 `mc --goal` 流式 AgentLoop（只读工具调用 + 事件流 + 断线恢复）。
 
 ## 环境要求
 
@@ -30,8 +31,17 @@ bun run core
 
 ```bash
 bun run ping
-# pong server=0.0.1 uptime=12ms latency=2ms
+# pong server=0.1.0 uptime=12ms latency=2ms
 ```
+
+配置好 `.env` 中的 `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` 后，以当前目录为 workspace
+发起一次 run（assistant 文本写 stdout，进度写 stderr）：
+
+```bash
+bun run mc --goal "Read README.md and summarize it"
+```
+
+Ctrl-C 会取消当前 run 并以退出码 130 结束；退出码 0 表示成功、1 表示 run 失败、2 表示参数或配置错误。
 
 Core 默认监听 `127.0.0.1:7437`。可通过 `.env` 中的 `MINICODE_CORE_HOST` 和
 `MINICODE_CORE_PORT` 修改 loopback 地址；当前不允许监听非本机地址。
@@ -63,7 +73,7 @@ LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run 
 | --- | --- |
 | `@minicode/protocol` | JSON-RPC、Ping/Pong 和 Core 地址的 Zod schema |
 | `@minicode/core` | Bun TCP/NDJSON server 与 `mc-core` 入口 |
-| `@minicode/cli` | 一次性 `mc-ping` 客户端 |
+| `@minicode/cli` | `mc-ping` 健康检查与 `mc --goal` 客户端 |
 | `@minicode/tui` | 预留给终端 UI 前端 |
 
 ## 文档

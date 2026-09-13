@@ -14,6 +14,7 @@
     "format": "biome format --write .",
     "format:check": "biome format .",
     "lint": "biome lint .",
+    "mc": "bun run packages/cli/src/mc.ts",
     "ping": "bun run packages/cli/src/bin.ts",
     "protocol:docs": "bun run packages/protocol/scripts/generate-wire-protocol.ts",
     "protocol:docs:check": "bun run packages/protocol/scripts/generate-wire-protocol.ts --check",

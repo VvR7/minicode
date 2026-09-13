@@ -7,10 +7,11 @@
     ".": "./src/index.ts"
   },
   "bin": {
-    "mc-ping": "./src/bin.ts"
+    "mc-ping": "./src/bin.ts",
+    "mc": "./src/mc.ts"
   },
   "scripts": {
-    "build": "bun build ./src/index.ts ./src/bin.ts --outdir ./dist --target bun --format esm --sourcemap=external"
+    "build": "bun build ./src/index.ts ./src/bin.ts ./src/mc.ts --outdir ./dist --target bun --format esm --sourcemap=external"
   },
   "dependencies": {
     "@minicode/protocol": "workspace:*",

@@ -1,5 +1,7 @@
-import { readdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { constants } from "node:fs";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Dirent, Stats } from "node:fs";
 import { ToolError } from "./types.ts";
 
@@ -47,14 +49,48 @@ export async function resolveSafePath(workspaceRoot: string, inputPath: string):
     throw new ToolError("path_escape", "path escapes the workspace");
   }
 
-  // realpath 解析 symlink 并校验最终落在 workspace 内；目标不存在时交给调用方处理。
+  // realpath 解析 symlink 并校验最终落在 workspace 内；目标不存在时仍校验最近存在的父目录。
   let realRoot: string;
-  let realTarget: string;
   try {
     realRoot = await realpath(workspaceRoot);
+  } catch {
+    throw new ToolError("io_error", "failed to resolve workspace", true);
+  }
+  let realTarget: string;
+  try {
     realTarget = await realpath(resolved);
   } catch (error) {
     if (isNotFound(error)) {
+      let ancestor = dirname(resolved);
+      while (ancestor !== dirname(ancestor)) {
+        try {
+          const realAncestor = await realpath(ancestor);
+          const ancestorRelative = relative(realRoot, realAncestor);
+          if (
+            ancestorRelative === ".." ||
+            ancestorRelative.startsWith(`..${sep}`) ||
+            isAbsolute(ancestorRelative)
+          ) {
+            throw new ToolError("path_escape", "path resolves outside the workspace");
+          }
+          return resolved;
+        } catch (ancestorError) {
+          if (!isNotFound(ancestorError)) {
+            throw ancestorError;
+          }
+          // realpath 对悬挂 symlink 返回 ENOENT；lstat 可识别该路径本身，必须拒绝。
+          try {
+            if ((await lstat(ancestor)).isSymbolicLink()) {
+              throw new ToolError("path_escape", "path contains a dangling symlink");
+            }
+          } catch (lstatError) {
+            if (!isNotFound(lstatError)) {
+              throw lstatError;
+            }
+          }
+          ancestor = dirname(ancestor);
+        }
+      }
       return resolved;
     }
     throw new ToolError("io_error", "failed to resolve path", true);
@@ -118,39 +154,38 @@ export interface TextFileContent {
  * stream 解码避免截断位置的多字节序列被误判为无效 UTF-8。
  */
 export async function readTextFileSafe(path: string, limitBytes: number): Promise<TextFileContent> {
-  // Bun.file().size 对不存在文件返回 0 而不抛错，因此先用 stat 校验存在性与类型。
-  let info: Stats;
+  // O_NOFOLLOW + 同一 FileHandle 的 fstat/read 消除 realpath 校验与实际读取之间的末端 symlink 竞态。
+  let handle: FileHandle;
   try {
-    info = await stat(path);
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   } catch (error) {
     if (isNotFound(error)) {
       throw new ToolError("not_found", "file not found");
     }
     throw new ToolError("io_error", "failed to read file", true);
   }
-  if (!info.isFile()) {
-    throw new ToolError("invalid_params", "path does not refer to a file");
-  }
-
-  let buffer: ArrayBuffer;
   try {
-    buffer = await Bun.file(path).slice(0, limitBytes).arrayBuffer();
-  } catch (error) {
-    if (isNotFound(error)) {
-      throw new ToolError("not_found", "file not found");
+    const info: Stats = await handle.stat();
+    if (!info.isFile()) {
+      throw new ToolError("invalid_params", "path does not refer to a file");
     }
-    throw new ToolError("io_error", "failed to read file", true);
+    const bytes = new Uint8Array(Math.min(info.size, limitBytes));
+    await handle.read(bytes, 0, bytes.byteLength, 0);
+    if (isBinary(bytes)) {
+      throw new ToolError("binary_file", "file appears to be binary");
+    }
+    let text: string;
+    try {
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      text = decoder.decode(bytes, { stream: info.size > limitBytes });
+      if (info.size <= limitBytes) {
+        text += decoder.decode();
+      }
+    } catch {
+      throw new ToolError("invalid_utf8", "file is not valid UTF-8");
+    }
+    return { text, outputBytes: info.size, truncated: info.size > limitBytes };
+  } finally {
+    await handle.close();
   }
-
-  const bytes = new Uint8Array(buffer);
-  if (isBinary(bytes)) {
-    throw new ToolError("binary_file", "file appears to be binary");
-  }
-  let text: string;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes, { stream: true });
-  } catch {
-    throw new ToolError("invalid_utf8", "file is not valid UTF-8");
-  }
-  return { text, outputBytes: info.size, truncated: info.size > limitBytes };
 }

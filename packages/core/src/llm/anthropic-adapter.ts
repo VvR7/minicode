@@ -356,7 +356,6 @@ export class AnthropicAdapter implements LlmProvider {
         externalSignal.addEventListener("abort", onExternalAbort, { once: true });
       }
     }
-
     try {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         let sawDelta = false;
@@ -415,10 +414,20 @@ export class AnthropicAdapter implements LlmProvider {
             delayMs,
             reason: retryReason(llmError.code),
           };
-          await sleep(delayMs, controller.signal);
+          try {
+            await sleep(delayMs, controller.signal);
+          } catch {
+            // sleep 的 AbortError 也必须遵循与 fetch/reader 相同的错误契约。
+            if (timedOut) {
+              throw new LlmError("timeout", "LLM call timed out");
+            }
+            throw new LlmError("aborted", "LLM call aborted");
+          }
         }
       }
     } finally {
+      // 无论正常完成、解析失败还是消费者提前退出，都中断底层请求/响应体，避免残留流。
+      controller.abort();
       clearTimeout(timeoutTimer);
       if (externalSignal !== undefined) {
         externalSignal.removeEventListener("abort", onExternalAbort);

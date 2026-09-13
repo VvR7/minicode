@@ -17,6 +17,8 @@ interface OwnedSubscription {
 export interface IpcEventSubscription {
   readonly result: EventSubscribeResult;
   readonly afterResponseEnqueued: () => void;
+  /** 订阅关闭时完成；用于释放等待 response 入队的 run，但不隐式取消它。 */
+  readonly closed: Promise<unknown>;
 }
 
 /** 把一个 run 的 EventBus 事件转换成同连接上的 event.push notification。 */
@@ -80,6 +82,7 @@ export class IpcEventBroadcaster {
       value: {
         result: { subscriptionId, sessionId, runId },
         afterResponseEnqueued: () => created.value.activate(),
+        closed: created.value.closed,
       },
     };
   }

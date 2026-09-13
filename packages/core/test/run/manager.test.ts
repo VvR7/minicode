@@ -9,8 +9,13 @@ import { SESSION_A, SESSION_B, RUN_A, RUN_B } from "../agent/test-helpers.ts";
 class HangExecutor implements RunExecutor {
   readonly aborted = new Set<AbortSignal>();
 
-  run(_request: AgentRunRequest, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve) => {
+  async run(
+    _request: AgentRunRequest,
+    signal: AbortSignal,
+    onStarted: () => Promise<void> = async () => {},
+  ): Promise<void> {
+    const activated = onStarted();
+    const finished = new Promise<void>((resolve) => {
       if (signal.aborted) {
         resolve();
         return;
@@ -24,12 +29,32 @@ class HangExecutor implements RunExecutor {
         { once: true },
       );
     });
+    await activated;
+    await finished;
   }
 }
 
 /** 立即完成的 executor，用于验证终态清理。 */
 class ImmediateExecutor implements RunExecutor {
-  async run(_request: AgentRunRequest, _signal: AbortSignal): Promise<void> {}
+  async run(
+    _request: AgentRunRequest,
+    _signal: AbortSignal,
+    onStarted: () => Promise<void> = async () => {},
+  ): Promise<void> {
+    await onStarted();
+  }
+}
+
+/** 激活后失败的 executor，用于验证 manager 不产生未处理拒绝。 */
+class RejectExecutor implements RunExecutor {
+  async run(
+    _request: AgentRunRequest,
+    _signal: AbortSignal,
+    onStarted: () => Promise<void> = async () => {},
+  ): Promise<void> {
+    await onStarted();
+    throw new Error("boom");
+  }
 }
 
 function request(sessionId = SESSION_A, runId = RUN_A): AgentRunRequest {
@@ -52,16 +77,17 @@ describe("RunManager", () => {
     expect(runId).not.toBe(manager.newRunId());
   });
 
-  test("starts runs and reports active count", () => {
+  test("starts runs and reports active count", async () => {
     const manager = new RunManager(new HangExecutor());
-    manager.start(request());
+    const activate = await manager.start(request());
+    activate();
     expect(manager.activeCount).toBe(1);
   });
 
-  test("cancels an active run idempotently", () => {
+  test("cancels an active run idempotently", async () => {
     const executor = new HangExecutor();
     const manager = new RunManager(executor);
-    manager.start(request());
+    await manager.start(request());
 
     expect(manager.cancel(SESSION_A, RUN_A)).toBe("cancellation_requested");
     expect(executor.aborted.size).toBe(1);
@@ -69,9 +95,19 @@ describe("RunManager", () => {
 
   test("returns already_finished for a completed run", async () => {
     const manager = new RunManager(new ImmediateExecutor());
-    manager.start(request());
+    const activate = await manager.start(request());
+    activate();
     await flushMicrotasks();
 
+    expect(manager.activeCount).toBe(0);
+    expect(manager.cancel(SESSION_A, RUN_A)).toBe("already_finished");
+  });
+
+  test("cleans up a rejected executor without an unhandled rejection", async () => {
+    const manager = new RunManager(new RejectExecutor());
+    const activate = await manager.start(request());
+    activate();
+    await flushMicrotasks();
     expect(manager.activeCount).toBe(0);
     expect(manager.cancel(SESSION_A, RUN_A)).toBe("already_finished");
   });
@@ -81,17 +117,17 @@ describe("RunManager", () => {
     expect(manager.cancel(SESSION_A, RUN_A)).toBe("not_found");
   });
 
-  test("rejects duplicate starts", () => {
+  test("rejects duplicate starts", async () => {
     const manager = new RunManager(new HangExecutor());
-    manager.start(request());
+    await manager.start(request());
     expect(() => manager.start(request())).toThrow("duplicate run");
   });
 
   test("shutdown aborts all active runs and releases them", async () => {
     const executor = new HangExecutor();
     const manager = new RunManager(executor);
-    manager.start(request(SESSION_A, RUN_A));
-    manager.start(request(SESSION_B, RUN_B));
+    await manager.start(request(SESSION_A, RUN_A));
+    await manager.start(request(SESSION_B, RUN_B));
     expect(manager.activeCount).toBe(2);
 
     await manager.shutdown();

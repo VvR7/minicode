@@ -41,23 +41,33 @@ export class AgentRunHandler extends RpcMethodHandler {
       throw new Error(subscribed.error.code);
     }
 
-    this.#manager.start({
-      sessionId,
-      runId,
-      goal: params.data.goal,
-      workspaceRoot: params.data.workspaceRoot,
-    });
-
-    const result: AgentRunResult = {
-      status: "accepted",
-      sessionId,
-      runId,
-      subscriptionId: subscribed.value.result.subscriptionId,
-    };
-    return {
-      kind: "success",
-      result,
-      afterResponseEnqueued: subscribed.value.afterResponseEnqueued,
-    };
+    try {
+      const activateRun = await this.#manager.start({
+        sessionId,
+        runId,
+        goal: params.data.goal,
+        workspaceRoot: params.data.workspaceRoot,
+      });
+      const activateSubscription = subscribed.value.afterResponseEnqueued;
+      // response 尚未入队连接就关闭时，订阅关闭负责放行 run；普通断连不取消执行。
+      void subscribed.value.closed.then(() => activateRun());
+      const result: AgentRunResult = {
+        status: "accepted",
+        sessionId,
+        runId,
+        subscriptionId: subscribed.value.result.subscriptionId,
+      };
+      return {
+        kind: "success",
+        result,
+        afterResponseEnqueued: () => {
+          activateSubscription();
+          activateRun();
+        },
+      };
+    } catch (error) {
+      this.#broadcaster.unsubscribe(context.connection, subscribed.value.result.subscriptionId);
+      throw error;
+    }
   }
 }

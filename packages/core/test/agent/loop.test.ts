@@ -256,6 +256,23 @@ describe("AgentLoop", () => {
     }
   });
 
+  test("rejects inconsistent finish reasons and tool calls", async () => {
+    const workspace = await createTempWorkspace();
+    try {
+      for (const response of [
+        { ...textResponse("done"), toolCalls: [toolCall("c1", "read_file", { path: "a.txt" })] },
+        { ...toolResponse([]), toolCalls: [] },
+      ]) {
+        const { loop, bus } = buildHarness([{ response }]);
+        const context = makeContext(workspace);
+        await runAndDrain(loop, context, bus);
+        expect(context.reason).toBe("invalid_llm_response");
+      }
+    } finally {
+      await cleanupTempWorkspace(workspace);
+    }
+  });
+
   test("maps a config error into a failed run", async () => {
     const workspace = await createTempWorkspace();
     try {

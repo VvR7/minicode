@@ -102,6 +102,21 @@ describe("ToolInvoker retry", () => {
     expect(result.retries).toEqual([]);
   });
 
+  test("does not retry an unknown exception", async () => {
+    let calls = 0;
+    const tool: Tool = {
+      name: "t",
+      description: "",
+      inputSchema: z.strictObject({}),
+      execute: () => {
+        calls += 1;
+        throw new Error("unexpected");
+      },
+    };
+    await invokerWith(tool, { retryDelaysMs: [0] }).invoke("t", {}, context());
+    expect(calls).toBe(1);
+  });
+
   test("surfaces the last error after exhausting retries", async () => {
     const tool: Tool = {
       name: "t",
@@ -146,6 +161,24 @@ describe("ToolInvoker timeout and abort", () => {
     controller.abort();
     const result = await pending;
     expect(result.result.isError).toBe(true);
+    expect(result.result.content).toBe("tool call aborted");
+  });
+
+  test("does not execute a tool when the caller is already cancelled", async () => {
+    let calls = 0;
+    const tool: Tool = {
+      name: "t",
+      description: "",
+      inputSchema: z.strictObject({}),
+      execute: () => {
+        calls += 1;
+        return { content: "unexpected" };
+      },
+    };
+    const controller = new AbortController();
+    controller.abort();
+    const result = await invokerWith(tool).invoke("t", {}, context(controller.signal));
+    expect(calls).toBe(0);
     expect(result.result.content).toBe("tool call aborted");
   });
 });

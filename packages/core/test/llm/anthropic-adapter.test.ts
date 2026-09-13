@@ -331,6 +331,13 @@ describe("timeout and abort", () => {
       collect(adapter.stream([userMessage], { signal: controller.signal })),
     ).rejects.toThrow("LLM call aborted");
   });
+
+  test("maps timeout during retry backoff to a typed timeout error", async () => {
+    const adapter = new AnthropicAdapter(config, async () => jsonResponse({}, 503), [100]);
+    const { error } = await collectWithError(adapter.stream([userMessage], { timeoutMs: 10 }));
+    expect(error).toBeInstanceOf(LlmError);
+    expect((error as LlmError).code).toBe("timeout");
+  });
 });
 
 describe("malformed responses", () => {

@@ -19,12 +19,12 @@ export interface ToolInvokerOptions {
   readonly retryDelaysMs?: readonly number[];
 }
 
-/** 非 ToolError 的意外异常统一视为可重试的瞬时 I/O 错误。 */
+/** 非 ToolError 的意外异常不可证明可安全重试，避免重复执行有副作用的工具。 */
 function toToolError(error: unknown): ToolError {
   if (error instanceof ToolError) {
     return error;
   }
-  return new ToolError("io_error", "tool call failed", true);
+  return new ToolError("io_error", "tool call failed");
 }
 
 /** 把字符串内容安全截断到 maxBytes，不在多字节 UTF-8 字符中间切断。 */
@@ -123,6 +123,10 @@ export class ToolInvoker {
     const parsed = tool.inputSchema.safeParse(params);
     if (!parsed.success) {
       return this.#fail("invalid tool parameters", 0, [], duration());
+    }
+    // 在创建执行 promise 前退出，确保已取消的 run 不会实际调用工具。
+    if (context.signal.aborted) {
+      return this.#fail("tool call aborted", 0, [], duration());
     }
 
     // 组合外部取消与内部超时，二者必须可区分。

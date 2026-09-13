@@ -42,4 +42,14 @@ describe("resolveSafePath", () => {
   test("returns the lexical path when the target does not exist", async () => {
     expect(await resolveSafePath(root, "missing.txt")).toBe(join(root, "missing.txt"));
   });
+
+  test("rejects a missing target below an escaping symlink parent", async () => {
+    await symlink(outside, join(root, "link"));
+    await expect(resolveSafePath(root, "link/missing.txt")).rejects.toBeInstanceOf(ToolError);
+  });
+
+  test("rejects a missing target below a dangling symlink parent", async () => {
+    await symlink(join(outside, "missing-dir"), join(root, "link"));
+    await expect(resolveSafePath(root, "link/missing.txt")).rejects.toBeInstanceOf(ToolError);
+  });
 });

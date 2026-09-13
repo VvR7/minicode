@@ -90,9 +90,11 @@ export class AgentLoop {
   }
 
   /** 执行直到终止；同一 signal 贯穿 LLM 与工具调用。任何失败都落到 context 状态上。 */
-  async run(context: ExecutionContext, signal: AbortSignal): Promise<void> {
+  async run(context: ExecutionContext, signal: AbortSignal, runStarted = false): Promise<void> {
     try {
-      await this.#publish(context, { type: "run.started", payload: {} }, true);
+      if (!runStarted) {
+        await this.#publish(context, { type: "run.started", payload: {} }, true);
+      }
 
       while (!context.isDone()) {
         if (context.step >= context.maxSteps) {
@@ -178,9 +180,17 @@ export class AgentLoop {
 
     switch (response.finishReason) {
       case "end_turn":
+        if (response.toolCalls.length > 0) {
+          context.markFailed("invalid_llm_response");
+          return "failed";
+        }
         context.markSucceeded(response.text);
         return "succeeded";
       case "tool_use":
+        if (response.toolCalls.length === 0) {
+          context.markFailed("invalid_llm_response");
+          return "failed";
+        }
         await this.#executeTools(context, response.toolCalls, signal);
         return "continue";
       case "max_tokens":
@@ -248,6 +258,10 @@ export class AgentLoop {
   ): Promise<void> {
     const results: { toolUseId: string; content: string; isError: boolean }[] = [];
     for (const call of toolCalls) {
+      // 取消后不再开始新的工具，避免产生无意义的工具副作用与事件。
+      if (signal.aborted) {
+        throw new LlmError("aborted", "agent run cancelled");
+      }
       await this.#publish(
         context,
         { type: "tool.started", payload: { toolCallId: call.id, name: call.name, attempt: 1 } },

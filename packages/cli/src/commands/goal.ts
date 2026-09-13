@@ -76,6 +76,7 @@ export interface GoalEventOutput {
 export class GoalEventReducer {
   #lastSequence = 0;
   #outcome: GoalRunOutcome | undefined;
+  #currentStepText = "";
 
   /** 已处理的最大 sequence，作为断线重连的 afterSequence cursor。 */
   get lastSequence(): number {
@@ -87,6 +88,7 @@ export class GoalEventReducer {
     return this.#outcome;
   }
 
+  /** 消费一条按 sequence 排序的事件，并返回本次应写入终端的增量。 */
   onEvent(event: AgentEvent): GoalEventOutput {
     // 断线重放或乱序到达时跳过已处理过的 sequence。
     if (event.sequence <= this.#lastSequence) {
@@ -100,6 +102,7 @@ export class GoalEventReducer {
       case "llm.model_selected":
         return { stderr: [`model ${event.payload.model} (${event.payload.provider})`] };
       case "llm.text_delta":
+        this.#currentStepText += event.payload.text;
         return { stdout: event.payload.text, stderr: [] };
       case "llm.retrying":
         return {
@@ -112,6 +115,7 @@ export class GoalEventReducer {
           stderr: [`usage input=${event.payload.inputTokens} output=${event.payload.outputTokens}`],
         };
       case "step.started":
+        this.#currentStepText = "";
         return { stderr: [`step ${event.payload.step}`] };
       case "step.finished":
         return { stderr: [`step ${event.payload.step} ${event.payload.outcome}`] };
@@ -136,7 +140,16 @@ export class GoalEventReducer {
           finalText: event.payload.finalText,
           steps: event.payload.steps,
         };
-        return { stderr: [`run ${event.payload.status} (${event.payload.reason})`] };
+        // text_delta 不持久化；断线后的终态用 finalText 补齐当前最终 step 尚未输出的后缀。
+        const missingFinalText = event.payload.finalText.startsWith(this.#currentStepText)
+          ? event.payload.finalText.slice(this.#currentStepText.length)
+          : this.#currentStepText.length === 0
+            ? event.payload.finalText
+            : "";
+        return {
+          ...(missingFinalText.length === 0 ? {} : { stdout: missingFinalText }),
+          stderr: [`run ${event.payload.status} (${event.payload.reason})`],
+        };
       }
     }
   }
@@ -351,6 +364,11 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
         if (reducer.outcome !== undefined) {
           return exitCodeFor(reducer.outcome, cancelledByUser);
         }
+        if (runIdentity === undefined) {
+          // agent.run 的响应可能在 accepted 后丢失；禁止重试创建，避免产生重复的孤儿 run。
+          writeStderr("error: agent.run failed before acceptance could be confirmed\n");
+          return signal?.aborted === true ? 130 : 2;
+        }
       } finally {
         connection.close();
         currentConnection = undefined;
@@ -365,5 +383,7 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
     // 任何未预期的内部错误按 run failure 处理，不向上抛。
     writeStderr("error: goal run failed unexpectedly\n");
     return 1;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
 }

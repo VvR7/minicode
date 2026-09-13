@@ -1,8 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import type { AgentEvent } from "@minicode/protocol";
+import type { AgentEvent, CoreEndpoint } from "@minicode/protocol";
+import type { NdjsonRpcConnection } from "@minicode/core";
 
-import { GoalEventReducer, exitCodeFor, parseGoalArgs } from "../../src/commands/goal.ts";
+import {
+  GoalEventReducer,
+  exitCodeFor,
+  parseGoalArgs,
+  runGoalCommand,
+} from "../../src/commands/goal.ts";
 
 const sessionId = "550e8400-e29b-41d4-a716-446655440000";
 const runId = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
@@ -109,6 +115,31 @@ describe("GoalEventReducer", () => {
       steps: 2,
     });
   });
+
+  test("fills a missing final text suffix from the durable terminal event", () => {
+    const reducer = new GoalEventReducer();
+    reducer.onEvent(event("step.started", { step: 1 }, 1));
+    expect(reducer.onEvent(event("llm.text_delta", { text: "Hel" }, 2)).stdout).toBe("Hel");
+    const terminal = reducer.onEvent(
+      event(
+        "run.finished",
+        {
+          status: "succeeded",
+          reason: "completed",
+          finalText: "Hello",
+          steps: 1,
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+        },
+        4,
+      ),
+    );
+    expect(terminal.stdout).toBe("lo");
+  });
 });
 
 describe("exitCodeFor", () => {
@@ -122,5 +153,48 @@ describe("exitCodeFor", () => {
 
   test("treats a missing outcome as a run failure", () => {
     expect(exitCodeFor(undefined, false)).toBe(1);
+  });
+});
+
+describe("runGoalCommand", () => {
+  test("does not retry an ambiguous agent.run failure and removes the abort listener", async () => {
+    let connections = 0;
+    let requests = 0;
+    let removed = 0;
+    const controller = new AbortController();
+    const originalRemove = controller.signal.removeEventListener.bind(controller.signal);
+    controller.signal.removeEventListener = ((
+      ...args: Parameters<AbortSignal["removeEventListener"]>
+    ) => {
+      removed += 1;
+      originalRemove(...args);
+    }) as AbortSignal["removeEventListener"];
+    const connection = {
+      request: async () => {
+        requests += 1;
+        throw new Error("response lost");
+      },
+      close: () => {},
+    } as unknown as NdjsonRpcConnection;
+    const endpoint: CoreEndpoint = { host: "127.0.0.1", port: 7437 };
+    const stderr: string[] = [];
+
+    const code = await runGoalCommand({
+      goal: "x",
+      workspaceRoot: "/workspace",
+      endpoint,
+      signal: controller.signal,
+      connect: async () => {
+        connections += 1;
+        return connection;
+      },
+      stderr: (text) => stderr.push(text),
+    });
+
+    expect(code).toBe(2);
+    expect(connections).toBe(1);
+    expect(requests).toBe(1);
+    expect(removed).toBe(1);
+    expect(stderr.join("")).toContain("acceptance could be confirmed");
   });
 });

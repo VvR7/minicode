@@ -14,6 +14,7 @@
     "build": "bun build ./src/index.ts ./src/bin.ts ./src/mc.ts --outdir ./dist --target bun --format esm --sourcemap=external"
   },
   "dependencies": {
+    "@minicode/core": "workspace:*",
     "@minicode/protocol": "workspace:*",
     "zod": "4.6.2"
   }

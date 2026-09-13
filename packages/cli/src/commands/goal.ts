@@ -15,7 +15,7 @@ import {
   EventSubscribeResultSchema,
   formatEndpoint,
 } from "@minicode/protocol";
-import { NdjsonRpcConnection } from "../transport/ndjson-rpc-client.ts";
+import { NdjsonRpcConnection } from "@minicode/core";
 
 /** 把文本写到 stdout / stderr 的输出接口，测试可注入捕获 buffer。 */
 export type GoalOutputSink = (text: string) => void;

@@ -11,8 +11,12 @@ import {
   EventPushNotificationSchema,
   PongResultSchema,
 } from "../../packages/protocol/src/index.ts";
-import { NdjsonRpcConnection } from "../../packages/cli/src/index.ts";
-import { CoreApp, EventBus, EventStore } from "../../packages/core/src/index.ts";
+import {
+  CoreApp,
+  EventBus,
+  EventStore,
+  NdjsonRpcConnection,
+} from "../../packages/core/src/index.ts";
 
 const SESSION_A = "550e8400-e29b-41d4-a716-446655440020";
 const RUN_A = "6ba7b810-9dad-41d1-80b4-00c04fd43020";

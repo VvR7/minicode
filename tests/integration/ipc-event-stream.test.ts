@@ -3,11 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { NdjsonRpcConnection } from "../../packages/cli/src/index.ts";
 import type { RpcInvocationContext } from "../../packages/core/src/index.ts";
 import {
   CoreApp,
   createRpcDispatcher,
+  NdjsonRpcConnection,
   NdjsonRpcServer,
   RpcMethodHandler,
 } from "../../packages/core/src/index.ts";

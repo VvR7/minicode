@@ -275,28 +275,25 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
           deadlineTimer = setTimeout(resolve, remaining);
         }),
     );
-    const stopListening = connection.onNotification((notification) => {
-      const parsed = EventPushNotificationSchema.safeParse(notification);
-      if (!parsed.success) {
-        return;
-      }
-      if (parsed.data.params.subscriptionId !== subscriptionId) {
-        return;
-      }
-      const output = reducer.onEvent(parsed.data.params.event);
-      if (output.stdout !== undefined) {
-        writeStdout(output.stdout);
-      }
-      for (const line of output.stderr) {
-        writeStderr(`${line}\n`);
-      }
-      if (reducer.outcome !== undefined) {
-        finished.resolve();
-      }
-    });
-
     const run = async (): Promise<DrainResult> => {
+      let stopListening: (() => void) | undefined;
       try {
+        stopListening = connection.onNotification((notification) => {
+          const parsed = EventPushNotificationSchema.safeParse(notification);
+          if (!parsed.success || parsed.data.params.subscriptionId !== subscriptionId) {
+            return;
+          }
+          const output = reducer.onEvent(parsed.data.params.event);
+          if (output.stdout !== undefined) {
+            writeStdout(output.stdout);
+          }
+          for (const line of output.stderr) {
+            writeStderr(`${line}\n`);
+          }
+          if (reducer.outcome !== undefined) {
+            finished.resolve();
+          }
+        });
         await Promise.race([finished.promise, connection.waitUntilClosed(), deadlineReached]);
         return reducer.outcome !== undefined ? "finished" : "disconnected";
       } finally {
@@ -304,7 +301,7 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
         if (deadlineTimer !== undefined) {
           clearTimeout(deadlineTimer);
         }
-        stopListening();
+        stopListening?.();
       }
     };
     return run();

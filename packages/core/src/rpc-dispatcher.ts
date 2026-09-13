@@ -1,14 +1,17 @@
+import type { JsonRpcErrorResponse, JsonRpcSuccessEnvelope } from "@minicode/protocol";
 import {
+  JSON_RPC_VERSION,
   JsonRpcErrorCode,
   JsonRpcRequestEnvelopeSchema,
-  JSON_RPC_VERSION,
   makeJsonRpcError,
 } from "@minicode/protocol";
-
-import type { JsonRpcErrorResponse, JsonRpcSuccessEnvelope } from "@minicode/protocol";
 import type { RpcMethodHandler } from "./handlers/rpc-method-handler.ts";
+import type { RpcInvocationContext } from "./rpc-context.ts";
 
-export type JsonRpcDispatchResult = JsonRpcSuccessEnvelope | JsonRpcErrorResponse;
+export interface JsonRpcDispatchResult {
+  readonly response: JsonRpcSuccessEnvelope | JsonRpcErrorResponse;
+  readonly afterResponseEnqueued?: () => void;
+}
 
 export interface RpcDispatcherOptions {
   /** 所有已注册的 RPC 方法；一个 method 只能注册一个 handler。 */
@@ -36,34 +39,53 @@ function createHandlerRegistry(
 export function createRpcDispatcher(options: RpcDispatcherOptions) {
   const handlers = createHandlerRegistry(options.handlers);
 
-  return async (value: unknown): Promise<JsonRpcDispatchResult> => {
+  return async (value: unknown, context: RpcInvocationContext): Promise<JsonRpcDispatchResult> => {
     const envelope = JsonRpcRequestEnvelopeSchema.safeParse(value);
     if (!envelope.success) {
-      return makeJsonRpcError(null, JsonRpcErrorCode.invalidRequest, "Invalid Request");
+      return {
+        response: makeJsonRpcError(null, JsonRpcErrorCode.invalidRequest, "Invalid Request"),
+      };
     }
 
     const handler = handlers.get(envelope.data.method);
     if (handler === undefined) {
-      return makeJsonRpcError(
-        envelope.data.id,
-        JsonRpcErrorCode.methodNotFound,
-        `Method not found: ${envelope.data.method}`,
-      );
+      return {
+        response: makeJsonRpcError(
+          envelope.data.id,
+          JsonRpcErrorCode.methodNotFound,
+          `Method not found: ${envelope.data.method}`,
+        ),
+      };
     }
 
     try {
-      const result = await handler.invoke(envelope.data.params);
+      const result = await handler.invoke(envelope.data.params, context);
       if (result.kind === "invalid-params") {
-        return makeJsonRpcError(envelope.data.id, JsonRpcErrorCode.invalidParams, "Invalid params");
+        return {
+          response: makeJsonRpcError(
+            envelope.data.id,
+            JsonRpcErrorCode.invalidParams,
+            "Invalid params",
+          ),
+        };
       }
 
-      return {
+      const response: JsonRpcSuccessEnvelope = {
         jsonrpc: JSON_RPC_VERSION,
         id: envelope.data.id,
         result: result.result,
       };
+      return result.afterResponseEnqueued === undefined
+        ? { response }
+        : { response, afterResponseEnqueued: result.afterResponseEnqueued };
     } catch {
-      return makeJsonRpcError(envelope.data.id, JsonRpcErrorCode.internalError, "Internal error");
+      return {
+        response: makeJsonRpcError(
+          envelope.data.id,
+          JsonRpcErrorCode.internalError,
+          "Internal error",
+        ),
+      };
     }
   };
 }

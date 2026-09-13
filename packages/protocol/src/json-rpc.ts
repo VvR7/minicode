@@ -3,6 +3,7 @@ import { z } from "zod";
 export const JSON_RPC_VERSION = "2.0" as const;
 
 export const JsonRpcErrorCode = {
+  runNotFound: -32001,
   parseError: -32700,
   invalidRequest: -32600,
   methodNotFound: -32601,
@@ -52,6 +53,24 @@ export const JsonRpcResponseEnvelopeSchema = z.union([
   JsonRpcErrorResponseSchema,
 ]);
 export type JsonRpcResponseEnvelope = z.infer<typeof JsonRpcResponseEnvelopeSchema>;
+
+export const JsonRpcNotificationEnvelopeSchema = z.strictObject({
+  jsonrpc: z.literal(JSON_RPC_VERSION),
+  method: z.string().min(1),
+  params: z.record(z.string(), z.unknown()),
+});
+export type JsonRpcNotificationEnvelope = z.infer<typeof JsonRpcNotificationEnvelopeSchema>;
+
+export function jsonRpcNotificationSchema<
+  const Method extends string,
+  ParamsSchema extends z.ZodType,
+>(method: Method, params: ParamsSchema) {
+  return z.strictObject({
+    jsonrpc: z.literal(JSON_RPC_VERSION),
+    method: z.literal(method),
+    params,
+  });
+}
 
 export function makeJsonRpcError(
   id: JsonRpcId | null,

@@ -1,8 +1,13 @@
 import type { z } from "zod";
+import type { RpcInvocationContext } from "../rpc-context.ts";
 
 /** 调用方法 handler 后的结果：要么参数合法并得到业务结果，要么参数不合法。 */
 export type RpcMethodInvocation =
-  | { readonly kind: "success"; readonly result: unknown }
+  | {
+      readonly kind: "success";
+      readonly result: unknown;
+      readonly afterResponseEnqueued?: () => void;
+    }
   | { readonly kind: "invalid-params" };
 
 /**
@@ -14,7 +19,7 @@ export abstract class RpcMethodHandler {
   abstract readonly method: string;
 
   /** 校验原始 params 并执行方法；业务异常交由 dispatcher 统一映射为内部错误。 */
-  abstract invoke(params: unknown): Promise<RpcMethodInvocation>;
+  abstract invoke(params: unknown, context: RpcInvocationContext): Promise<RpcMethodInvocation>;
 }
 
 /**
@@ -25,15 +30,18 @@ export abstract class TypedRpcMethodHandler<Params, Result> extends RpcMethodHan
   /** 该方法唯一的运行时参数边界。 */
   abstract readonly paramsSchema: z.ZodType<Params>;
 
-  async invoke(rawParams: unknown): Promise<RpcMethodInvocation> {
+  async invoke(rawParams: unknown, context: RpcInvocationContext): Promise<RpcMethodInvocation> {
     const params = this.paramsSchema.safeParse(rawParams);
     if (!params.success) {
       return { kind: "invalid-params" };
     }
 
-    return { kind: "success", result: await this.handle(params.data) };
+    return { kind: "success", result: await this.handle(params.data, context) };
   }
 
   /** params 已由 paramsSchema 校验；子类在这里实现具体业务逻辑。 */
-  protected abstract handle(params: Params): Promise<Result> | Result;
+  protected abstract handle(
+    params: Params,
+    context: RpcInvocationContext,
+  ): Promise<Result> | Result;
 }

@@ -1,7 +1,17 @@
 import { z } from "zod";
 
 import {
+  AgentCancelRequestSchema,
+  AgentCancelSuccessResponseSchema,
+  AgentRunRequestSchema,
+  AgentRunSuccessResponseSchema,
+  EventPushNotificationSchema,
+  EventSubscribeRequestSchema,
+  EventSubscribeSuccessResponseSchema,
+  EventUnsubscribeRequestSchema,
+  EventUnsubscribeSuccessResponseSchema,
   JsonRpcErrorResponseSchema,
+  JsonRpcNotificationEnvelopeSchema,
   JsonRpcRequestEnvelopeSchema,
   MAX_JSON_RPC_FRAME_BYTES,
   PingParamsSchema,
@@ -24,6 +34,16 @@ export function renderWireProtocol(): string {
     schemaBlock("PingRequest", PingRequestSchema),
     schemaBlock("PongResult", PongResultSchema),
     schemaBlock("PingSuccessResponse", PingSuccessResponseSchema),
+    schemaBlock("AgentRunRequest", AgentRunRequestSchema),
+    schemaBlock("AgentRunSuccessResponse", AgentRunSuccessResponseSchema),
+    schemaBlock("AgentCancelRequest", AgentCancelRequestSchema),
+    schemaBlock("AgentCancelSuccessResponse", AgentCancelSuccessResponseSchema),
+    schemaBlock("EventSubscribeRequest", EventSubscribeRequestSchema),
+    schemaBlock("EventSubscribeSuccessResponse", EventSubscribeSuccessResponseSchema),
+    schemaBlock("EventUnsubscribeRequest", EventUnsubscribeRequestSchema),
+    schemaBlock("EventUnsubscribeSuccessResponse", EventUnsubscribeSuccessResponseSchema),
+    schemaBlock("EventPushNotification", EventPushNotificationSchema),
+    schemaBlock("JsonRpcNotificationEnvelope", JsonRpcNotificationEnvelopeSchema),
     schemaBlock("JsonRpcErrorResponse", JsonRpcErrorResponseSchema),
   ].join("\n\n");
 
@@ -38,14 +58,27 @@ export function renderWireProtocol(): string {
   \`MINICODE_CORE_HOST\` / \`MINICODE_CORE_PORT\`.
 - UTF-8 NDJSON: one non-empty JSON value per LF-terminated frame; CRLF is accepted.
 - Maximum payload is ${maxFrameMiB} MiB per frame, excluding the newline delimiter.
-- A Core connection accepts multiple requests serially. \`mc-ping\` sends one request and closes.
+- A Core connection accepts multiple requests and may remain open for an event stream.
+- Responses and server notifications can be interleaved; clients correlate responses by request ID.
 
 ## JSON-RPC profile
 
-- JSON-RPC version \`2.0\` with one request object and one response object per frame.
+- JSON-RPC version \`2.0\` with one request, response, or server notification object per frame.
 - Request IDs are non-empty strings or safe integers and are echoed unchanged.
-- Notifications and batch arrays are not supported and return \`-32600\`.
+- Client-to-server notifications and batch arrays are not supported and return \`-32600\`.
+- Server-to-client \`event.push\` notifications have no request ID and carry one typed agent event.
 - Objects are strict: unknown fields are rejected.
+
+## Agent and event stream
+
+- \`agent.run\` accepts a goal and workspace root. Its response identifies the session, run, and
+  initial subscription.
+- \`agent.cancel\` requests cancellation for one session-isolated run.
+- \`event.subscribe\` can resume after a durable sequence cursor; \`event.unsubscribe\` removes a
+  subscription.
+- The \`agent.run\` response is enqueued before the first \`event.push\` for that run.
+- Event sequence numbers are positive and scoped to a run; durable events can be replayed by a
+  later event-store implementation.
 
 ## Ping
 
@@ -86,6 +119,7 @@ Success response:
 | -32601 | Method not found |
 | -32602 | Invalid \`core.ping\` parameters |
 | -32603 | Internal server error |
+| -32001 | Requested run was not found |
 
 ## JSON Schemas
 

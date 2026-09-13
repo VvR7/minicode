@@ -1,12 +1,20 @@
 // 导入协议层定义的标准错误码，以及构造 JSON-RPC 错误响应的函数。
-import { JsonRpcErrorCode, makeJsonRpcError, MAX_JSON_RPC_FRAME_BYTES } from "@minicode/protocol";
 
 // 这里只导入类型；编译后的 JavaScript 不会包含这些导入。
-import type { CoreEndpoint, JsonRpcErrorResponse } from "@minicode/protocol";
+import type {
+  CoreEndpoint,
+  JsonRpcErrorResponse,
+  JsonRpcNotificationEnvelope,
+  JsonRpcSuccessEnvelope,
+} from "@minicode/protocol";
+import { JsonRpcErrorCode, MAX_JSON_RPC_FRAME_BYTES, makeJsonRpcError } from "@minicode/protocol";
 // Logger 负责把连接和错误信息写到 stderr。
 import type { Logger } from "../logger.ts";
+import type { RpcConnection, RpcInvocationContext } from "../rpc-context.ts";
 // 分发器接收解析后的 JSON，并返回一个可发送的 JSON-RPC 响应。
 import type { JsonRpcDispatchResult } from "../rpc-dispatcher.ts";
+
+type OutboundMessage = JsonRpcSuccessEnvelope | JsonRpcErrorResponse | JsonRpcNotificationEnvelope;
 
 // 单条 NDJSON 请求的最大字节数：1 MiB，防止无限制占用内存。
 // 停止服务时，最多等待在途请求与连接关闭的时间。
@@ -45,10 +53,17 @@ interface ConnectionState {
   readonly closed: Promise<void>;
   // resolveClosed 是完成 closed Promise 的函数。
   resolveClosed: () => void;
+  // connection 是提供给业务 handler 的窄接口，不暴露底层 socket。
+  readonly connection: RpcConnection;
+  // true 表示 close 已发生，之后不能再接受任何出站消息。
+  closedState: boolean;
 }
 
 // Core 注入的业务处理函数：输入尚未可信任的 JSON，输出已构造的响应。
-export type RpcFrameHandler = (value: unknown) => Promise<JsonRpcDispatchResult>;
+export type RpcFrameHandler = (
+  value: unknown,
+  context: RpcInvocationContext,
+) => Promise<JsonRpcDispatchResult>;
 
 // encoder 用于把响应字符串转换为 UTF-8 字节。
 const encoder = new TextEncoder();
@@ -56,7 +71,7 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 /** 创建一条 TCP 连接专属的输入缓冲、请求队列、写队列和关闭通知。 */
-function createConnectionState(): ConnectionState {
+function createConnectionState(socket: Bun.Socket<ConnectionState>): ConnectionState {
   // 先提供一个空函数，随后由 Promise 构造器赋值为真实的 resolve。
   let resolveClosed = (): void => {};
   // closed 让 stop() 能异步等待这条连接真正关闭。
@@ -64,8 +79,16 @@ function createConnectionState(): ConnectionState {
     // 保存 resolve，供 socket.close 回调使用。
     resolveClosed = resolve;
   });
+  // 连接对象只暴露安全的通知发送能力，业务层不能直接操作 socket。
+  const connection: RpcConnection = {
+    id: crypto.randomUUID(),
+    closed,
+    sendNotification(notification) {
+      return enqueueMessage(socket, notification);
+    },
+  };
   // 返回所有字段都有安全初始值的连接状态。
-  return {
+  const state: ConnectionState = {
     // 没有收到任何字节时，输入缓冲为空。
     input: new Uint8Array(),
     // 新连接还没有等待处理的帧。
@@ -82,7 +105,10 @@ function createConnectionState(): ConnectionState {
     closed,
     // 把完成关闭 Promise 的函数保存到状态中。
     resolveClosed,
+    connection,
+    closedState: false,
   };
+  return state;
 }
 
 /** 合并已有的未完成输入与本次收到的字节，保留跨 TCP 回调的半帧。 */
@@ -98,9 +124,9 @@ function concatenate(left: Uint8Array, right: Uint8Array): Uint8Array {
 }
 
 /** 将 JSON-RPC 响应编码为以换行符结尾的一条 UTF-8 NDJSON 帧。 */
-function encodeResponse(response: JsonRpcDispatchResult | JsonRpcErrorResponse): Uint8Array {
+function encodeMessage(message: OutboundMessage): Uint8Array {
   // JSON.stringify 生成一条 JSON 值，\n 将它变成一条 NDJSON 帧。
-  return encoder.encode(`${JSON.stringify(response)}\n`);
+  return encoder.encode(`${JSON.stringify(message)}\n`);
 }
 
 /** 尽可能写出队列中的响应；遇到背压时由 socket 的 drain 回调继续。 */
@@ -143,14 +169,21 @@ function flushWrites(socket: Bun.Socket<ConnectionState>): void {
 }
 
 /** 将一个响应加入连接的写队列，并立即尝试发送。 */
-function enqueueResponse(
-  socket: Bun.Socket<ConnectionState>,
-  response: JsonRpcDispatchResult | JsonRpcErrorResponse,
-): void {
+function enqueueMessage(socket: Bun.Socket<ConnectionState>, message: OutboundMessage): boolean {
+  const state = socket.data;
+  if (state.closedState) {
+    return false;
+  }
+  const bytes = encodeMessage(message);
+  // 与入站帧使用同一个 1 MiB 上限；结尾 LF 不计入帧本身。
+  if (bytes.byteLength - 1 > MAX_JSON_RPC_FRAME_BYTES) {
+    return false;
+  }
   // 先把响应转为字节并加入队尾，保持响应顺序与请求顺序一致。
-  socket.data.writes.push({ bytes: encodeResponse(response), offset: 0 });
+  state.writes.push({ bytes, offset: 0 });
   // 若 socket 当前可写，立即开始发送。
   flushWrites(socket);
+  return true;
 }
 
 /** 将一条 UTF-8 NDJSON 帧解析为未知 JSON 值；编码或 JSON 无效时返回失败。 */
@@ -213,7 +246,7 @@ export class NdjsonRpcServer {
         binaryType: "uint8array",
         open: (socket) => {
           // 每条新连接都分配独立的状态。
-          socket.data = createConnectionState();
+          socket.data = createConnectionState(socket);
           // 记录活动连接，供优雅关闭时遍历。
           this.#activeSockets.add(socket);
           this.#logger.debug(
@@ -229,6 +262,7 @@ export class NdjsonRpcServer {
           flushWrites(socket);
         },
         close: (socket) => {
+          socket.data.closedState = true;
           // 关闭后不再把该 socket 当作活动连接。
           this.#activeSockets.delete(socket);
           // 唤醒可能正在 stop() 中等待它关闭的代码。
@@ -353,7 +387,7 @@ export class NdjsonRpcServer {
           }
           if (job.kind === "oversize") {
             // 超限没有可靠请求 ID，因此错误响应的 id 为 null。
-            enqueueResponse(
+            enqueueMessage(
               socket,
               makeJsonRpcError(null, JsonRpcErrorCode.invalidRequest, "Request too large"),
             );
@@ -366,7 +400,7 @@ export class NdjsonRpcServer {
           const parsed = parseFrame(job.bytes);
           // 无效 UTF-8、空帧或无效 JSON 都是 JSON-RPC parse error。
           if (!parsed.ok) {
-            enqueueResponse(
+            enqueueMessage(
               socket,
               makeJsonRpcError(null, JsonRpcErrorCode.parseError, "Parse error"),
             );
@@ -375,10 +409,25 @@ export class NdjsonRpcServer {
 
           try {
             // 业务层负责校验请求、路由方法并构造成功或协议错误响应。
-            enqueueResponse(socket, await this.#handler(parsed.value));
+            const dispatched = await this.#handler(parsed.value, {
+              connection: state.connection,
+            });
+            if (!enqueueMessage(socket, dispatched.response)) {
+              socket.terminate();
+              return;
+            }
+            // 响应必须先入写队列，再允许业务层推送事件，确保客户端先拿到订阅 ID。
+            if (dispatched.afterResponseEnqueued !== undefined) {
+              try {
+                dispatched.afterResponseEnqueued();
+              } catch {
+                // 此时 RPC 响应已入队，不能再发送第二条错误响应；仅记录内部错误。
+                this.#logger.error("after-response action failed");
+              }
+            }
           } catch {
             // 不把异常栈或内部细节泄漏给客户端。
-            enqueueResponse(
+            enqueueMessage(
               socket,
               makeJsonRpcError(null, JsonRpcErrorCode.internalError, "Internal error"),
             );
@@ -387,7 +436,7 @@ export class NdjsonRpcServer {
       })
       .catch(() => {
         // 兜底处理处理链自身的意外失败，保持每条请求都有安全的协议级结果。
-        enqueueResponse(
+        enqueueMessage(
           socket,
           makeJsonRpcError(null, JsonRpcErrorCode.internalError, "Internal error"),
         );

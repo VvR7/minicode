@@ -4,7 +4,8 @@ import type { JsonRpcNotificationEnvelope } from "@minicode/protocol";
 export interface RpcConnection {
   readonly id: string;
   readonly closed: Promise<void>;
-  sendNotification(notification: JsonRpcNotificationEnvelope): boolean;
+  sendNotification(notification: JsonRpcNotificationEnvelope): Promise<boolean>;
+  disconnect(): void;
 }
 
 export interface RpcInvocationContext {

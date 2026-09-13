@@ -19,6 +19,8 @@ type OutboundMessage = JsonRpcSuccessEnvelope | JsonRpcErrorResponse | JsonRpcNo
 // 单条 NDJSON 请求的最大字节数：1 MiB，防止无限制占用内存。
 // 停止服务时，最多等待在途请求与连接关闭的时间。
 export const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
+export const MAX_CONNECTION_WRITE_FRAMES = 256;
+export const MAX_CONNECTION_WRITE_BYTES = 4 * 1024 * 1024;
 
 // 队列中的工作项：要么是一条完整帧，要么是已经确认超限的输入。
 type FrameJob =
@@ -33,6 +35,13 @@ interface PendingWrite {
   readonly bytes: Uint8Array;
   // offset 表示下次应从 bytes 的哪个位置继续写。
   offset: number;
+  // completed 只在整帧交给内核或连接失败后完成，供订阅级背压感知真实发送进度。
+  readonly resolveCompleted: (sent: boolean) => void;
+}
+
+interface EnqueueResult {
+  readonly accepted: boolean;
+  readonly completed: Promise<boolean>;
 }
 
 // 每一个 TCP 连接都有自己独立的状态，互不共享请求队列。
@@ -45,6 +54,8 @@ interface ConnectionState {
   processing: Promise<void>;
   // writes 保存等待写入或因背压未写完的响应。
   readonly writes: PendingWrite[];
+  // queuedWriteBytes 统计尚未交给内核的出站字节，用于隔离慢客户端。
+  queuedWriteBytes: number;
   // true 表示写队列清空后应调用 socket.end()。
   closeAfterWrites: boolean;
   // false 后不再从客户端接受新的请求字节。
@@ -84,7 +95,10 @@ function createConnectionState(socket: Bun.Socket<ConnectionState>): ConnectionS
     id: crypto.randomUUID(),
     closed,
     sendNotification(notification) {
-      return enqueueMessage(socket, notification);
+      return enqueueMessage(socket, notification).completed;
+    },
+    disconnect() {
+      socket.terminate();
     },
   };
   // 返回所有字段都有安全初始值的连接状态。
@@ -97,6 +111,7 @@ function createConnectionState(socket: Bun.Socket<ConnectionState>): ConnectionS
     processing: Promise.resolve(),
     // 新连接还没有等待发送的响应。
     writes: [],
+    queuedWriteBytes: 0,
     // 默认不会在写完后关闭连接。
     closeAfterWrites: false,
     // 默认允许客户端发送请求。
@@ -150,16 +165,18 @@ function flushWrites(socket: Bun.Socket<ConnectionState>): void {
     );
     // 小于 0 表示写入失败，无法安全恢复，因此丢弃队列并立即终止连接。
     if (written < 0) {
-      state.writes.length = 0;
+      rejectPendingWrites(state);
       socket.terminate();
       return;
     }
     pending.offset += written;
+    state.queuedWriteBytes -= written;
     // 没写完时返回；Bun 稍后会调用 drain，届时继续写。
     if (pending.offset < pending.bytes.byteLength) {
       return;
     }
     state.writes.shift();
+    pending.resolveCompleted(true);
   }
 
   if (state.closeAfterWrites) {
@@ -169,21 +186,40 @@ function flushWrites(socket: Bun.Socket<ConnectionState>): void {
 }
 
 /** 将一个响应加入连接的写队列，并立即尝试发送。 */
-function enqueueMessage(socket: Bun.Socket<ConnectionState>, message: OutboundMessage): boolean {
+function enqueueMessage(
+  socket: Bun.Socket<ConnectionState>,
+  message: OutboundMessage,
+): EnqueueResult {
   const state = socket.data;
   if (state.closedState) {
-    return false;
+    return { accepted: false, completed: Promise.resolve(false) };
   }
   const bytes = encodeMessage(message);
   // 与入站帧使用同一个 1 MiB 上限；结尾 LF 不计入帧本身。
   if (bytes.byteLength - 1 > MAX_JSON_RPC_FRAME_BYTES) {
-    return false;
+    return { accepted: false, completed: Promise.resolve(false) };
   }
+  if (
+    state.writes.length >= MAX_CONNECTION_WRITE_FRAMES ||
+    state.queuedWriteBytes + bytes.byteLength > MAX_CONNECTION_WRITE_BYTES
+  ) {
+    return { accepted: false, completed: Promise.resolve(false) };
+  }
+  const completion = Promise.withResolvers<boolean>();
   // 先把响应转为字节并加入队尾，保持响应顺序与请求顺序一致。
-  state.writes.push({ bytes, offset: 0 });
+  state.writes.push({ bytes, offset: 0, resolveCompleted: completion.resolve });
+  state.queuedWriteBytes += bytes.byteLength;
   // 若 socket 当前可写，立即开始发送。
   flushWrites(socket);
-  return true;
+  return { accepted: true, completed: completion.promise };
+}
+
+function rejectPendingWrites(state: ConnectionState): void {
+  for (const pending of state.writes) {
+    pending.resolveCompleted(false);
+  }
+  state.writes.length = 0;
+  state.queuedWriteBytes = 0;
 }
 
 /** 将一条 UTF-8 NDJSON 帧解析为未知 JSON 值；编码或 JSON 无效时返回失败。 */
@@ -263,6 +299,7 @@ export class NdjsonRpcServer {
         },
         close: (socket) => {
           socket.data.closedState = true;
+          rejectPendingWrites(socket.data);
           // 关闭后不再把该 socket 当作活动连接。
           this.#activeSockets.delete(socket);
           // 唤醒可能正在 stop() 中等待它关闭的代码。
@@ -412,7 +449,7 @@ export class NdjsonRpcServer {
             const dispatched = await this.#handler(parsed.value, {
               connection: state.connection,
             });
-            if (!enqueueMessage(socket, dispatched.response)) {
+            if (!enqueueMessage(socket, dispatched.response).accepted) {
               socket.terminate();
               return;
             }

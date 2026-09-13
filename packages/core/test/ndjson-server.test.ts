@@ -1,13 +1,28 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createConnection } from "node:net";
-import type { CoreEndpoint } from "@minicode/protocol";
-import { JsonRpcErrorCode, MAX_JSON_RPC_FRAME_BYTES } from "@minicode/protocol";
+import type { CoreEndpoint, RunId } from "@minicode/protocol";
+import {
+  EVENT_SUBSCRIBE_METHOD,
+  JsonRpcErrorCode,
+  MAX_JSON_RPC_FRAME_BYTES,
+} from "@minicode/protocol";
+import { EventBus } from "../src/events/event-bus.ts";
+import { EventStore } from "../src/events/event-store.ts";
+import { IpcEventBroadcaster } from "../src/events/ipc-event-broadcaster.ts";
+import { EventSubscribeHandler } from "../src/handlers/event-subscription-handlers.ts";
 import { PingHandler } from "../src/handlers/ping-handler.ts";
 import { RpcMethodHandler } from "../src/handlers/rpc-method-handler.ts";
 import type { Logger } from "../src/logger.ts";
 import type { RpcInvocationContext } from "../src/rpc-context.ts";
 import { createRpcDispatcher } from "../src/rpc-dispatcher.ts";
 import { NdjsonRpcServer } from "../src/transport/ndjson-server.ts";
+import {
+  deltaInput,
+  MemoryJournalStorage,
+  RUN_A,
+  RUN_B,
+  SESSION_A,
+} from "./events/test-helpers.ts";
 
 const silentLogger: Logger = {
   debug: () => {},
@@ -273,4 +288,68 @@ describe("NDJSON RPC server", () => {
 
     expect(socket.destroyed).toBe(true);
   });
+
+  test("disconnects a stopped-reading event client without delaying a healthy client", async () => {
+    const bus = new EventBus(new EventStore("/memory", new MemoryJournalStorage()));
+    const broadcaster = new IpcEventBroadcaster(bus);
+    const server = new NdjsonRpcServer(
+      { host: "127.0.0.1", port: 0 },
+      createRpcDispatcher({ handlers: [new EventSubscribeHandler(broadcaster)] }),
+      silentLogger,
+    );
+    const endpoint = server.start();
+    runningServers.push(server);
+
+    const subscribe = (runId: RunId, pauseAfterResponse: boolean) =>
+      new Promise<ReturnType<typeof createConnection>>((resolve, reject) => {
+        const socket = createConnection(endpoint);
+        let buffer = Buffer.alloc(0);
+        socket.once("error", reject);
+        socket.on("data", (data) => {
+          buffer = Buffer.concat([buffer, data]);
+          if (buffer.indexOf(0x0a) === -1) return;
+          if (pauseAfterResponse) socket.pause();
+          resolve(socket);
+        });
+        socket.once("connect", () => {
+          socket.write(
+            `${JSON.stringify({
+              jsonrpc: "2.0",
+              id: `subscribe-${runId}`,
+              method: EVENT_SUBSCRIBE_METHOD,
+              params: { sessionId: SESSION_A, runId, afterSequence: 0 },
+            })}\n`,
+          );
+        });
+      });
+
+    const [slowSocket, healthySocket] = await Promise.all([
+      subscribe(RUN_A, true),
+      subscribe(RUN_B, false),
+    ]);
+    const slowClosed = new Promise<void>((resolve) => slowSocket.once("close", resolve));
+    const healthyEvent = new Promise<void>((resolve) =>
+      healthySocket.on("data", (data) => {
+        if (data.toString("utf8").includes('"method":"event.push"')) resolve();
+      }),
+    );
+
+    expect((await bus.publish(deltaInput("healthy", RUN_B))).ok).toBe(true);
+    await healthyEvent;
+
+    const largeDelta = "x".repeat(16 * 1024);
+    for (let index = 0; index < 2_000 && broadcaster.subscriptionCount === 2; index += 1) {
+      expect((await bus.publish(deltaInput(largeDelta, RUN_A))).ok).toBe(true);
+    }
+    await Promise.race([
+      slowClosed,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("slow event client was not disconnected")), 5_000),
+      ),
+    ]);
+
+    expect(broadcaster.subscriptionCount).toBe(1);
+    expect(healthySocket.destroyed).toBe(false);
+    healthySocket.destroy();
+  }, 10_000);
 });

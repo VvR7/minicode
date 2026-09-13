@@ -1,4 +1,5 @@
 export * from "./app.ts";
+export * from "./agent/index.ts";
 export * from "./config.ts";
 export * from "./events/index.ts";
 export * from "./handlers/index.ts";

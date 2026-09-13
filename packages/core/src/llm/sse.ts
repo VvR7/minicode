@@ -51,6 +51,13 @@ export async function* parseSseStream(body: ReadableStream<Uint8Array>): AsyncIt
       }
     }
 
+    // EOF 也必须 flush 解码器；否则末尾不完整的 UTF-8 序列会被静默忽略。
+    try {
+      buffer += decoder.decode();
+    } catch {
+      throw new LlmError("invalid_response", "SSE stream contains invalid UTF-8");
+    }
+
     // 流正常结束时，处理未以空行结尾的最后一条事件。
     const tail = extractData(buffer);
     if (tail !== undefined) {

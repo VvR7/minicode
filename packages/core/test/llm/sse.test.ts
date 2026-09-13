@@ -65,4 +65,9 @@ describe("parseSseStream", () => {
     const body = streamFrom([new Uint8Array([0xff, 0xfe, 0xfd])]);
     await expect(collect(parseSseStream(body))).rejects.toBeInstanceOf(LlmError);
   });
+
+  test("rejects an incomplete UTF-8 sequence at EOF", async () => {
+    const body = streamFrom([encode("data: ok\n\n"), new Uint8Array([0xe2])]);
+    await expect(collect(parseSseStream(body))).rejects.toBeInstanceOf(LlmError);
+  });
 });

@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { open, readdir, realpath } from "node:fs/promises";
+import { lstat, open, readdir, realpath } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Dirent, Stats } from "node:fs";
@@ -50,10 +50,14 @@ export async function resolveSafePath(workspaceRoot: string, inputPath: string):
   }
 
   // realpath 解析 symlink 并校验最终落在 workspace 内；目标不存在时仍校验最近存在的父目录。
-  let realRoot = workspaceRoot;
-  let realTarget: string;
+  let realRoot: string;
   try {
     realRoot = await realpath(workspaceRoot);
+  } catch {
+    throw new ToolError("io_error", "failed to resolve workspace", true);
+  }
+  let realTarget: string;
+  try {
     realTarget = await realpath(resolved);
   } catch (error) {
     if (isNotFound(error)) {
@@ -73,6 +77,16 @@ export async function resolveSafePath(workspaceRoot: string, inputPath: string):
         } catch (ancestorError) {
           if (!isNotFound(ancestorError)) {
             throw ancestorError;
+          }
+          // realpath 对悬挂 symlink 返回 ENOENT；lstat 可识别该路径本身，必须拒绝。
+          try {
+            if ((await lstat(ancestor)).isSymbolicLink()) {
+              throw new ToolError("path_escape", "path contains a dangling symlink");
+            }
+          } catch (lstatError) {
+            if (!isNotFound(lstatError)) {
+              throw lstatError;
+            }
           }
           ancestor = dirname(ancestor);
         }
@@ -163,7 +177,10 @@ export async function readTextFileSafe(path: string, limitBytes: number): Promis
     let text: string;
     try {
       const decoder = new TextDecoder("utf-8", { fatal: true });
-      text = decoder.decode(bytes, { stream: true }) + decoder.decode();
+      text = decoder.decode(bytes, { stream: info.size > limitBytes });
+      if (info.size <= limitBytes) {
+        text += decoder.decode();
+      }
     } catch {
       throw new ToolError("invalid_utf8", "file is not valid UTF-8");
     }

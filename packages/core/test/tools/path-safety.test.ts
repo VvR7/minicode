@@ -47,4 +47,9 @@ describe("resolveSafePath", () => {
     await symlink(outside, join(root, "link"));
     await expect(resolveSafePath(root, "link/missing.txt")).rejects.toBeInstanceOf(ToolError);
   });
+
+  test("rejects a missing target below a dangling symlink parent", async () => {
+    await symlink(join(outside, "missing-dir"), join(root, "link"));
+    await expect(resolveSafePath(root, "link/missing.txt")).rejects.toBeInstanceOf(ToolError);
+  });
 });

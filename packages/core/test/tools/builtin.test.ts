@@ -49,6 +49,13 @@ describe("read_file", () => {
     expect(new TextEncoder().encode(result.content).byteLength).toBeLessThanOrEqual(256 * 1024);
   });
 
+  test("does not reject valid UTF-8 split at the truncation boundary", async () => {
+    await writeFile(join(root, "utf8.txt"), `${"a".repeat(256 * 1024 - 1)}€tail`);
+    const result = await new ReadFileTool().execute({ path: "utf8.txt" }, context(root));
+    expect(result.truncated).toBe(true);
+    expect(result.content).toBe("a".repeat(256 * 1024 - 1));
+  });
+
   test("reports not_found for missing files", async () => {
     let caught: unknown;
     try {

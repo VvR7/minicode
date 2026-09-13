@@ -4,6 +4,7 @@ import type { EventStore, EventStoreFailure } from "./event-store.ts";
 
 export const MAX_SUBSCRIBER_QUEUE_EVENTS = 256;
 export const MAX_SUBSCRIBER_QUEUE_BYTES = 4 * 1024 * 1024;
+export const DEFAULT_SUBSCRIPTION_CLOSE_GRACE_MS = 1_000;
 
 type WithoutSequence<Event> = Event extends AgentEvent ? Omit<Event, "sequence"> : never;
 export type AgentEventInput = WithoutSequence<AgentEvent>;
@@ -19,14 +20,21 @@ export type EventBusResult<Value> =
   | { readonly ok: false; readonly error: EventBusFailure };
 
 export type AgentEventHandler = (event: AgentEvent) => Promise<void> | void;
+export type SubscriptionCloseReason = "disposed" | "completed" | "slow_consumer" | "handler_error";
 
 export interface EventSubscription {
   readonly id: SubscriptionId;
   readonly sessionId: SessionId;
   readonly runId: RunId;
-  readonly closed: Promise<void>;
+  readonly closed: Promise<SubscriptionCloseReason>;
   activate(): void;
   dispose(): void;
+}
+
+export interface EventBusOptions {
+  readonly maxQueueEvents?: number;
+  readonly maxQueueBytes?: number;
+  readonly closeGraceMs?: number;
 }
 
 interface QueuedEvent {
@@ -49,16 +57,20 @@ class BufferedEventSubscription implements EventSubscription {
   readonly id: SubscriptionId;
   readonly sessionId: SessionId;
   readonly runId: RunId;
-  readonly closed: Promise<void>;
+  readonly closed: Promise<SubscriptionCloseReason>;
   readonly #handler: AgentEventHandler;
   readonly #onClosed: (subscription: BufferedEventSubscription) => void;
+  readonly #maxQueueEvents: number;
+  readonly #maxQueueBytes: number;
+  readonly #closeGraceMs: number;
   readonly #queue: QueuedEvent[] = [];
   #queuedBytes = 0;
   #active: boolean;
   #accepting = true;
   #draining = false;
   #closedState = false;
-  #resolveClosed = (): void => {};
+  #closeTimer: ReturnType<typeof setTimeout> | undefined;
+  #resolveClosed = (_reason: SubscriptionCloseReason): void => {};
 
   constructor(
     id: SubscriptionId,
@@ -67,6 +79,7 @@ class BufferedEventSubscription implements EventSubscription {
     handler: AgentEventHandler,
     onClosed: (subscription: BufferedEventSubscription) => void,
     active: boolean,
+    options: Required<EventBusOptions>,
   ) {
     this.id = id;
     this.sessionId = sessionId;
@@ -74,7 +87,10 @@ class BufferedEventSubscription implements EventSubscription {
     this.#handler = handler;
     this.#onClosed = onClosed;
     this.#active = active;
-    this.closed = new Promise<void>((resolve) => {
+    this.#maxQueueEvents = options.maxQueueEvents;
+    this.#maxQueueBytes = options.maxQueueBytes;
+    this.#closeGraceMs = options.closeGraceMs;
+    this.closed = new Promise<SubscriptionCloseReason>((resolve) => {
       this.#resolveClosed = resolve;
     });
   }
@@ -85,10 +101,10 @@ class BufferedEventSubscription implements EventSubscription {
     }
     const bytes = encoder.encode(JSON.stringify(event)).byteLength;
     if (
-      this.#queue.length >= MAX_SUBSCRIBER_QUEUE_EVENTS ||
-      this.#queuedBytes + bytes > MAX_SUBSCRIBER_QUEUE_BYTES
+      this.#queue.length >= this.#maxQueueEvents ||
+      this.#queuedBytes + bytes > this.#maxQueueBytes
     ) {
-      this.dispose();
+      this.#close("slow_consumer");
       return false;
     }
     this.#queue.push({ event, bytes });
@@ -104,7 +120,7 @@ class BufferedEventSubscription implements EventSubscription {
     this.#active = true;
     this.#scheduleDrain();
     if (!this.#accepting && this.#queue.length === 0) {
-      this.#finish();
+      this.#finish("completed");
     }
   }
 
@@ -116,19 +132,23 @@ class BufferedEventSubscription implements EventSubscription {
     this.#accepting = false;
     this.#onClosed(this);
     if (!this.#draining && this.#queue.length === 0) {
-      this.#finish();
+      this.#finish("completed");
+      return;
     }
+    this.#closeTimer = setTimeout(() => this.#close("slow_consumer"), this.#closeGraceMs);
   }
 
   dispose(): void {
-    if (!this.#accepting && this.#closedState) {
-      return;
-    }
+    this.#close("disposed");
+  }
+
+  #close(reason: SubscriptionCloseReason): void {
+    if (this.#closedState) return;
     this.#accepting = false;
     this.#queue.length = 0;
     this.#queuedBytes = 0;
     this.#onClosed(this);
-    this.#finish();
+    this.#finish(reason);
   }
 
   async #drain(): Promise<void> {
@@ -142,13 +162,13 @@ class BufferedEventSubscription implements EventSubscription {
         await this.#handler(queued.event);
       } catch {
         // handler 故障只关闭自己的订阅，不能反向传播到 publish 或其他 run。
-        this.dispose();
+        this.#close("handler_error");
         return;
       }
     }
     this.#draining = false;
     if (!this.#accepting) {
-      this.#finish();
+      this.#finish("completed");
     }
   }
 
@@ -160,12 +180,16 @@ class BufferedEventSubscription implements EventSubscription {
     queueMicrotask(() => void this.#drain());
   }
 
-  #finish(): void {
+  #finish(reason: SubscriptionCloseReason): void {
     if (this.#closedState) {
       return;
     }
     this.#closedState = true;
-    this.#resolveClosed();
+    if (this.#closeTimer !== undefined) {
+      clearTimeout(this.#closeTimer);
+      this.#closeTimer = undefined;
+    }
+    this.#resolveClosed(reason);
   }
 }
 
@@ -173,9 +197,15 @@ class BufferedEventSubscription implements EventSubscription {
 export class EventBus {
   readonly #store: EventStore;
   readonly #runs = new Map<string, RunState>();
+  readonly #options: Required<EventBusOptions>;
 
-  constructor(store: EventStore) {
+  constructor(store: EventStore, options: EventBusOptions = {}) {
     this.#store = store;
+    this.#options = {
+      maxQueueEvents: options.maxQueueEvents ?? MAX_SUBSCRIBER_QUEUE_EVENTS,
+      maxQueueBytes: options.maxQueueBytes ?? MAX_SUBSCRIBER_QUEUE_BYTES,
+      closeGraceMs: options.closeGraceMs ?? DEFAULT_SUBSCRIPTION_CLOSE_GRACE_MS,
+    };
   }
 
   publish(input: AgentEventInput): Promise<EventBusResult<AgentEvent>> {
@@ -199,11 +229,11 @@ export class EventBus {
         };
       }
       const event = parsed.data;
-      if (event.durable) {
-        const persisted = await this.#store.append(event);
-        if (!persisted.ok) {
-          return this.#storeFailure(persisted.error);
-        }
+      const persisted = event.durable
+        ? await this.#store.append(event)
+        : await this.#store.appendWatermark(event.sessionId, event.runId, event.sequence);
+      if (!persisted.ok) {
+        return this.#storeFailure(persisted.error);
       }
 
       state.nextSequence = event.sequence + 1;
@@ -247,8 +277,9 @@ export class EventBus {
         handler,
         (closed) => state.subscriptions.delete(closed),
         !startPaused,
+        this.#options,
       );
-      for (const event of replay.value) {
+      for (const event of replay.value.events) {
         if (!subscription.enqueue(event)) {
           return {
             ok: false,
@@ -310,8 +341,8 @@ export class EventBus {
     if (!existing.ok) {
       return this.#storeFailure(existing.error);
     }
-    state.nextSequence = (existing.value.at(-1)?.sequence ?? 0) + 1;
-    state.finished = existing.value.some((event) => event.type === "run.finished");
+    state.nextSequence = existing.value.latestSequence + 1;
+    state.finished = existing.value.finished;
     return { ok: true, value: undefined };
   }
 

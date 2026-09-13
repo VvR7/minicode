@@ -1,7 +1,8 @@
 import { chmod, mkdir, open, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type { AgentEvent, RunId, SessionId } from "@minicode/protocol";
 import { AgentEventSchema, RunIdSchema, SessionIdSchema } from "@minicode/protocol";
+import { z } from "zod";
 
 export type EventStoreFailureCode =
   | "read_failed"
@@ -19,16 +20,34 @@ export type EventStoreResult<Value> =
   | { readonly ok: false; readonly error: EventStoreFailure };
 
 export interface EventJournalStorage {
-  append(path: string, content: string): Promise<void>;
+  append(path: string, content: string, directories: readonly string[]): Promise<void>;
   read(path: string): Promise<string | undefined>;
 }
 
+export interface EventJournalSnapshot {
+  readonly events: readonly AgentEvent[];
+  readonly latestSequence: number;
+  readonly finished: boolean;
+}
+
+const SequenceWatermarkSchema = z
+  .object({
+    kind: z.literal("sequence.watermark"),
+    sessionId: SessionIdSchema,
+    runId: RunIdSchema,
+    sequence: z.number().int().positive(),
+  })
+  .strict();
+
+type SequenceWatermark = z.infer<typeof SequenceWatermarkSchema>;
+
 const nodeJournalStorage: EventJournalStorage = {
-  async append(path, content) {
-    const directory = dirname(path);
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    // 即使目录已存在，也收紧权限，避免受进程 umask 或旧目录影响。
-    await chmod(directory, 0o700);
+  async append(path, content, directories) {
+    for (const directory of directories) {
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      // 即使父目录已存在，也逐级收紧权限，避免旧权限泄露 journal 元数据。
+      await chmod(directory, 0o700);
+    }
     const file = await open(path, "a", 0o600);
     try {
       await file.chmod(0o600);
@@ -55,7 +74,7 @@ const nodeJournalStorage: EventJournalStorage = {
   },
 };
 
-/** 仅负责按 session/run 追加和读取已脱敏的 durable AgentEvent。 */
+/** 按 session/run 保存 durable 事件和不含事件内容的 sequence 水位。 */
 export class EventStore {
   readonly #homeDirectory: string;
   readonly #storage: EventJournalStorage;
@@ -81,10 +100,7 @@ export class EventStore {
     }
     try {
       // AgentEvent schema 不包含 goal、绝对 workspace、工具原始参数/输出或 secret。
-      await this.#storage.append(
-        this.pathFor(parsed.data.sessionId, parsed.data.runId),
-        `${JSON.stringify(parsed.data)}\n`,
-      );
+      await this.#appendRecord(parsed.data.sessionId, parsed.data.runId, parsed.data);
       return { ok: true, value: undefined };
     } catch {
       return {
@@ -94,11 +110,40 @@ export class EventStore {
     }
   }
 
+  async appendWatermark(
+    sessionId: SessionId,
+    runId: RunId,
+    sequence: number,
+  ): Promise<EventStoreResult<void>> {
+    const parsed = SequenceWatermarkSchema.safeParse({
+      kind: "sequence.watermark",
+      sessionId,
+      runId,
+      sequence,
+    });
+    if (!parsed.success) {
+      return {
+        ok: false,
+        error: { code: "invalid_event", message: "event sequence watermark is invalid" },
+      };
+    }
+    try {
+      // watermark 只记录连续序号和隔离标识，不写入 transient payload。
+      await this.#appendRecord(sessionId, runId, parsed.data);
+      return { ok: true, value: undefined };
+    } catch {
+      return {
+        ok: false,
+        error: { code: "write_failed", message: "failed to persist event sequence watermark" },
+      };
+    }
+  }
+
   async read(
     sessionId: SessionId,
     runId: RunId,
     afterSequence = 0,
-  ): Promise<EventStoreResult<readonly AgentEvent[]>> {
+  ): Promise<EventStoreResult<EventJournalSnapshot>> {
     if (
       !SessionIdSchema.safeParse(sessionId).success ||
       !RunIdSchema.safeParse(runId).success ||
@@ -120,11 +165,12 @@ export class EventStore {
       };
     }
     if (content === undefined || content.length === 0) {
-      return { ok: true, value: [] };
+      return { ok: true, value: { events: [], latestSequence: 0, finished: false } };
     }
 
     const events: AgentEvent[] = [];
     let previousSequence = 0;
+    let finished = false;
     for (const line of content.split("\n")) {
       if (line.length === 0) {
         continue;
@@ -136,20 +182,47 @@ export class EventStore {
         return this.#corruptJournal();
       }
       const event = AgentEventSchema.safeParse(raw);
+      const watermark = SequenceWatermarkSchema.safeParse(raw);
+      const record: AgentEvent | SequenceWatermark | undefined = event.success
+        ? event.data
+        : watermark.success
+          ? watermark.data
+          : undefined;
       if (
-        !event.success ||
-        event.data.sessionId !== sessionId ||
-        event.data.runId !== runId ||
-        event.data.sequence <= previousSequence
+        record === undefined ||
+        record.sessionId !== sessionId ||
+        record.runId !== runId ||
+        record.sequence !== previousSequence + 1
       ) {
         return this.#corruptJournal();
       }
-      previousSequence = event.data.sequence;
-      if (event.data.sequence > afterSequence) {
+      previousSequence = record.sequence;
+      if (event.success && event.data.sequence > afterSequence) {
         events.push(event.data);
       }
+      if (event.success && event.data.type === "run.finished") {
+        finished = true;
+      }
     }
-    return { ok: true, value: events };
+    return { ok: true, value: { events, latestSequence: previousSequence, finished } };
+  }
+
+  async #appendRecord(
+    sessionId: SessionId,
+    runId: RunId,
+    record: AgentEvent | SequenceWatermark,
+  ): Promise<void> {
+    const sessions = join(this.#homeDirectory, "sessions");
+    const session = join(sessions, sessionId);
+    const runs = join(session, "runs");
+    const run = join(runs, runId);
+    await this.#storage.append(join(run, "events.jsonl"), `${JSON.stringify(record)}\n`, [
+      this.#homeDirectory,
+      sessions,
+      session,
+      runs,
+      run,
+    ]);
   }
 
   #corruptJournal(): EventStoreResult<never> {

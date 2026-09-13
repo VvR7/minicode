@@ -40,8 +40,8 @@ export class IpcEventBroadcaster {
     const created = await this.#bus.subscribe(
       sessionId,
       runId,
-      (event) => {
-        const sent = connection.sendNotification({
+      async (event) => {
+        const sent = await connection.sendNotification({
           jsonrpc: "2.0",
           method: EVENT_PUSH_METHOD,
           params: { subscriptionId, event },
@@ -68,7 +68,12 @@ export class IpcEventBroadcaster {
       this.#connectionSubscriptions.set(connection.id, ids);
     }
     ids.add(subscriptionId);
-    void created.value.closed.then(() => this.#forget(subscriptionId));
+    void created.value.closed.then((reason) => {
+      this.#forget(subscriptionId);
+      if (reason === "slow_consumer" || reason === "handler_error") {
+        connection.disconnect();
+      }
+    });
     this.#watchConnection(connection);
     return {
       ok: true,

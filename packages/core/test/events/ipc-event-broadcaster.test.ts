@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { JsonRpcNotificationEnvelope } from "@minicode/protocol";
 import { EventPushNotificationSchema } from "@minicode/protocol";
-import { EventBus } from "../../src/events/event-bus.ts";
+import { EventBus, MAX_SUBSCRIBER_QUEUE_EVENTS } from "../../src/events/event-bus.ts";
 import { EventStore } from "../../src/events/event-store.ts";
 import { IpcEventBroadcaster } from "../../src/events/ipc-event-broadcaster.ts";
 import type { RpcConnection } from "../../src/rpc-context.ts";
@@ -10,22 +10,32 @@ import { MemoryJournalStorage, RUN_A, SESSION_A, startedInput } from "./test-hel
 
 interface MockConnection extends RpcConnection {
   readonly notifications: JsonRpcNotificationEnvelope[];
+  readonly disconnects: number;
   close(): void;
 }
 
-function createConnection(id: string, sendResult = true): MockConnection {
+function createConnection(
+  id: string,
+  sendResult: boolean | Promise<boolean> = true,
+): MockConnection {
   const closed = Promise.withResolvers<void>();
   const notifications: JsonRpcNotificationEnvelope[] = [];
-  return {
+  const connection = {
     id,
     closed: closed.promise,
     notifications,
-    sendNotification(notification) {
+    disconnects: 0,
+    async sendNotification(notification: JsonRpcNotificationEnvelope) {
       notifications.push(notification);
-      return sendResult;
+      return await sendResult;
+    },
+    disconnect() {
+      connection.disconnects += 1;
+      closed.resolve();
     },
     close: () => closed.resolve(),
   };
+  return connection;
 }
 
 function createBroadcaster() {
@@ -87,10 +97,70 @@ describe("IpcEventBroadcaster", () => {
     }
     subscribed.value.afterResponseEnqueued();
     await bus.publish(startedInput());
-    await Promise.resolve();
-    await Promise.resolve();
+    await connection.closed;
 
     expect(connection.notifications).toHaveLength(1);
+    expect(broadcaster.subscriptionCount).toBe(0);
+    expect(connection.disconnects).toBe(1);
+  });
+
+  test("disconnects only the connection whose subscriber queue is blocked", async () => {
+    const { bus, broadcaster } = createBroadcaster();
+    const blockedSend = new Promise<boolean>(() => {});
+    const slow = createConnection("slow", blockedSend);
+    const healthy = createConnection("healthy");
+    const slowSubscription = await broadcaster.subscribe(slow, SESSION_A, RUN_A);
+    const healthySubscription = await broadcaster.subscribe(healthy, SESSION_A, RUN_A);
+    expect(slowSubscription.ok && healthySubscription.ok).toBe(true);
+    if (!slowSubscription.ok || !healthySubscription.ok) return;
+    slowSubscription.value.afterResponseEnqueued();
+    healthySubscription.value.afterResponseEnqueued();
+
+    for (let index = 0; index <= MAX_SUBSCRIBER_QUEUE_EVENTS + 1; index += 1) {
+      await bus.publish({
+        ...startedInput(),
+        durable: false,
+        type: "llm.text_delta",
+        payload: { text: `${index}` },
+      });
+    }
+    await Promise.resolve();
+
+    expect(slow.disconnects).toBe(1);
+    expect(healthy.disconnects).toBe(0);
+    expect(healthy.notifications).toHaveLength(MAX_SUBSCRIBER_QUEUE_EVENTS + 2);
+    expect(broadcaster.subscriptionCount).toBe(1);
+  });
+
+  test("disconnects and forgets a blocked subscriber after terminal grace", async () => {
+    const storage = new MemoryJournalStorage();
+    const bus = new EventBus(new EventStore("/memory", storage), { closeGraceMs: 10 });
+    const broadcaster = new IpcEventBroadcaster(bus);
+    const connection = createConnection("blocked-terminal", new Promise<boolean>(() => {}));
+    const subscribed = await broadcaster.subscribe(connection, SESSION_A, RUN_A);
+    expect(subscribed.ok).toBe(true);
+    if (!subscribed.ok) return;
+    subscribed.value.afterResponseEnqueued();
+
+    await bus.publish({
+      ...startedInput(),
+      type: "run.finished",
+      payload: {
+        status: "succeeded",
+        reason: "completed",
+        finalText: "done",
+        steps: 1,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(connection.disconnects).toBe(1);
     expect(broadcaster.subscriptionCount).toBe(0);
   });
 

@@ -65,9 +65,9 @@ describe("EventBus", () => {
     const storage = new MemoryJournalStorage();
     const originalAppend = storage.append.bind(storage);
     const gate = Promise.withResolvers<void>();
-    storage.append = async (path, content) => {
+    storage.append = async (path, content, directories) => {
       await gate.promise;
-      await originalAppend(path, content);
+      await originalAppend(path, content, directories);
     };
     const bus = new EventBus(new EventStore("/memory", storage));
     const received: AgentEvent[] = [];
@@ -123,6 +123,35 @@ describe("EventBus", () => {
       payload: { step: 1 },
     });
     expect(next.ok && next.value.sequence).toBe(2);
+  });
+
+  test("does not reuse a transient sequence after restart or lose the exclusive cursor", async () => {
+    const storage = new MemoryJournalStorage();
+    const firstBus = new EventBus(new EventStore("/memory", storage));
+    expect((await firstBus.publish(startedInput())).ok).toBe(true);
+    expect((await firstBus.publish(deltaInput("ephemeral secret"))).ok).toBe(true);
+
+    const restartedBus = new EventBus(new EventStore("/memory", storage));
+    const next = await restartedBus.publish({
+      ...startedInput(),
+      type: "step.started",
+      payload: { step: 1 },
+    });
+    expect(next.ok && next.value.sequence).toBe(3);
+
+    const replayed: number[] = [];
+    await restartedBus.subscribe(
+      SESSION_A,
+      RUN_A,
+      (event) => {
+        replayed.push(event.sequence);
+      },
+      2,
+    );
+    await Promise.resolve();
+    expect(replayed).toEqual([3]);
+    const journal = storage.files.get(new EventStore("/memory", storage).pathFor(SESSION_A, RUN_A));
+    expect(journal).not.toContain("ephemeral secret");
   });
 
   test("disconnects a slow subscriber without blocking another run", async () => {
@@ -190,6 +219,18 @@ describe("EventBus", () => {
     await completed.value.closed;
     expect(terminal).toEqual(["run.finished"]);
     expect(bus.subscriptionCount(SESSION_A, RUN_B)).toBe(0);
+  });
+
+  test("bounds terminal cleanup when a subscriber handler never settles", async () => {
+    const storage = new MemoryJournalStorage();
+    const bus = new EventBus(new EventStore("/memory", storage), { closeGraceMs: 10 });
+    const blocked = await bus.subscribe(SESSION_A, RUN_A, () => new Promise<void>(() => {}));
+    expect(blocked.ok).toBe(true);
+    if (!blocked.ok) return;
+
+    await bus.publish(finishedInput());
+    expect(await blocked.value.closed).toBe("slow_consumer");
+    expect(bus.subscriptionCount(SESSION_A, RUN_A)).toBe(0);
   });
 
   test("returns typed store failures without advancing or broadcasting", async () => {

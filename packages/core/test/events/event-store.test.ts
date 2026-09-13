@@ -30,7 +30,15 @@ describe("EventStore", () => {
     expect(await store.append(event)).toEqual({ ok: true, value: undefined });
     const path = store.pathFor(SESSION_A, RUN_A);
     expect(JSON.parse((await readFile(path, "utf8")).trim())).toEqual(event);
-    expect((await stat(join(path, ".."))).mode & 0o777).toBe(0o700);
+    for (const directory of [
+      home,
+      join(home, "sessions"),
+      join(home, "sessions", SESSION_A),
+      join(home, "sessions", SESSION_A, "runs"),
+      join(path, ".."),
+    ]) {
+      expect((await stat(directory)).mode & 0o777).toBe(0o700);
+    }
     expect((await stat(path)).mode & 0o777).toBe(0o600);
   });
 
@@ -38,10 +46,29 @@ describe("EventStore", () => {
     const storage = new MemoryJournalStorage();
     const store = new EventStore("/memory", storage);
     await store.append(sequencedStarted(1));
+    await store.appendWatermark(SESSION_A, RUN_A, 2);
     await store.append({ ...sequencedStarted(3), type: "step.started", payload: { step: 1 } });
 
     const replay = await store.read(SESSION_A, RUN_A, 1);
-    expect(replay.ok && replay.value.map((event) => event.sequence)).toEqual([3]);
+    expect(replay.ok && replay.value.events.map((event) => event.sequence)).toEqual([3]);
+    expect(replay.ok && replay.value.latestSequence).toBe(3);
+  });
+
+  test("stores transient sequence watermarks without transient payloads", async () => {
+    const storage = new MemoryJournalStorage();
+    const store = new EventStore("/memory", storage);
+
+    expect(await store.appendWatermark(SESSION_A, RUN_A, 1)).toEqual({
+      ok: true,
+      value: undefined,
+    });
+    const journal = storage.files.get(store.pathFor(SESSION_A, RUN_A)) ?? "";
+    expect(journal).toContain('"kind":"sequence.watermark"');
+    expect(journal).not.toContain("secret delta");
+    expect(await store.read(SESSION_A, RUN_A)).toEqual({
+      ok: true,
+      value: { events: [], latestSequence: 1, finished: false },
+    });
   });
 
   test("rejects non-durable or non-schema data instead of persisting secrets", async () => {

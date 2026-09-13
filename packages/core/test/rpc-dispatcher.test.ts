@@ -12,7 +12,8 @@ function createContext(): RpcInvocationContext {
     connection: {
       id: "test-connection",
       closed: new Promise<void>(() => {}),
-      sendNotification: () => true,
+      sendNotification: async () => true,
+      disconnect: () => {},
     },
   };
 }

@@ -63,7 +63,7 @@ export class MemoryJournalStorage implements EventJournalStorage {
   appendError: Error | undefined;
   readError: Error | undefined;
 
-  async append(path: string, content: string): Promise<void> {
+  async append(path: string, content: string, _directories: readonly string[]): Promise<void> {
     if (this.appendError !== undefined) {
       throw this.appendError;
     }

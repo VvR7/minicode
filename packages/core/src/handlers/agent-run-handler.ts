@@ -41,23 +41,31 @@ export class AgentRunHandler extends RpcMethodHandler {
       throw new Error(subscribed.error.code);
     }
 
-    this.#manager.start({
-      sessionId,
-      runId,
-      goal: params.data.goal,
-      workspaceRoot: params.data.workspaceRoot,
-    });
-
-    const result: AgentRunResult = {
-      status: "accepted",
-      sessionId,
-      runId,
-      subscriptionId: subscribed.value.result.subscriptionId,
-    };
-    return {
-      kind: "success",
-      result,
-      afterResponseEnqueued: subscribed.value.afterResponseEnqueued,
-    };
+    try {
+      const activateRun = await this.#manager.start({
+        sessionId,
+        runId,
+        goal: params.data.goal,
+        workspaceRoot: params.data.workspaceRoot,
+      });
+      const activateSubscription = subscribed.value.afterResponseEnqueued;
+      const result: AgentRunResult = {
+        status: "accepted",
+        sessionId,
+        runId,
+        subscriptionId: subscribed.value.result.subscriptionId,
+      };
+      return {
+        kind: "success",
+        result,
+        afterResponseEnqueued: () => {
+          activateSubscription();
+          activateRun();
+        },
+      };
+    } catch (error) {
+      this.#broadcaster.unsubscribe(context.connection, subscribed.value.result.subscriptionId);
+      throw error;
+    }
   }
 }

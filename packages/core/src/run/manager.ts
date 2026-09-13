@@ -3,10 +3,15 @@ import type { AgentRunRequest } from "./runner.ts";
 
 /** RunManager 依赖的最小执行契约，测试可用 fake 替代真实 AgentRunner。 */
 export interface RunExecutor {
-  run(request: AgentRunRequest, signal: AbortSignal): Promise<void>;
+  run(
+    request: AgentRunRequest,
+    signal: AbortSignal,
+    onStarted?: () => Promise<void>,
+  ): Promise<void>;
 }
 
 interface ActiveRun {
+  readonly activate: () => void;
   readonly controller: AbortController;
   readonly promise: Promise<void>;
   readonly sessionId: SessionId;
@@ -36,23 +41,46 @@ export class RunManager {
   }
 
   /** 启动后台 run；重复标识视为编程错误，立即抛出。 */
-  start(request: AgentRunRequest): void {
+  start(request: AgentRunRequest): Promise<() => void> {
     const key = this.#key(request.sessionId, request.runId);
     if (this.#active.has(key) || this.#finished.has(key)) {
       throw new Error(`duplicate run: ${key}`);
     }
     const controller = new AbortController();
-    const promise = this.#runner.run(request, controller.signal);
+    let resolveStarted!: () => void;
+    let rejectStarted!: (error: unknown) => void;
+    let didStart = false;
+    let releaseRun!: () => void;
+    const activation = new Promise<void>((resolve) => {
+      releaseRun = resolve;
+    });
+    const started = new Promise<void>((resolve, reject) => {
+      resolveStarted = resolve;
+      rejectStarted = reject;
+    });
+    const promise = this.#runner.run(request, controller.signal, async () => {
+      didStart = true;
+      resolveStarted();
+      await activation;
+    });
     this.#active.set(key, {
+      activate: releaseRun,
       controller,
       promise,
       sessionId: request.sessionId,
       runId: request.runId,
     });
+    void promise.then(
+      () => {
+        if (!didStart) rejectStarted(new Error("run ended before durable start"));
+      },
+      (error) => rejectStarted(error),
+    );
     void promise.finally(() => {
       this.#active.delete(key);
       this.#finished.add(key);
     });
+    return started.then(() => releaseRun);
   }
 
   /** 幂等取消：active 则 abort，已终态返回 already_finished，否则 not_found。 */
@@ -60,6 +88,7 @@ export class RunManager {
     const key = this.#key(sessionId, runId);
     const active = this.#active.get(key);
     if (active !== undefined) {
+      active.activate();
       active.controller.abort();
       return "cancellation_requested";
     }
@@ -73,6 +102,7 @@ export class RunManager {
   async shutdown(): Promise<void> {
     const active = [...this.#active.values()];
     for (const run of active) {
+      run.activate();
       run.controller.abort();
     }
     await Promise.allSettled(active.map((run) => run.promise));

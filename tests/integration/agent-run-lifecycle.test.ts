@@ -11,6 +11,7 @@ import {
   EventPushNotificationSchema,
   PongResultSchema,
 } from "../../packages/protocol/src/index.ts";
+import type { AgentEvent } from "../../packages/protocol/src/index.ts";
 import { NdjsonRpcConnection } from "../../packages/cli/src/index.ts";
 import { CoreApp, EventBus, EventStore } from "../../packages/core/src/index.ts";
 
@@ -61,6 +62,16 @@ describe("agent.run lifecycle (integration)", () => {
 
       expect(response.result.status).toBe("accepted");
 
+      // accepted 返回时 journal 已包含 run.started，daemon 随即崩溃也可由 startup 收尾。
+      const journal = await new EventStore(home).read(
+        response.result.sessionId,
+        response.result.runId,
+      );
+      expect(journal.ok).toBe(true);
+      if (journal.ok) {
+        expect(journal.value.events[0]?.type).toBe("run.started");
+      }
+
       await waitFor(() => order.includes("event:run.finished"));
       // response 严格早于首个事件。
       expect(order[0]).toBe("response");
@@ -86,6 +97,14 @@ describe("agent.run lifecycle (integration)", () => {
     const home = await mkdtemp(join(tmpdir(), "minicode-run-"));
     const app = makeApp(home);
     const connection = await NdjsonRpcConnection.connect(app.start());
+    const received = new Map<string, AgentEvent[]>();
+    const stop = connection.onNotification((notification) => {
+      const parsed = EventPushNotificationSchema.safeParse(notification);
+      if (!parsed.success) return;
+      const events = received.get(parsed.data.params.subscriptionId) ?? [];
+      events.push(parsed.data.params.event);
+      received.set(parsed.data.params.subscriptionId, events);
+    });
     const first = await connection.request(
       AGENT_RUN_METHOD,
       { goal: "a", workspaceRoot: "/workspace/a" },
@@ -104,32 +123,26 @@ describe("agent.run lifecycle (integration)", () => {
       expect(first.result.runId).not.toBe(second.result.runId);
       expect(first.result.subscriptionId).not.toBe(second.result.subscriptionId);
 
-      const firstTypes: string[] = [];
-      const firstSessions = new Set<string>();
-      const secondTypes: string[] = [];
-      const secondSessions = new Set<string>();
-      const stop = connection.onNotification((notification) => {
-        const parsed = EventPushNotificationSchema.safeParse(notification);
-        if (!parsed.success) return;
-        const sub = parsed.data.params.subscriptionId;
-        const event = parsed.data.params.event;
-        if (sub === first.result.subscriptionId) {
-          firstTypes.push(event.type);
-          firstSessions.add(event.sessionId);
-        } else if (sub === second.result.subscriptionId) {
-          secondTypes.push(event.type);
-          secondSessions.add(event.sessionId);
-        }
-      });
-
       await waitFor(
-        () => firstTypes.includes("run.finished") && secondTypes.includes("run.finished"),
+        () =>
+          (received.get(first.result.subscriptionId) ?? []).some(
+            (event) => event.type === "run.finished",
+          ) &&
+          (received.get(second.result.subscriptionId) ?? []).some(
+            (event) => event.type === "run.finished",
+          ),
       );
-      stop();
+      const firstEvents = received.get(first.result.subscriptionId) ?? [];
+      const secondEvents = received.get(second.result.subscriptionId) ?? [];
 
-      expect([...firstSessions]).toEqual([first.result.sessionId]);
-      expect([...secondSessions]).toEqual([second.result.sessionId]);
+      expect([...new Set(firstEvents.map((event) => event.sessionId))]).toEqual([
+        first.result.sessionId,
+      ]);
+      expect([...new Set(secondEvents.map((event) => event.sessionId))]).toEqual([
+        second.result.sessionId,
+      ]);
     } finally {
+      stop();
       connection.close();
       await app.stop();
       await rm(home, { recursive: true, force: true });

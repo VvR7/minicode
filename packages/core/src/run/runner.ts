@@ -46,27 +46,38 @@ export class AgentRunner {
     this.#providerFactory = options.providerFactory ?? ((config) => new AnthropicAdapter(config));
   }
 
-  async run(request: AgentRunRequest, externalSignal: AbortSignal): Promise<void> {
+  async run(
+    request: AgentRunRequest,
+    externalSignal: AbortSignal,
+    onStarted: () => Promise<void> = async () => {},
+  ): Promise<void> {
     try {
-      await this.#run(request, externalSignal);
+      await this.#run(request, externalSignal, onStarted);
     } catch {
       // 所有失败已在 #run 内收敛为 run.finished；此处兜底防止 daemon 崩溃。
     }
   }
 
-  async #run(request: AgentRunRequest, externalSignal: AbortSignal): Promise<void> {
+  async #run(
+    request: AgentRunRequest,
+    externalSignal: AbortSignal,
+    onStarted: () => Promise<void>,
+  ): Promise<void> {
     const context = new ExecutionContext({
       sessionId: request.sessionId,
       runId: request.runId,
       workspaceRoot: request.workspaceRoot,
       goal: request.goal,
     });
+    await this.#publishStarted(context);
+    // 等待 RPC response 入队后才继续执行，既保证 durable start，又保持响应先于事件。
+    await onStarted();
 
     const llmConfig = loadLlmConfig(this.#environment);
     if (!llmConfig.ok) {
       // 缺配置只让当前 run 以 config_error 失败，绝不杀 daemon。
       context.markFailed("config_error");
-      await this.#publishStartedAndFinished(context);
+      await this.#publishFinished(context);
       return;
     }
 
@@ -91,12 +102,12 @@ export class AgentRunner {
       }
       const invoker = new ToolInvoker(registry);
       const loop = new AgentLoop(provider, registry, invoker, this.#bus);
-      await loop.run(context, controller.signal);
+      await loop.run(context, controller.signal, true);
     } catch {
       // AgentLoop 自身已发布终态；只有组装依赖失败时 context 仍处于 running，需补齐唯一终态。
       if (!context.isDone()) {
         context.markFailed("internal_error");
-        await this.#publishStartedAndFinished(context);
+        await this.#publishFinished(context);
       }
     } finally {
       clearTimeout(timeoutTimer);
@@ -104,8 +115,8 @@ export class AgentRunner {
     }
   }
 
-  /** config_error 场景不经过 AgentLoop，这里直接发布 run.started 与 run.finished。 */
-  async #publishStartedAndFinished(context: ExecutionContext): Promise<void> {
+  /** 在返回 accepted 前持久化 run.started，建立可供重启恢复的 durable 记录。 */
+  async #publishStarted(context: ExecutionContext): Promise<void> {
     const started = await this.#bus.publish({
       sessionId: context.sessionId,
       runId: context.runId,
@@ -117,7 +128,10 @@ export class AgentRunner {
     if (!started.ok) {
       throw new Error(started.error.code);
     }
+  }
 
+  /** 不经过 AgentLoop 的失败场景直接发布唯一 run.finished。 */
+  async #publishFinished(context: ExecutionContext): Promise<void> {
     const finished = await this.#bus.publish({
       sessionId: context.sessionId,
       runId: context.runId,

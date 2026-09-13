@@ -66,6 +66,29 @@ describe("AgentRunner", () => {
     }
   });
 
+  test("publishes an internal_error terminal event when composition fails", async () => {
+    const workspace = await createTempWorkspace();
+    try {
+      const bus = createBus();
+      const runner = new AgentRunner({
+        environment: environmentWithLlm(),
+        bus,
+        providerFactory: () => {
+          throw new Error("factory failed");
+        },
+      });
+      const { events, subscription } = await collectEvents(bus, SESSION_A, RUN_A);
+      await runner.run(
+        { sessionId: SESSION_A, runId: RUN_A, goal: "x", workspaceRoot: workspace },
+        new AbortController().signal,
+      );
+      await subscription.closed;
+      expect(finishedOf(events)).toMatchObject({ status: "failed", reason: "internal_error" });
+    } finally {
+      await cleanupTempWorkspace(workspace);
+    }
+  });
+
   test("fails with run_timeout when the whole run exceeds its timeout", async () => {
     const workspace = await createTempWorkspace();
     try {

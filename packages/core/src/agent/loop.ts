@@ -90,9 +90,11 @@ export class AgentLoop {
   }
 
   /** 执行直到终止；同一 signal 贯穿 LLM 与工具调用。任何失败都落到 context 状态上。 */
-  async run(context: ExecutionContext, signal: AbortSignal): Promise<void> {
+  async run(context: ExecutionContext, signal: AbortSignal, runStarted = false): Promise<void> {
     try {
-      await this.#publish(context, { type: "run.started", payload: {} }, true);
+      if (!runStarted) {
+        await this.#publish(context, { type: "run.started", payload: {} }, true);
+      }
 
       while (!context.isDone()) {
         if (context.step >= context.maxSteps) {

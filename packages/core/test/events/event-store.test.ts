@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -24,6 +24,7 @@ afterEach(async () => {
 describe("EventStore", () => {
   test("writes isolated JSONL with private directory and file permissions", async () => {
     const home = await temporaryDirectory();
+    await chmod(home, 0o755);
     const store = new EventStore(home);
     const event = sequencedStarted();
 
@@ -31,7 +32,6 @@ describe("EventStore", () => {
     const path = store.pathFor(SESSION_A, RUN_A);
     expect(JSON.parse((await readFile(path, "utf8")).trim())).toEqual(event);
     for (const directory of [
-      home,
       join(home, "sessions"),
       join(home, "sessions", SESSION_A),
       join(home, "sessions", SESSION_A, "runs"),
@@ -39,6 +39,8 @@ describe("EventStore", () => {
     ]) {
       expect((await stat(directory)).mode & 0o777).toBe(0o700);
     }
+    // MINICODE_HOME 可能是用户已有目录，不应擅自改变它自身的权限。
+    expect((await stat(home)).mode & 0o777).toBe(0o755);
     expect((await stat(path)).mode & 0o777).toBe(0o600);
   });
 

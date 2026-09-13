@@ -217,7 +217,6 @@ export class EventStore {
     const runs = join(session, "runs");
     const run = join(runs, runId);
     await this.#storage.append(join(run, "events.jsonl"), `${JSON.stringify(record)}\n`, [
-      this.#homeDirectory,
       sessions,
       session,
       runs,

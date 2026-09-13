@@ -264,9 +264,13 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
   ): Promise<DrainResult> => {
     const finished = Promise.withResolvers<void>();
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let active = true;
     const deadlineReached = cancelRequested.promise.then(
       () =>
         new Promise<void>((resolve) => {
+          if (!active) {
+            return;
+          }
           const remaining = Math.max(0, (cancelDeadline ?? Date.now()) - Date.now());
           deadlineTimer = setTimeout(resolve, remaining);
         }),
@@ -296,6 +300,7 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
         await Promise.race([finished.promise, connection.waitUntilClosed(), deadlineReached]);
         return reducer.outcome !== undefined ? "finished" : "disconnected";
       } finally {
+        active = false;
         if (deadlineTimer !== undefined) {
           clearTimeout(deadlineTimer);
         }

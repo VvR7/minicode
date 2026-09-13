@@ -92,6 +92,12 @@ export class AgentRunner {
       const invoker = new ToolInvoker(registry);
       const loop = new AgentLoop(provider, registry, invoker, this.#bus);
       await loop.run(context, controller.signal);
+    } catch {
+      // AgentLoop 自身已发布终态；只有组装依赖失败时 context 仍处于 running，需补齐唯一终态。
+      if (!context.isDone()) {
+        context.markFailed("internal_error");
+        await this.#publishStartedAndFinished(context);
+      }
     } finally {
       clearTimeout(timeoutTimer);
       externalSignal.removeEventListener("abort", onExternalAbort);

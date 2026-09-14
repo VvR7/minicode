@@ -180,9 +180,9 @@ describe("mc-tui process-level E2E (headless)", () => {
       reconnectDelayMs: 20,
     });
 
-    await waitForText(setup, "SUMMARY:content-alpha");
-    // 文本 delta 可能早于 run.finished；等待终态后 q 才应直接退出而不是发起取消。
+    // 只等待 durable 终态，再在同一帧检查最终文本；避免停在流式中间态时误触取消。
     await waitForText(setup, "succeeded");
+    expect(setup.captureCharFrame()).toContain("SUMMARY:content-alpha");
     setup.mockInput.pressKey("q");
     expect(await codePromise).toBe(0);
     expect(mock.callCount).toBe(2);

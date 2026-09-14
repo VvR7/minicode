@@ -102,6 +102,8 @@ function sleepInterruptible(ms: number, signals: readonly AbortSignal[]): Promis
 }
 
 const SHUTDOWN = Symbol("agent-run-client-shutdown");
+const USER_ABORT = Symbol("agent-run-client-user-abort");
+const CANCEL_EXPIRED = Symbol("agent-run-client-cancel-expired");
 
 /**
  * 前端共享的 Agent run 控制器：连接 core、启动精确 run、消费事件流，
@@ -157,7 +159,25 @@ export class AgentRunClient {
     let runIdentity: RunIdentity | undefined;
     let currentConnection: NdjsonRpcConnection | undefined;
     let cancelDeadline: number | undefined;
-    const cancelRequested = Promise.withResolvers<void>();
+    let cancelTimer: ReturnType<typeof setTimeout> | undefined;
+    const userAbortRequested = Promise.withResolvers<void>();
+    const cancelExpired = Promise.withResolvers<void>();
+    const shutdownRequested = Promise.withResolvers<void>();
+    const onShutdown = (): void => shutdownRequested.resolve();
+    if (shutdownSignal.aborted) {
+      onShutdown();
+    } else {
+      shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+    }
+    const shutdownInterruption: Promise<typeof SHUTDOWN> = shutdownRequested.promise.then(
+      (): typeof SHUTDOWN => SHUTDOWN,
+    );
+    const userAbortInterruption: Promise<typeof USER_ABORT> = userAbortRequested.promise.then(
+      (): typeof USER_ABORT => USER_ABORT,
+    );
+    const cancelExpiredInterruption: Promise<typeof CANCEL_EXPIRED> = cancelExpired.promise.then(
+      (): typeof CANCEL_EXPIRED => CANCEL_EXPIRED,
+    );
 
     /** 等待下一次重连；取消后仍按节奏重试，但不超过 cancel deadline。 */
     const waitBeforeReconnect = async (): Promise<void> => {
@@ -194,7 +214,8 @@ export class AgentRunClient {
       }
       cancelledByUser = true;
       cancelDeadline = Date.now() + cancelTimeoutMs;
-      cancelRequested.resolve();
+      userAbortRequested.resolve();
+      cancelTimer = setTimeout(() => cancelExpired.resolve(), cancelTimeoutMs);
       callbacks.onStatus({ state: "cancelling" });
       void requestCancel();
     };
@@ -215,31 +236,9 @@ export class AgentRunClient {
       subscriptionId: SubscriptionId,
     ): Promise<DrainResult> => {
       const runFinished = Promise.withResolvers<void>();
-      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-      let active = true;
-      const deadlineReached = cancelRequested.promise.then(
-        () =>
-          new Promise<void>((resolve) => {
-            if (!active) {
-              return;
-            }
-            const remaining = Math.max(0, (cancelDeadline ?? Date.now()) - Date.now());
-            deadlineTimer = setTimeout(resolve, remaining);
-          }),
-      );
       const consume = async (): Promise<DrainResult> => {
         let stopListening: (() => void) | undefined;
-        let stopShutdownListening: (() => void) | undefined;
         try {
-          const shutdownReached = new Promise<void>((resolve) => {
-            if (shutdownSignal.aborted) {
-              resolve();
-              return;
-            }
-            const onShutdown = (): void => resolve();
-            shutdownSignal.addEventListener("abort", onShutdown, { once: true });
-            stopShutdownListening = () => shutdownSignal.removeEventListener("abort", onShutdown);
-          });
           stopListening = connection.onNotification((notification) => {
             const parsed = EventPushNotificationSchema.safeParse(notification);
             if (!parsed.success || parsed.data.params.subscriptionId !== subscriptionId) {
@@ -268,16 +267,11 @@ export class AgentRunClient {
           await Promise.race([
             runFinished.promise,
             connection.waitUntilClosed(),
-            deadlineReached,
-            shutdownReached,
+            cancelExpired.promise,
+            shutdownRequested.promise,
           ]);
           return finished ? "finished" : "disconnected";
         } finally {
-          active = false;
-          if (deadlineTimer !== undefined) {
-            clearTimeout(deadlineTimer);
-          }
-          stopShutdownListening?.();
           stopListening?.();
         }
       };
@@ -306,27 +300,12 @@ export class AgentRunClient {
         let connection: NdjsonRpcConnection;
         try {
           const pendingConnection = connect(options.endpoint);
-          const connected = await new Promise<NdjsonRpcConnection | typeof SHUTDOWN>(
-            (resolve, reject) => {
-              if (shutdownSignal.aborted) {
-                resolve(SHUTDOWN);
-                return;
-              }
-              const onShutdown = (): void => resolve(SHUTDOWN);
-              shutdownSignal.addEventListener("abort", onShutdown, { once: true });
-              pendingConnection.then(
-                (value) => {
-                  shutdownSignal.removeEventListener("abort", onShutdown);
-                  resolve(value);
-                },
-                (error: unknown) => {
-                  shutdownSignal.removeEventListener("abort", onShutdown);
-                  reject(error);
-                },
-              );
-            },
-          );
-          if (connected === SHUTDOWN) {
+          const connected = await Promise.race([
+            pendingConnection,
+            shutdownInterruption,
+            ...(runIdentity === undefined ? [userAbortInterruption] : [cancelExpiredInterruption]),
+          ]);
+          if (connected === SHUTDOWN || connected === USER_ABORT || connected === CANCEL_EXPIRED) {
             // connect 无法从外部取消；若稍后成功，立即关闭迟到的 socket。
             void pendingConnection.then(
               (lateConnection) => this.#closeConnection(lateConnection),
@@ -368,11 +347,15 @@ export class AgentRunClient {
         try {
           let subscriptionId: SubscriptionId;
           if (runIdentity === undefined) {
-            const response = await connection.request(
+            const pendingRun = connection.request(
               AGENT_RUN_METHOD,
               { goal: options.goal, workspaceRoot: options.workspaceRoot },
               AgentRunResultSchema,
             );
+            const response = await Promise.race([pendingRun, shutdownInterruption]);
+            if (response === SHUTDOWN) {
+              return { kind: "cancelled" };
+            }
             runIdentity = {
               sessionId: response.result.sessionId,
               runId: response.result.runId,
@@ -384,7 +367,7 @@ export class AgentRunClient {
             }
           } else {
             // 断线重连：用已处理 cursor 续订，重放 durable 事件并去重。
-            const response = await connection.request(
+            const pendingSubscribe = connection.request(
               EVENT_SUBSCRIBE_METHOD,
               {
                 sessionId: runIdentity.sessionId,
@@ -393,6 +376,14 @@ export class AgentRunClient {
               },
               EventSubscribeResultSchema,
             );
+            const response = await Promise.race([
+              pendingSubscribe,
+              shutdownInterruption,
+              cancelExpiredInterruption,
+            ]);
+            if (response === SHUTDOWN || response === CANCEL_EXPIRED) {
+              return { kind: "cancelled" };
+            }
             subscriptionId = response.result.subscriptionId;
             // Ctrl-C 可能发生在断线期间；每次重连后幂等补发取消请求。
             if (cancelledByUser) {
@@ -431,6 +422,10 @@ export class AgentRunClient {
       // 任何未预期的内部错误都不向上抛。
       return { kind: "internal-error" };
     } finally {
+      if (cancelTimer !== undefined) {
+        clearTimeout(cancelTimer);
+      }
+      shutdownSignal.removeEventListener("abort", onShutdown);
       signal?.removeEventListener("abort", onAbort);
     }
   }

@@ -318,11 +318,88 @@ describe("AgentRunClient", () => {
       callbacks,
     );
     controller.abort();
-    pending.resolve(connection as unknown as NdjsonRpcConnection);
 
+    // connector 永不 settle 时也应立即响应初始取消。
     expect((await running).kind).toBe("cancelled");
+    pending.resolve(connection as unknown as NdjsonRpcConnection);
+    await Promise.resolve();
+    await Promise.resolve();
     expect(connection.requests.some((request) => request.method === "agent.run")).toBe(false);
     expect(connection.closed).toBe(true);
+  });
+
+  test("bounds a pending reconnect for an established cancelled run", async () => {
+    const controller = new AbortController();
+    const first = new FakeConnection();
+    first.requestHandler = defaultHandler;
+    const reconnectStarted = Promise.withResolvers<void>();
+    const neverConnect = new Promise<NdjsonRpcConnection>(() => {});
+    let attempts = 0;
+    const client = new AgentRunClient();
+
+    const running = client.run(
+      {
+        goal: "x",
+        workspaceRoot: "/w",
+        endpoint,
+        signal: controller.signal,
+        reconnectDelayMs: 0,
+        cancelTimeoutMs: 15,
+        connect: () => {
+          attempts += 1;
+          if (attempts === 1) {
+            return Promise.resolve(first as unknown as NdjsonRpcConnection);
+          }
+          reconnectStarted.resolve();
+          return neverConnect;
+        },
+      },
+      collectCallbacks().callbacks,
+    );
+    await first.listening;
+    first.close();
+    await reconnectStarted.promise;
+    controller.abort();
+
+    expect((await running).kind).toBe("cancelled");
+    expect(attempts).toBe(2);
+  });
+
+  test("bounds a pending subscribe request after cancellation", async () => {
+    const controller = new AbortController();
+    const first = new FakeConnection();
+    const second = new FakeConnection();
+    first.requestHandler = defaultHandler;
+    const subscribeStarted = Promise.withResolvers<void>();
+    second.requestHandler = (method) => {
+      if (method === "event.subscribe") {
+        subscribeStarted.resolve();
+        return new Promise(() => {});
+      }
+      return defaultHandler(method, {});
+    };
+    const { connect } = connectSequence([first, second]);
+    const client = new AgentRunClient();
+
+    const running = client.run(
+      {
+        goal: "x",
+        workspaceRoot: "/w",
+        endpoint,
+        signal: controller.signal,
+        reconnectDelayMs: 0,
+        cancelTimeoutMs: 15,
+        connect,
+      },
+      collectCallbacks().callbacks,
+    );
+    await first.listening;
+    first.close();
+    await subscribeStarted.promise;
+    controller.abort();
+
+    expect((await running).kind).toBe("cancelled");
+    expect(second.closed).toBe(true);
   });
 
   test("keeps reconnecting an established run after cancellation until its deadline", async () => {

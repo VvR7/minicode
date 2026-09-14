@@ -9,7 +9,9 @@ import type { ExecutionContext, FailedReason, RunFinishReason } from "./context.
 
 /** 默认系统提示词；Agent 层负责，provider 不内置默认 prompt。 */
 export const DEFAULT_SYSTEM_PROMPT =
-  "You are a helpful coding agent. Use the provided read-only tools to inspect the workspace, then respond with your final answer in plain text.";
+  "You are a helpful coding agent. Use the provided read-only tools to inspect the workspace, then respond with your final answer in plain text. " +
+  "For complex, multi-step goals that require several tool calls, first create a task plan with task_create and keep it updated with task_update as you start and finish each piece of work. " +
+  "Simple questions and single-step reads do not require a plan.";
 
 /**
  * AgentRunner 用该 reason abort 信号表示“整 run 超时”而非用户取消；

@@ -1,0 +1,410 @@
+import { join } from "node:path";
+import type { RunId, SessionId, TaskSnapshot } from "@minicode/protocol";
+import { nodeSessionStorage } from "../session/storage.ts";
+import {
+  TASK_SCHEMA_VERSION,
+  TASK_TRANSITIONS,
+  TaskGraphFileSchema,
+  TaskRecordSchema,
+  type CreateTaskInput,
+  type TaskGraphFile,
+  type TaskRecord,
+  type TaskStorage,
+  type TaskStoreFailure,
+  type TaskStoreResult,
+  type UpdateTaskInput,
+} from "./types.ts";
+
+/** 计算某个 run 的 tasks.json 绝对路径，与 SessionStore 的路径规则一致。 */
+export function tasksPath(homeDirectory: string, sessionId: SessionId, runId: RunId): string {
+  return join(homeDirectory, "sessions", sessionId, "runs", runId, "tasks.json");
+}
+
+/** 检测直接或间接依赖环。 */
+function hasCycle(tasks: readonly TaskRecord[]): boolean {
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const visiting = new Set<number>();
+  const visited = new Set<number>();
+
+  const visit = (id: number): boolean => {
+    if (visiting.has(id)) {
+      return true;
+    }
+    if (visited.has(id)) {
+      return false;
+    }
+    visiting.add(id);
+    const task = byId.get(id);
+    if (task !== undefined) {
+      for (const dependency of task.blockedBy) {
+        if (byId.has(dependency) && visit(dependency)) {
+          return true;
+        }
+      }
+    }
+    visiting.delete(id);
+    visited.add(id);
+    return false;
+  };
+
+  for (const task of tasks) {
+    if (visit(task.id)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** 由 blockedBy 动态推导 blocked：存在任一未 completed 依赖即为 blocked。 */
+function deriveBlocked(task: TaskRecord, byId: Map<number, TaskRecord>): boolean {
+  return task.blockedBy.some((dependency) => {
+    const dep = byId.get(dependency);
+    return dep === undefined || dep.status !== "completed";
+  });
+}
+
+/** 把持久化 TaskRecord 转换为协议层 TaskSnapshot（含动态 blocked）。 */
+function toSnapshot(task: TaskRecord, byId: Map<number, TaskRecord>): TaskSnapshot {
+  return {
+    id: task.id,
+    subject: task.subject,
+    description: task.description,
+    status: task.status,
+    blocked: deriveBlocked(task, byId),
+    blockedBy: [...task.blockedBy],
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+  };
+}
+
+/** 规范化依赖：去重、升序；非法值由 schema 校验兜底。 */
+function normalizeBlockedBy(dependencies: readonly number[]): number[] {
+  return [...new Set(dependencies)].sort((left, right) => left - right);
+}
+
+/**
+ * 单个 run 独占的 TaskManager：负责 tasks.json 的读取、校验、内存变更与原子写入。
+ * 只记录和约束计划，不主动调度任务。生命周期由 run 独占保证，但写入前仍检测
+ * stale revision 防止两个 manager 实例交错写同一 run。
+ */
+export class TaskManager {
+  readonly #storage: TaskStorage;
+  readonly #path: string;
+  readonly #now: () => string;
+  #graph: TaskGraphFile | null = null;
+
+  constructor(
+    storage: TaskStorage,
+    path: string,
+    now: () => string = () => new Date().toISOString(),
+  ) {
+    this.#storage = storage;
+    this.#path = path;
+    this.#now = now;
+  }
+
+  /** 读取并校验 tasks.json；文件缺失视为空图，损坏或未知版本返回 task_store_corrupted。 */
+  async load(): Promise<TaskStoreResult<TaskGraphFile>> {
+    let raw: string | undefined;
+    try {
+      raw = await this.#storage.readFile(this.#path);
+    } catch {
+      return this.#fail("io_error", "failed to read tasks.json");
+    }
+
+    let graph: TaskGraphFile;
+    if (raw === undefined) {
+      graph = {
+        schemaVersion: TASK_SCHEMA_VERSION,
+        revision: 0,
+        nextId: 1,
+        tasks: [],
+      };
+    } else {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw) as unknown;
+      } catch {
+        return this.#fail("task_store_corrupted", "tasks.json is not valid JSON");
+      }
+      const result = TaskGraphFileSchema.safeParse(parsed);
+      if (!result.success) {
+        return this.#fail("task_store_corrupted", "tasks.json does not match the schema");
+      }
+      graph = result.data;
+    }
+
+    const validated = this.#validatePersisted(graph.tasks, graph.nextId);
+    if (!validated.ok) {
+      return validated;
+    }
+    this.#graph = { ...graph, tasks: [...graph.tasks].sort((a, b) => a.id - b.id) };
+    return { ok: true, value: this.#graph };
+  }
+
+  /** 创建新任务；ID 取 nextId 且只增不复用。 */
+  async create(
+    input: CreateTaskInput,
+  ): Promise<TaskStoreResult<{ revision: number; task: TaskSnapshot }>> {
+    const loaded = await this.#ensureLoaded();
+    if (!loaded.ok) {
+      return loaded;
+    }
+    const graph = this.#graph as TaskGraphFile;
+    const blockedBy = normalizeBlockedBy(input.blockedBy ?? []);
+
+    if (blockedBy.includes(graph.nextId)) {
+      return this.#fail("self_dependency", "a task cannot depend on itself");
+    }
+    const existingIds = new Set(graph.tasks.map((task) => task.id));
+    for (const dependency of blockedBy) {
+      if (!existingIds.has(dependency)) {
+        return this.#fail("dependency_not_found", `dependency ${dependency} does not exist`);
+      }
+    }
+
+    const timestamp = this.#now();
+    const task: TaskRecord = {
+      id: graph.nextId,
+      subject: input.subject,
+      description: input.description,
+      status: "pending",
+      blockedBy,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const parsed = TaskRecordSchema.safeParse(task);
+    if (!parsed.success) {
+      return this.#fail("invalid_task", "task subject or description is invalid");
+    }
+
+    const nextGraph: TaskGraphFile = {
+      ...graph,
+      revision: graph.revision + 1,
+      nextId: graph.nextId + 1,
+      tasks: [...graph.tasks, parsed.data].sort((a, b) => a.id - b.id),
+    };
+    const committed = await this.#commit(nextGraph);
+    if (!committed.ok) {
+      return committed;
+    }
+    return {
+      ok: true,
+      value: { revision: nextGraph.revision, task: this.#snapshotOf(parsed.data, nextGraph.tasks) },
+    };
+  }
+
+  /** 更新任务；校验状态转换、blocked 约束、依赖引用与环，completed 不可变。 */
+  async update(
+    input: UpdateTaskInput,
+  ): Promise<TaskStoreResult<{ revision: number; task: TaskSnapshot }>> {
+    const loaded = await this.#ensureLoaded();
+    if (!loaded.ok) {
+      return loaded;
+    }
+    const graph = this.#graph as TaskGraphFile;
+    const index = graph.tasks.findIndex((task) => task.id === input.id);
+    if (index < 0) {
+      return this.#fail("task_not_found", `task ${input.id} does not exist`);
+    }
+    const current = graph.tasks[index] as TaskRecord;
+
+    const hasChange =
+      input.subject !== undefined ||
+      input.description !== undefined ||
+      input.status !== undefined ||
+      input.blockedBy !== undefined;
+    if (!hasChange) {
+      return this.#fail("invalid_task", "at least one change field is required");
+    }
+    if (current.status === "completed") {
+      return this.#fail("immutable_task", "a completed task cannot be modified");
+    }
+
+    if (input.status !== undefined && input.status !== current.status) {
+      if (!TASK_TRANSITIONS[current.status].includes(input.status)) {
+        return this.#fail(
+          "invalid_transition",
+          `cannot transition from ${current.status} to ${input.status}`,
+        );
+      }
+    }
+
+    const candidate: TaskRecord = {
+      ...current,
+      subject: input.subject ?? current.subject,
+      description: input.description ?? current.description,
+      status: input.status ?? current.status,
+      blockedBy:
+        input.blockedBy === undefined ? current.blockedBy : normalizeBlockedBy(input.blockedBy),
+      updatedAt: this.#now(),
+    };
+    const parsed = TaskRecordSchema.safeParse(candidate);
+    if (!parsed.success) {
+      return this.#fail("invalid_task", "updated task fields are invalid");
+    }
+
+    if (parsed.data.blockedBy.includes(parsed.data.id)) {
+      return this.#fail("self_dependency", "a task cannot depend on itself");
+    }
+    const existingIds = new Set(graph.tasks.map((task) => task.id));
+    for (const dependency of parsed.data.blockedBy) {
+      if (!existingIds.has(dependency)) {
+        return this.#fail("dependency_not_found", `dependency ${dependency} does not exist`);
+      }
+    }
+
+    const candidateTasks = [...graph.tasks];
+    candidateTasks[index] = parsed.data;
+    if (hasCycle(candidateTasks)) {
+      return this.#fail("cycle_dependency", "dependency graph contains a cycle");
+    }
+
+    if (parsed.data.status !== "pending") {
+      const byId = new Map(candidateTasks.map((task) => [task.id, task]));
+      if (deriveBlocked(parsed.data, byId)) {
+        return this.#fail("blocked_task", "a blocked task cannot be in_progress or completed");
+      }
+    }
+
+    const nextGraph: TaskGraphFile = {
+      ...graph,
+      revision: graph.revision + 1,
+      tasks: candidateTasks.sort((a, b) => a.id - b.id),
+    };
+    const committed = await this.#commit(nextGraph);
+    if (!committed.ok) {
+      return committed;
+    }
+    return {
+      ok: true,
+      value: { revision: nextGraph.revision, task: this.#snapshotOf(parsed.data, nextGraph.tasks) },
+    };
+  }
+
+  /** 列出任务（可选按 status 过滤），按 ID 升序返回。 */
+  async list(
+    status?: TaskRecord["status"],
+  ): Promise<TaskStoreResult<{ revision: number; tasks: TaskSnapshot[] }>> {
+    const loaded = await this.#ensureLoaded();
+    if (!loaded.ok) {
+      return loaded;
+    }
+    const graph = this.#graph as TaskGraphFile;
+    const byId = new Map(graph.tasks.map((task) => [task.id, task]));
+    const tasks = graph.tasks
+      .filter((task) => status === undefined || task.status === status)
+      .map((task) => toSnapshot(task, byId));
+    return { ok: true, value: { revision: graph.revision, tasks } };
+  }
+
+  /** 读取单个任务。 */
+  async get(id: number): Promise<TaskStoreResult<{ revision: number; task: TaskSnapshot }>> {
+    const loaded = await this.#ensureLoaded();
+    if (!loaded.ok) {
+      return loaded;
+    }
+    const graph = this.#graph as TaskGraphFile;
+    const task = graph.tasks.find((candidate) => candidate.id === id);
+    if (task === undefined) {
+      return this.#fail("task_not_found", `task ${id} does not exist`);
+    }
+    return {
+      ok: true,
+      value: { revision: graph.revision, task: this.#snapshotOf(task, graph.tasks) },
+    };
+  }
+
+  /** 懒加载图，保证 create/update/list/get 首次调用前已校验落盘状态。 */
+  async #ensureLoaded(): Promise<TaskStoreResult<void>> {
+    if (this.#graph !== null) {
+      return { ok: true, value: undefined };
+    }
+    const loaded = await this.load();
+    if (!loaded.ok) {
+      return loaded;
+    }
+    return { ok: true, value: undefined };
+  }
+
+  /** 校验已持久化的整图：任何结构违例都收敛为 task_store_corrupted。 */
+  #validatePersisted(tasks: readonly TaskRecord[], nextId: number): TaskStoreResult<void> {
+    const ids = new Set<number>();
+    for (const task of tasks) {
+      if (ids.has(task.id)) {
+        return this.#fail("task_store_corrupted", "duplicate task id");
+      }
+      ids.add(task.id);
+    }
+    for (const task of tasks) {
+      for (const dependency of task.blockedBy) {
+        if (dependency === task.id || !ids.has(dependency)) {
+          return this.#fail("task_store_corrupted", "task has an invalid dependency");
+        }
+      }
+    }
+    if (hasCycle(tasks)) {
+      return this.#fail("task_store_corrupted", "dependency graph contains a cycle");
+    }
+    const maxId = tasks.reduce((max, task) => Math.max(max, task.id), 0);
+    if (nextId <= maxId) {
+      return this.#fail("task_store_corrupted", "nextId must exceed every task id");
+    }
+    return { ok: true, value: undefined };
+  }
+
+  /** 原子提交：先做 stale revision 检测，写失败绝不推进内存状态。 */
+  async #commit(nextGraph: TaskGraphFile): Promise<TaskStoreResult<void>> {
+    const diskRevision = await this.#readDiskRevision();
+    if (!diskRevision.ok) {
+      return diskRevision;
+    }
+    if (diskRevision.value !== (this.#graph as TaskGraphFile).revision) {
+      return this.#fail("stale_revision", "tasks.json was modified by another manager");
+    }
+    try {
+      await this.#storage.writeFileAtomic(this.#path, `${JSON.stringify(nextGraph, null, 2)}\n`);
+    } catch {
+      return this.#fail("io_error", "failed to write tasks.json");
+    }
+    this.#graph = nextGraph;
+    return { ok: true, value: undefined };
+  }
+
+  /** 读取磁盘当前 revision；文件缺失视为 0，损坏返回 task_store_corrupted。 */
+  async #readDiskRevision(): Promise<TaskStoreResult<number>> {
+    let raw: string | undefined;
+    try {
+      raw = await this.#storage.readFile(this.#path);
+    } catch {
+      return this.#fail("io_error", "failed to read tasks.json during commit");
+    }
+    if (raw === undefined) {
+      return { ok: true, value: 0 };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      return this.#fail("task_store_corrupted", "tasks.json became corrupt");
+    }
+    const result = TaskGraphFileSchema.safeParse(parsed);
+    if (!result.success) {
+      return this.#fail("task_store_corrupted", "tasks.json schema became invalid");
+    }
+    return { ok: true, value: result.data.revision };
+  }
+
+  /** 由已落盘的任务数组构建单个任务的快照。 */
+  #snapshotOf(task: TaskRecord, tasks: readonly TaskRecord[]): TaskSnapshot {
+    const byId = new Map(tasks.map((candidate) => [candidate.id, candidate]));
+    return toSnapshot(task, byId);
+  }
+
+  #fail(code: TaskStoreFailure["code"], message: string): TaskStoreResult<never> {
+    return { ok: false, error: { code, message } };
+  }
+}
+
+/** 默认的真实文件存储：复用 session 的原子写入 + fsync 实现。 */
+export const nodeTaskStorage: TaskStorage = nodeSessionStorage;

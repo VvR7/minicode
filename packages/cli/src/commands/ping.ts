@@ -6,7 +6,7 @@ import {
 } from "@minicode/protocol";
 
 import type { CoreEndpoint, JsonRpcId } from "@minicode/protocol";
-import { NdjsonRpcClient, RpcClientError } from "@minicode/core";
+import { NdjsonRpcClient, RpcClientError } from "@minicode/client";
 
 export interface PingCommandOptions {
   readonly timeoutMs?: number;

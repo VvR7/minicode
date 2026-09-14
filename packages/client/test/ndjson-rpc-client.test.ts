@@ -3,11 +3,7 @@ import type { Socket } from "node:net";
 import { createServer } from "node:net";
 import type { CoreEndpoint, JsonRpcId, JsonRpcNotificationEnvelope } from "@minicode/protocol";
 import { CORE_PING_METHOD, MAX_JSON_RPC_FRAME_BYTES, PongResultSchema } from "@minicode/protocol";
-import {
-  NdjsonRpcClient,
-  NdjsonRpcConnection,
-  RpcClientError,
-} from "../../src/transport/ndjson-rpc-client.ts";
+import { NdjsonRpcClient, NdjsonRpcConnection, RpcClientError } from "../src/ndjson-rpc-client.ts";
 
 interface MockServer {
   readonly endpoint: CoreEndpoint;

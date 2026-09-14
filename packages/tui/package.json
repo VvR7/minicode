@@ -6,10 +6,15 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "bin": {
+    "mc-tui": "./src/bin.ts"
+  },
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm --sourcemap=external"
+    "build": "bun build ./src/index.ts ./src/bin.ts --outdir ./dist --target bun --format esm --sourcemap=external --external @opentui/core"
   },
   "dependencies": {
-    "@minicode/protocol": "workspace:*"
+    "@minicode/client": "workspace:*",
+    "@minicode/protocol": "workspace:*",
+    "@opentui/core": "0.5.11"
   }
 }

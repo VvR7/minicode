@@ -1,0 +1,16 @@
+{
+  "name": "@minicode/client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm --sourcemap=external"
+  },
+  "dependencies": {
+    "@minicode/protocol": "workspace:*",
+    "zod": "4.6.2"
+  }
+}

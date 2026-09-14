@@ -22,11 +22,13 @@
     "test:coverage": "bun test packages scripts tests/integration --coverage",
     "test:integration": "bun test tests/integration",
     "test:unit": "bun test packages scripts",
+    "tui": "bun run packages/tui/src/bin.ts",
     "coverage:check": "bun run scripts/check-coverage.ts",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.13",
+    "@opentui/core": "0.5.11",
     "@types/bun": "1.4.2",
     "typescript": "7.0.2"
   }

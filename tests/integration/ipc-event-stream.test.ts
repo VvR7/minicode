@@ -7,10 +7,10 @@ import type { RpcInvocationContext } from "../../packages/core/src/index.ts";
 import {
   CoreApp,
   createRpcDispatcher,
-  NdjsonRpcConnection,
   NdjsonRpcServer,
   RpcMethodHandler,
 } from "../../packages/core/src/index.ts";
+import { NdjsonRpcConnection } from "../../packages/client/src/index.ts";
 import type { EventPushNotification } from "../../packages/protocol/src/index.ts";
 import {
   AGENT_RUN_METHOD,

@@ -5,7 +5,7 @@ TUI 前端、类型化 IPC、事件流、工具与权限系统、任务规划、
 以及 MCP 外部工具接入。
 
 当前版本实现了本地 coding agent 闭环：常驻 `mc-core` 前台进程、一次性 `mc-ping` 健康检查，
-以及 `mc --goal` 流式 AgentLoop（只读工具调用 + 事件流 + 断线恢复）。
+`mc --goal` 流式 AgentLoop（只读工具调用 + 事件流 + 断线恢复），以及 `mc-tui` 交互式终端界面。
 
 ## 环境要求
 
@@ -47,6 +47,33 @@ Core 默认监听 `127.0.0.1:7437`。可通过 `.env` 中的 `MINICODE_CORE_HOST
 `MINICODE_CORE_PORT` 修改 loopback 地址；当前不允许监听非本机地址。
 持久化事件默认写入 `~/.minicode`，可通过绝对路径 `MINICODE_HOME` 覆盖。
 
+## 终端界面（TUI）
+
+启动 Core 并配置好 LLM 后，以目标目录作为 workspace 启动交互式 TUI：
+
+```bash
+bun run tui --goal "Read README.md and summarize it"
+```
+
+TUI 以启动目录作为 workspaceRoot，连接正在运行的 Core，实时展示本次 run 的
+run/step/tool/LLM 事件流与 assistant 流式输出；Core 未运行时持续重试并在顶部状态栏显示连接状态。
+界面为顶部状态栏 + 可滚动事件日志 + 底部快捷键提示。
+
+快捷键（纯键盘，不支持鼠标）：
+
+| 按键 | 作用 |
+| --- | --- |
+| `q` | 空闲/结束后退出；运行中首次按下请求取消，再次按下强制退出 |
+| `Ctrl-C` | 运行中取消当前 run |
+| `↑` / `↓` | 向上/向下滚动事件日志 |
+| `PgUp` / `PgDn` | 向上/向下翻页 |
+| `Home` / `End` | 跳到日志开头/结尾 |
+
+退出码：`0` 成功、`1` run 失败、`2` 参数/配置错误或非 TTY 环境、`130` 用户取消或中断。
+
+当前限制：一次 TUI 进程只发起并展示一个隔离 run，结束后按 `q` 退出；不支持交互聊天、
+多 run 列表、历史 run 回放和鼠标操作。需要这些能力时请另建 Issue。
+
 提交前运行：
 
 ```bash
@@ -73,8 +100,9 @@ LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run 
 | --- | --- |
 | `@minicode/protocol` | JSON-RPC、Ping/Pong 和 Core 地址的 Zod schema |
 | `@minicode/core` | Bun TCP/NDJSON server 与 `mc-core` 入口 |
+| `@minicode/client` | CLI/TUI 共用的持久 RPC client 与 typed Agent run controller |
 | `@minicode/cli` | `mc-ping` 健康检查与 `mc --goal` 客户端 |
-| `@minicode/tui` | 预留给终端 UI 前端 |
+| `@minicode/tui` | `mc-tui` 交互式终端界面 |
 
 ## 文档
 

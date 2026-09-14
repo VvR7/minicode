@@ -1,21 +1,10 @@
-import type {
-  AgentEvent,
-  CoreEndpoint,
-  RunId,
-  SessionId,
-  SubscriptionId,
-} from "@minicode/protocol";
+import type { AgentEvent, CoreEndpoint } from "@minicode/protocol";
 import {
-  AGENT_CANCEL_METHOD,
-  AGENT_RUN_METHOD,
-  AgentCancelResultSchema,
-  AgentRunResultSchema,
-  EVENT_SUBSCRIBE_METHOD,
-  EventPushNotificationSchema,
-  EventSubscribeResultSchema,
-  formatEndpoint,
-} from "@minicode/protocol";
-import { NdjsonRpcConnection } from "@minicode/core";
+  AgentRunClient,
+  type AgentRunClientResult,
+  type AgentRunConnector,
+} from "@minicode/client";
+import { formatEndpoint } from "@minicode/protocol";
 
 /** 把文本写到 stdout / stderr 的输出接口，测试可注入捕获 buffer。 */
 export type GoalOutputSink = (text: string) => void;
@@ -71,31 +60,20 @@ export interface GoalEventOutput {
 
 /**
  * 把 run 事件流归约为 CLI 输出：assistant delta 进 stdout，
- * step/tool/retry 等进度进 stderr，并按 sequence 去重（断线重放安全）。
+ * step/tool/retry 等进度进 stderr。sequence 去重与归属校验由共享
+ * AgentRunClient 完成，这里只做纯展示映射。
  */
 export class GoalEventReducer {
-  #lastSequence = 0;
   #outcome: GoalRunOutcome | undefined;
   #currentStepText = "";
-
-  /** 已处理的最大 sequence，作为断线重连的 afterSequence cursor。 */
-  get lastSequence(): number {
-    return this.#lastSequence;
-  }
 
   /** run.finished 到达后的终态；尚未结束时为 undefined。 */
   get outcome(): GoalRunOutcome | undefined {
     return this.#outcome;
   }
 
-  /** 消费一条按 sequence 排序的事件，并返回本次应写入终端的增量。 */
+  /** 消费一条事件，并返回本次应写入终端的增量。 */
   onEvent(event: AgentEvent): GoalEventOutput {
-    // 断线重放或乱序到达时跳过已处理过的 sequence。
-    if (event.sequence <= this.#lastSequence) {
-      return { stderr: [] };
-    }
-    this.#lastSequence = event.sequence;
-
     switch (event.type) {
       case "run.started":
         return { stderr: ["run started"] };
@@ -140,14 +118,14 @@ export class GoalEventReducer {
           finalText: event.payload.finalText,
           steps: event.payload.steps,
         };
-        // text_delta 不持久化；断线后的终态用 finalText 补齐当前最终 step 尚未输出的后缀。
-        const missingFinalText = event.payload.finalText.startsWith(this.#currentStepText)
+        // text_delta 不持久化；前缀一致时只补后缀，非前缀表示断线丢失了中间 delta，
+        // 此时输出带明确分隔的完整 durable finalText，避免把残缺流式文本误认为最终结果。
+        const streamedTextMatches = event.payload.finalText.startsWith(this.#currentStepText);
+        const recoveredText = streamedTextMatches
           ? event.payload.finalText.slice(this.#currentStepText.length)
-          : this.#currentStepText.length === 0
-            ? event.payload.finalText
-            : "";
+          : `\n--- recovered final response ---\n${event.payload.finalText}`;
         return {
-          ...(missingFinalText.length === 0 ? {} : { stdout: missingFinalText }),
+          ...(recoveredText.length === 0 ? {} : { stdout: recoveredText }),
           stderr: [`run ${event.payload.status} (${event.payload.reason})`],
         };
       }
@@ -171,8 +149,24 @@ export function exitCodeFor(outcome: GoalRunOutcome | undefined, cancelledByUser
   }
 }
 
-/** 供测试注入的连接工厂。 */
-export type GoalConnector = (endpoint: CoreEndpoint) => Promise<NdjsonRpcConnection>;
+/** 把共享客户端的生命周期结果 + 终态映射为进程退出码。 */
+export function exitCodeForResult(
+  result: AgentRunClientResult,
+  outcome: GoalRunOutcome | undefined,
+  cancelledByUser: boolean,
+): number {
+  switch (result.kind) {
+    case "finished":
+      return exitCodeFor(outcome, cancelledByUser);
+    case "cancelled":
+      return 130;
+    case "connect-failed":
+    case "acceptance-uncertain":
+      return 2;
+    case "internal-error":
+      return 1;
+  }
+}
 
 export interface GoalCommandOptions {
   readonly goal: string;
@@ -183,7 +177,7 @@ export interface GoalCommandOptions {
   /** Ctrl-C 取消信号；abort 时向 core 发 agent.cancel。 */
   readonly signal?: AbortSignal;
   /** 连接工厂，默认走真实 TCP；测试注入 fake。 */
-  readonly connect?: GoalConnector;
+  readonly connect?: AgentRunConnector;
   /** 断线重连间隔毫秒数。 */
   readonly reconnectDelayMs?: number;
   /** 首次建立 run 前连接失败的最大重试次数，超限返回 usage/config 退出码。 */
@@ -192,218 +186,62 @@ export interface GoalCommandOptions {
   readonly cancelTimeoutMs?: number;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-interface RunIdentity {
-  readonly sessionId: SessionId;
-  readonly runId: RunId;
-}
-
-type DrainResult = "finished" | "disconnected";
-
 /**
- * 执行一次 `mc --goal`：连接 core、启动 run、消费事件流，
- * 处理 Ctrl-C 取消与断线重连，最后返回退出码。
+ * 执行一次 `mc --goal`：通过共享 AgentRunClient 连接 core、启动 run、
+ * 消费事件流，处理 Ctrl-C 取消与断线重连，最后返回退出码。
  */
 export async function runGoalCommand(options: GoalCommandOptions): Promise<number> {
   const writeStdout: GoalOutputSink = options.stdout ?? ((text) => process.stdout.write(text));
   const writeStderr: GoalOutputSink = options.stderr ?? ((text) => process.stderr.write(text));
-  const connect: GoalConnector =
-    options.connect ?? ((endpoint) => NdjsonRpcConnection.connect(endpoint));
-  const signal = options.signal;
-  const reconnectDelayMs = options.reconnectDelayMs ?? 100;
-  const initialConnectAttempts = options.initialConnectAttempts ?? 3;
-  const cancelTimeoutMs = options.cancelTimeoutMs ?? 5_000;
 
   const reducer = new GoalEventReducer();
   let cancelledByUser = false;
-  let runIdentity: RunIdentity | undefined;
-  let currentConnection: NdjsonRpcConnection | undefined;
-  let cancelDeadline: number | undefined;
-  const cancelRequested = Promise.withResolvers<void>();
+  const client = new AgentRunClient();
 
-  /** Ctrl-C 触发：向当前连接发 agent.cancel，run 随后会发布 run.finished(cancelled)。 */
-  const requestCancel = async (): Promise<void> => {
-    if (runIdentity === undefined || currentConnection === undefined) {
-      return;
-    }
-    try {
-      await currentConnection.request(
-        AGENT_CANCEL_METHOD,
-        { sessionId: runIdentity.sessionId, runId: runIdentity.runId },
-        AgentCancelResultSchema,
-      );
-    } catch {
-      // 断线时 cancel 失败；重连后由 drain 继续等待 finished，或再次触发 cancel。
-    }
-  };
-
-  const onAbort = (): void => {
-    if (cancelledByUser) {
-      return;
-    }
-    cancelledByUser = true;
-    cancelDeadline = Date.now() + cancelTimeoutMs;
-    cancelRequested.resolve();
-    void requestCancel();
-  };
-  if (signal !== undefined) {
-    if (signal.aborted) {
-      onAbort();
-    } else {
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-  }
-
-  /** 在一条连接上消费事件流，直到 run 结束或连接断开。 */
-  const drain = (
-    connection: NdjsonRpcConnection,
-    subscriptionId: SubscriptionId,
-  ): Promise<DrainResult> => {
-    const finished = Promise.withResolvers<void>();
-    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
-    let active = true;
-    const deadlineReached = cancelRequested.promise.then(
-      () =>
-        new Promise<void>((resolve) => {
-          if (!active) {
-            return;
-          }
-          const remaining = Math.max(0, (cancelDeadline ?? Date.now()) - Date.now());
-          deadlineTimer = setTimeout(resolve, remaining);
-        }),
-    );
-    const run = async (): Promise<DrainResult> => {
-      let stopListening: (() => void) | undefined;
-      try {
-        stopListening = connection.onNotification((notification) => {
-          const parsed = EventPushNotificationSchema.safeParse(notification);
-          if (!parsed.success || parsed.data.params.subscriptionId !== subscriptionId) {
-            return;
-          }
-          const output = reducer.onEvent(parsed.data.params.event);
-          if (output.stdout !== undefined) {
-            writeStdout(output.stdout);
-          }
-          for (const line of output.stderr) {
-            writeStderr(`${line}\n`);
-          }
-          if (reducer.outcome !== undefined) {
-            finished.resolve();
-          }
-        });
-        await Promise.race([finished.promise, connection.waitUntilClosed(), deadlineReached]);
-        return reducer.outcome !== undefined ? "finished" : "disconnected";
-      } finally {
-        active = false;
-        if (deadlineTimer !== undefined) {
-          clearTimeout(deadlineTimer);
+  const result = await client.run(
+    {
+      goal: options.goal,
+      workspaceRoot: options.workspaceRoot,
+      endpoint: options.endpoint,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.connect === undefined ? {} : { connect: options.connect }),
+      ...(options.reconnectDelayMs === undefined
+        ? {}
+        : { reconnectDelayMs: options.reconnectDelayMs }),
+      ...(options.initialConnectAttempts === undefined
+        ? {}
+        : { initialConnectAttempts: options.initialConnectAttempts }),
+      ...(options.cancelTimeoutMs === undefined
+        ? {}
+        : { cancelTimeoutMs: options.cancelTimeoutMs }),
+    },
+    {
+      onEvent: (event) => {
+        const output = reducer.onEvent(event);
+        if (output.stdout !== undefined) {
+          writeStdout(output.stdout);
         }
-        stopListening?.();
-      }
-    };
-    return run();
-  };
+        for (const line of output.stderr) {
+          writeStderr(`${line}\n`);
+        }
+      },
+      onStatus: (status) => {
+        // 用户 Ctrl-C 由共享客户端触发，据此区分用户取消与 core 关停取消。
+        if (status.state === "cancelling") {
+          cancelledByUser = true;
+        }
+      },
+    },
+  );
 
-  try {
-    let connectAttempts = 0;
-    for (;;) {
-      if (cancelDeadline !== undefined && Date.now() > cancelDeadline) {
-        return 130;
-      }
-      if (signal?.aborted === true && reducer.outcome !== undefined) {
-        return exitCodeFor(reducer.outcome, cancelledByUser);
-      }
-
-      let connection: NdjsonRpcConnection;
-      try {
-        connection = await connect(options.endpoint);
-      } catch {
-        // run 尚未建立：连接失败是配置/环境问题，有限重试后返回 2。
-        if (runIdentity === undefined) {
-          connectAttempts += 1;
-          if (connectAttempts >= initialConnectAttempts) {
-            writeStderr(`error: cannot connect to core (${formatEndpoint(options.endpoint)})\n`);
-            return 2;
-          }
-        }
-        if (signal?.aborted === true) {
-          return 130;
-        }
-        await sleep(reconnectDelayMs);
-        continue;
-      }
-      connectAttempts = 0;
-      currentConnection = connection;
-
-      try {
-        let subscriptionId: SubscriptionId;
-        if (runIdentity === undefined) {
-          const response = await connection.request(
-            AGENT_RUN_METHOD,
-            { goal: options.goal, workspaceRoot: options.workspaceRoot },
-            AgentRunResultSchema,
-          );
-          runIdentity = {
-            sessionId: response.result.sessionId,
-            runId: response.result.runId,
-          };
-          subscriptionId = response.result.subscriptionId;
-          // Ctrl-C 可能发生在 run 建立之前，run 建立后补发 cancel。
-          if (cancelledByUser) {
-            void requestCancel();
-          }
-        } else {
-          // 断线重连：用已处理 cursor 续订，重放 durable 事件并去重。
-          const response = await connection.request(
-            EVENT_SUBSCRIBE_METHOD,
-            {
-              sessionId: runIdentity.sessionId,
-              runId: runIdentity.runId,
-              afterSequence: reducer.lastSequence,
-            },
-            EventSubscribeResultSchema,
-          );
-          subscriptionId = response.result.subscriptionId;
-          // Ctrl-C 可能发生在断线期间；每次重连后幂等补发取消请求。
-          if (cancelledByUser) {
-            // 不等待响应，确保 replay notification 到达前 drain 已注册 listener。
-            void requestCancel();
-          }
-        }
-
-        const status = await drain(connection, subscriptionId);
-        if (status === "finished") {
-          return exitCodeFor(reducer.outcome, cancelledByUser);
-        }
-        // 连接断开：run 未结束时进入重连循环。
-      } catch {
-        // request 或 drain 异常：run 已结束则直接退出，否则当作断线重连。
-        if (reducer.outcome !== undefined) {
-          return exitCodeFor(reducer.outcome, cancelledByUser);
-        }
-        if (runIdentity === undefined) {
-          // agent.run 的响应可能在 accepted 后丢失；禁止重试创建，避免产生重复的孤儿 run。
-          writeStderr("error: agent.run failed before acceptance could be confirmed\n");
-          return signal?.aborted === true ? 130 : 2;
-        }
-      } finally {
-        connection.close();
-        currentConnection = undefined;
-      }
-
-      if (cancelDeadline !== undefined && Date.now() > cancelDeadline) {
-        return 130;
-      }
-      await sleep(reconnectDelayMs);
-    }
-  } catch {
-    // 任何未预期的内部错误按 run failure 处理，不向上抛。
+  // 只在共享客户端无法自行给出更具体退出码的生命周期错误上补充 stderr 说明。
+  if (result.kind === "connect-failed") {
+    writeStderr(`error: cannot connect to core (${formatEndpoint(options.endpoint)})\n`);
+  } else if (result.kind === "acceptance-uncertain") {
+    writeStderr("error: agent.run failed before acceptance could be confirmed\n");
+  } else if (result.kind === "internal-error") {
     writeStderr("error: goal run failed unexpectedly\n");
-    return 1;
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
   }
+
+  return exitCodeForResult(result, reducer.outcome, cancelledByUser);
 }

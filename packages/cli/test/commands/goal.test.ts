@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import type { AgentEvent, CoreEndpoint } from "@minicode/protocol";
-import type { NdjsonRpcConnection } from "@minicode/core";
+import type { NdjsonRpcConnection } from "@minicode/client";
 
 import {
   GoalEventReducer,
   exitCodeFor,
+  exitCodeForResult,
   parseGoalArgs,
   runGoalCommand,
 } from "../../src/commands/goal.ts";
@@ -75,16 +76,32 @@ describe("GoalEventReducer", () => {
     expect(tool.stderr).toEqual(["tool read_file"]);
   });
 
-  test("drops duplicate sequences during replay", () => {
+  test("emits an explicitly separated durable result when middle deltas were lost", () => {
     const reducer = new GoalEventReducer();
-    const first = reducer.onEvent(event("llm.text_delta", { text: "A" }, 1));
-    const duplicate = reducer.onEvent(event("llm.text_delta", { text: "A" }, 1));
-    const next = reducer.onEvent(event("llm.text_delta", { text: "B" }, 2));
+    reducer.onEvent(event("step.started", { step: 1 }, 1));
+    reducer.onEvent(event("llm.text_delta", { text: "Hel" }, 2));
+    reducer.onEvent(event("llm.text_delta", { text: "world" }, 4));
 
-    expect(first.stdout).toBe("A");
-    expect(duplicate.stdout).toBeUndefined();
-    expect(next.stdout).toBe("B");
-    expect(reducer.lastSequence).toBe(2);
+    const terminal = reducer.onEvent(
+      event(
+        "run.finished",
+        {
+          status: "succeeded",
+          reason: "completed",
+          finalText: "Hello world",
+          steps: 1,
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+        },
+        5,
+      ),
+    );
+
+    expect(terminal.stdout).toBe("\n--- recovered final response ---\nHello world");
   });
 
   test("records the terminal outcome from run.finished", () => {
@@ -153,6 +170,18 @@ describe("exitCodeFor", () => {
 
   test("treats a missing outcome as a run failure", () => {
     expect(exitCodeFor(undefined, false)).toBe(1);
+  });
+});
+
+describe("exitCodeForResult", () => {
+  const succeeded = { status: "succeeded", reason: "completed", finalText: "", steps: 1 } as const;
+
+  test("maps lifecycle results to exit codes", () => {
+    expect(exitCodeForResult({ kind: "finished" }, succeeded, false)).toBe(0);
+    expect(exitCodeForResult({ kind: "cancelled" }, undefined, true)).toBe(130);
+    expect(exitCodeForResult({ kind: "connect-failed" }, undefined, false)).toBe(2);
+    expect(exitCodeForResult({ kind: "acceptance-uncertain" }, undefined, false)).toBe(2);
+    expect(exitCodeForResult({ kind: "internal-error" }, undefined, false)).toBe(1);
   });
 });
 

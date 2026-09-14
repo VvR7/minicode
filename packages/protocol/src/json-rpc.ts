@@ -81,10 +81,11 @@ export function makeJsonRpcError(
   id: JsonRpcId | null,
   code: JsonRpcErrorCode,
   message: string,
+  data?: unknown,
 ): JsonRpcErrorResponse {
   return {
     jsonrpc: JSON_RPC_VERSION,
     id,
-    error: { code, message },
+    error: { code, message, ...(data === undefined ? {} : { data }) },
   };
 }

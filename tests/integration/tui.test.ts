@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -46,6 +46,8 @@ interface CoreEnv {
   LLM_API_KEY: string;
   LLM_BASE_URL: string;
   LLM_MODEL: string;
+  LLM_CONTEXT_WINDOW_TOKENS: string;
+  LLM_MAX_OUTPUT_TOKENS: string;
   [name: string]: string | undefined;
 }
 
@@ -59,6 +61,8 @@ function spawnCore(port: number, homeDirectory: string, llmBaseUrl?: string): Su
     LLM_API_KEY: "",
     LLM_BASE_URL: "",
     LLM_MODEL: "",
+    LLM_CONTEXT_WINDOW_TOKENS: "100000",
+    LLM_MAX_OUTPUT_TOKENS: "4096",
   };
   if (llmBaseUrl !== undefined) {
     env.LLM_API_KEY = "test-key";
@@ -116,17 +120,13 @@ async function startCore(llmBaseUrl?: string) {
 interface HeadlessSetup {
   renderer: { destroy(): void };
   mockInput: { pressKey(key: string): void };
-  waitForFrame(
-    predicate: (frame: string) => boolean | Promise<boolean>,
-    options?: { maxPasses?: number },
-  ): Promise<string>;
   captureCharFrame(): string;
 }
 
 /**
- * 事件驱动地轮询渲染帧直到包含目标文本。
- * 只监听渲染器自身调度产出的 FRAME 事件，不直接驱动原生 loop()，
- * 避免与调度器并发驱动导致偶发死锁；渲染器空闲时由外层重试吸收跨进程延迟。
+ * 轮询渲染器已经提交的字符帧，直到出现目标文本。
+ * 不调用 renderOnce，也不等待单个 frame 事件：原生渲染循环偶发不再发出下一帧时，
+ * 这两种等待都可能永久悬挂，绕过 Bun 的测试超时清理。
  */
 async function waitForText(setup: HeadlessSetup, text: string, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -136,13 +136,8 @@ async function waitForText(setup: HeadlessSetup, text: string, timeoutMs = 15_00
     if (lastFrame.includes(text)) {
       return;
     }
-    try {
-      await setup.waitForFrame((frame) => frame.includes(text), { maxPasses: 4 });
-      return;
-    } catch {
-      // 渲染器暂时空闲或无新帧：等待跨进程 IPC 事件推进后再重试。
-      await Bun.sleep(20);
-    }
+    // UI 内容变化会由渲染器自行调度帧；这里仅让出事件循环并施加真实时间上限。
+    await Bun.sleep(20);
   }
   throw new Error(`timed out waiting for frame containing: ${text}\nlast frame:\n${lastFrame}`);
 }
@@ -172,13 +167,6 @@ async function waitUntilListening(port: number, timeoutMs = 3_000): Promise<void
 }
 
 describe("mc-tui process-level E2E (headless)", () => {
-  beforeAll(async () => {
-    // 预热原生渲染器：首个 createTestRenderer 的冷初始化存在偶发竞争导致挂起，
-    // 先用一个临时渲染器把原生模块/渲染线程加载起来，再销毁。
-    const warmup = await createTestRenderer({ width: 40, height: 4, exitOnCtrlC: false });
-    warmup.renderer.destroy();
-  });
-
   test("streams a mock-provider run and quits with 0", async () => {
     const mock = startAnthropicMock();
     cleanups.push(mock.stop);

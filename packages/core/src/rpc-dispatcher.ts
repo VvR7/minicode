@@ -11,6 +11,7 @@ import type { RpcInvocationContext } from "./rpc-context.ts";
 export interface JsonRpcDispatchResult {
   readonly response: JsonRpcSuccessEnvelope | JsonRpcErrorResponse;
   readonly afterResponseEnqueued?: () => void;
+  readonly afterResponseSent?: (sent: boolean) => void;
 }
 
 export interface RpcDispatcherOptions {
@@ -59,7 +60,11 @@ export function createRpcDispatcher(options: RpcDispatcherOptions) {
     }
 
     try {
-      const result = await handler.invoke(envelope.data.params, context);
+      const result = await handler.invoke(envelope.data.params, {
+        ...context,
+        requestId: envelope.data.id,
+        method: envelope.data.method,
+      });
       if (result.kind === "invalid-params") {
         return {
           response: makeJsonRpcError(
@@ -69,15 +74,32 @@ export function createRpcDispatcher(options: RpcDispatcherOptions) {
           ),
         };
       }
+      if (result.kind === "error") {
+        return {
+          response: makeJsonRpcError(envelope.data.id, result.code, result.message, result.data),
+          ...(result.afterResponseEnqueued === undefined
+            ? {}
+            : { afterResponseEnqueued: result.afterResponseEnqueued }),
+          ...(result.afterResponseSent === undefined
+            ? {}
+            : { afterResponseSent: result.afterResponseSent }),
+        };
+      }
 
       const response: JsonRpcSuccessEnvelope = {
         jsonrpc: JSON_RPC_VERSION,
         id: envelope.data.id,
         result: result.result,
       };
-      return result.afterResponseEnqueued === undefined
-        ? { response }
-        : { response, afterResponseEnqueued: result.afterResponseEnqueued };
+      return {
+        response,
+        ...(result.afterResponseEnqueued === undefined
+          ? {}
+          : { afterResponseEnqueued: result.afterResponseEnqueued }),
+        ...(result.afterResponseSent === undefined
+          ? {}
+          : { afterResponseSent: result.afterResponseSent }),
+      };
     } catch {
       return {
         response: makeJsonRpcError(

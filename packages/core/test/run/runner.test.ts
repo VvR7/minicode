@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { AgentEvent } from "@minicode/protocol";
-import { AgentRunner } from "../../src/run/runner.ts";
+import { AgentRunner, runToolSchemas } from "../../src/run/runner.ts";
 import { cleanupTempWorkspace, createTempWorkspace } from "../tools/test-helpers.ts";
 import {
   SESSION_A,
@@ -9,33 +8,35 @@ import {
   collectEvents,
   createBus,
   textResponse,
+  toolCall,
+  toolResponse,
 } from "../agent/test-helpers.ts";
 import { HangProvider, environmentWithLlm, environmentWithoutLlm } from "./test-helpers.ts";
-
-function finishedOf(events: readonly AgentEvent[]) {
-  const finished = events.find((e) => e.type === "run.finished");
-  if (finished === undefined || finished.type !== "run.finished") {
-    throw new Error("missing run.finished");
-  }
-  return finished.payload;
-}
 
 describe("AgentRunner", () => {
   test("fails with config_error and keeps the daemon alive when LLM config is missing", async () => {
     const workspace = await createTempWorkspace();
     try {
       const bus = createBus();
-      const runner = new AgentRunner({ environment: environmentWithoutLlm(), bus });
+      const runner = new AgentRunner({
+        environment: environmentWithoutLlm(),
+        bus,
+        homeDirectory: workspace,
+      });
       const { events, subscription } = await collectEvents(bus, SESSION_A, RUN_A);
 
-      // 不抛异常：run 把缺配置收敛为 run.finished(config_error)。
-      await runner.run(
+      // 不抛异常：Runner 把缺配置收敛为 config_error completion。
+      const outcome = await runner.run(
         { sessionId: SESSION_A, runId: RUN_A, goal: "x", workspaceRoot: workspace },
         new AbortController().signal,
       );
-      await subscription.closed;
+      subscription.dispose();
 
-      expect(finishedOf(events)).toMatchObject({ status: "failed", reason: "config_error" });
+      expect(outcome.completion).toMatchObject({
+        status: "failed",
+        reason: "config_error",
+        error: { code: "config_error", message: "run failed (config_error)" },
+      });
       expect(events[0]?.type).toBe("run.started");
     } finally {
       await cleanupTempWorkspace(workspace);
@@ -50,40 +51,105 @@ describe("AgentRunner", () => {
       const runner = new AgentRunner({
         environment: environmentWithLlm(),
         bus,
+        homeDirectory: workspace,
         providerFactory: () => provider,
       });
-      const { events, subscription } = await collectEvents(bus, SESSION_A, RUN_A);
+      const { subscription } = await collectEvents(bus, SESSION_A, RUN_A);
 
-      await runner.run(
+      const outcome = await runner.run(
         { sessionId: SESSION_A, runId: RUN_A, goal: "x", workspaceRoot: workspace },
         new AbortController().signal,
       );
-      await subscription.closed;
+      subscription.dispose();
 
-      expect(finishedOf(events)).toMatchObject({ status: "succeeded", finalText: "hi" });
+      expect(outcome.completion).toMatchObject({ status: "succeeded", finalText: "hi" });
     } finally {
       await cleanupTempWorkspace(workspace);
     }
   });
 
-  test("publishes an internal_error terminal event when composition fails", async () => {
+  test("composes task/note tools and returns the final task graph in RunCompletion", async () => {
+    const workspace = await createTempWorkspace();
+    try {
+      const bus = createBus();
+      const provider = new FakeProvider([
+        {
+          response: toolResponse([
+            toolCall("task-1", "task_create", {
+              subject: "Inspect",
+              description: "Inspect the workspace",
+            }),
+            toolCall("note-1", "note_save", { content: "Remember the result" }),
+          ]),
+        },
+        { response: textResponse("done") },
+      ]);
+      const runner = new AgentRunner({
+        environment: environmentWithLlm(),
+        bus,
+        homeDirectory: workspace,
+        providerFactory: () => provider,
+      });
+
+      const outcome = await runner.run(
+        {
+          sessionId: SESSION_A,
+          runId: RUN_A,
+          goal: "work",
+          workspaceRoot: workspace,
+          history: [{ role: "user", content: [{ type: "text", text: "old context" }] }],
+        },
+        new AbortController().signal,
+      );
+
+      expect(provider.calls[0]?.messages[0]?.content[0]).toEqual({
+        type: "text",
+        text: "old context",
+      });
+      expect(outcome.completion.messages[0]?.content[0]).toEqual({ type: "text", text: "work" });
+      expect(
+        outcome.completion.messages.some((message) =>
+          message.content.some((part) => part.type === "text" && part.text === "old context"),
+        ),
+      ).toBe(false);
+      expect(outcome.completion.taskGraph).toMatchObject({
+        revision: 1,
+        tasks: [{ id: 1, subject: "Inspect", status: "pending" }],
+      });
+      expect(runToolSchemas().map((schema) => schema.name)).toEqual(
+        expect.arrayContaining([
+          "read_file",
+          "task_create",
+          "task_update",
+          "task_list",
+          "task_get",
+          "note_save",
+        ]),
+      );
+    } finally {
+      await cleanupTempWorkspace(workspace);
+    }
+  });
+
+  test("returns an internal_error completion when composition fails", async () => {
     const workspace = await createTempWorkspace();
     try {
       const bus = createBus();
       const runner = new AgentRunner({
         environment: environmentWithLlm(),
         bus,
+        homeDirectory: workspace,
         providerFactory: () => {
           throw new Error("factory failed");
         },
       });
-      const { events, subscription } = await collectEvents(bus, SESSION_A, RUN_A);
-      await runner.run(
+      const { subscription } = await collectEvents(bus, SESSION_A, RUN_A);
+      const outcome = await runner.run(
         { sessionId: SESSION_A, runId: RUN_A, goal: "x", workspaceRoot: workspace },
         new AbortController().signal,
       );
-      await subscription.closed;
-      expect(finishedOf(events)).toMatchObject({ status: "failed", reason: "internal_error" });
+      subscription.dispose();
+      expect(outcome.completion).toMatchObject({ status: "failed", reason: "internal_error" });
     } finally {
       await cleanupTempWorkspace(workspace);
     }
@@ -96,18 +162,19 @@ describe("AgentRunner", () => {
       const runner = new AgentRunner({
         environment: environmentWithLlm(),
         bus,
+        homeDirectory: workspace,
         runTimeoutMs: 20,
         providerFactory: () => new HangProvider(),
       });
-      const { events, subscription } = await collectEvents(bus, SESSION_A, RUN_A);
+      const { subscription } = await collectEvents(bus, SESSION_A, RUN_A);
 
-      await runner.run(
+      const outcome = await runner.run(
         { sessionId: SESSION_A, runId: RUN_A, goal: "x", workspaceRoot: workspace },
         new AbortController().signal,
       );
-      await subscription.closed;
+      subscription.dispose();
 
-      expect(finishedOf(events)).toMatchObject({ status: "failed", reason: "run_timeout" });
+      expect(outcome.completion).toMatchObject({ status: "failed", reason: "run_timeout" });
     } finally {
       await cleanupTempWorkspace(workspace);
     }
@@ -120,9 +187,10 @@ describe("AgentRunner", () => {
       const runner = new AgentRunner({
         environment: environmentWithLlm(),
         bus,
+        homeDirectory: workspace,
         providerFactory: () => new HangProvider(),
       });
-      const { events, subscription } = await collectEvents(bus, SESSION_A, RUN_A);
+      const { subscription } = await collectEvents(bus, SESSION_A, RUN_A);
 
       const controller = new AbortController();
       const running = runner.run(
@@ -130,10 +198,10 @@ describe("AgentRunner", () => {
         controller.signal,
       );
       controller.abort();
-      await running;
-      await subscription.closed;
+      const outcome = await running;
+      subscription.dispose();
 
-      expect(finishedOf(events)).toMatchObject({ status: "cancelled", reason: "cancelled" });
+      expect(outcome.completion).toMatchObject({ status: "cancelled", reason: "cancelled" });
     } finally {
       await cleanupTempWorkspace(workspace);
     }

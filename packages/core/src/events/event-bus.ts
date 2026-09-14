@@ -35,6 +35,8 @@ export interface EventBusOptions {
   readonly maxQueueEvents?: number;
   readonly maxQueueBytes?: number;
   readonly closeGraceMs?: number;
+  /** durable event 或 watermark 成功写入后的 best-effort observer。 */
+  readonly onPersisted?: (event: AgentEvent) => void;
 }
 
 interface QueuedEvent {
@@ -79,7 +81,7 @@ class BufferedEventSubscription implements EventSubscription {
     handler: AgentEventHandler,
     onClosed: (subscription: BufferedEventSubscription) => void,
     active: boolean,
-    options: Required<EventBusOptions>,
+    options: Required<Pick<EventBusOptions, "maxQueueEvents" | "maxQueueBytes" | "closeGraceMs">>,
   ) {
     this.id = id;
     this.sessionId = sessionId;
@@ -197,7 +199,10 @@ class BufferedEventSubscription implements EventSubscription {
 export class EventBus {
   readonly #store: EventStore;
   readonly #runs = new Map<string, RunState>();
-  readonly #options: Required<EventBusOptions>;
+  readonly #options: Required<
+    Pick<EventBusOptions, "maxQueueEvents" | "maxQueueBytes" | "closeGraceMs">
+  >;
+  readonly #onPersisted: ((event: AgentEvent) => void) | undefined;
 
   constructor(store: EventStore, options: EventBusOptions = {}) {
     this.#store = store;
@@ -206,6 +211,7 @@ export class EventBus {
       maxQueueBytes: options.maxQueueBytes ?? MAX_SUBSCRIBER_QUEUE_BYTES,
       closeGraceMs: options.closeGraceMs ?? DEFAULT_SUBSCRIPTION_CLOSE_GRACE_MS,
     };
+    this.#onPersisted = options.onPersisted;
   }
 
   publish(input: AgentEventInput): Promise<EventBusResult<AgentEvent>> {
@@ -237,6 +243,11 @@ export class EventBus {
       }
 
       state.nextSequence = event.sequence + 1;
+      try {
+        this.#onPersisted?.(event);
+      } catch {
+        // Trace/observer 失败不能改变已经持久化的领域事件。
+      }
       for (const subscription of [...state.subscriptions]) {
         subscription.enqueue(event);
       }

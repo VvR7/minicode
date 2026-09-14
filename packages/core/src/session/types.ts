@@ -78,7 +78,8 @@ export const TurnCompletedRecordSchema = z
     reason: HistoryTurnReasonSchema.optional(),
     messages: z.array(HistoryMessageSchema),
     includedInContext: z.boolean(),
-    model: z.string().min(1).max(256),
+    // config_error 可能发生在选定模型之前，此时允许空字符串作为“未选择”审计值。
+    model: z.string().max(256),
     taskGraph: TaskGraphSnapshotSchema.optional(),
   })
   .superRefine((record, ctx) => {

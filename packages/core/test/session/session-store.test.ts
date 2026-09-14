@@ -421,7 +421,7 @@ describe("SessionStore turn lifecycle", () => {
     }
   });
 
-  test("serializes concurrent appends for one session without losing records", async () => {
+  test("treats multiple concurrently accepted unfinished turns as corrupted", async () => {
     const { store, storage } = createMemoryStore(HOME);
     seedSession(storage, HOME, SESSION_A);
     await Promise.all([
@@ -439,9 +439,9 @@ describe("SessionStore turn lifecycle", () => {
       }),
     ]);
     const loaded = await store.load(SESSION_A);
-    expect(loaded.ok).toBe(true);
-    if (loaded.ok) {
-      expect(loaded.value.turns).toHaveLength(2);
+    expect(loaded.ok).toBe(false);
+    if (!loaded.ok) {
+      expect(loaded.error.code).toBe("session_corrupted");
     }
   });
 });

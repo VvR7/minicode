@@ -4,6 +4,8 @@ import type { CoreConfig } from "./config.ts";
 import { EventBus } from "./events/event-bus.ts";
 import { EventStore } from "./events/event-store.ts";
 import { IpcEventBroadcaster } from "./events/ipc-event-broadcaster.ts";
+import { IpcSessionBroadcaster } from "./events/ipc-session-broadcaster.ts";
+import { SessionEventBus } from "./events/session-event-bus.ts";
 import { AgentCancelHandler } from "./handlers/agent-cancel-handler.ts";
 import { AgentRunHandler } from "./handlers/agent-run-handler.ts";
 import {
@@ -11,11 +13,21 @@ import {
   EventUnsubscribeHandler,
 } from "./handlers/event-subscription-handlers.ts";
 import { PingHandler } from "./handlers/ping-handler.ts";
+import {
+  SessionCreateHandler,
+  SessionGetHandler,
+  SessionGetHistoryHandler,
+  SessionListHandler,
+  SessionSendMessageHandler,
+  SessionSubscribeHandler,
+} from "./handlers/session-handlers.ts";
 import { createLogger } from "./logger.ts";
 import { createRpcDispatcher } from "./rpc-dispatcher.ts";
-import { RunManager } from "./run/manager.ts";
-import { markIncompleteRunsRestarted } from "./run/restart.ts";
+import { RunMetadataStore } from "./run/metadata.ts";
 import { AgentRunner } from "./run/runner.ts";
+import { SessionManager } from "./session/manager.ts";
+import { SessionStore } from "./session/session-store.ts";
+import { RunTraceRegistry } from "./trace/registry.ts";
 import { NdjsonRpcServer } from "./transport/ndjson-server.ts";
 
 export class CoreApp {
@@ -25,7 +37,9 @@ export class CoreApp {
   #server: NdjsonRpcServer | undefined;
   #eventBus: EventBus | undefined;
   #broadcaster: IpcEventBroadcaster | undefined;
-  #manager: RunManager | undefined;
+  #sessionBroadcaster: IpcSessionBroadcaster | undefined;
+  #manager: SessionManager | undefined;
+  #traces: RunTraceRegistry | undefined;
   #startedAt = 0;
 
   constructor(config: CoreConfig, environment: Environment = Bun.env) {
@@ -41,18 +55,44 @@ export class CoreApp {
 
     this.#startedAt = performance.now();
     const eventStore = new EventStore(this.#config.homeDirectory);
-    const eventBus = new EventBus(eventStore);
-    const broadcaster = new IpcEventBroadcaster(eventBus);
-    const manager = new RunManager(
-      new AgentRunner({ environment: this.#environment, bus: eventBus }),
-    );
+    const traces = new RunTraceRegistry(this.#config.homeDirectory, this.#environment);
+    const eventBus = new EventBus(eventStore, {
+      onPersisted: (event) => traces.recordAgentEvent(event),
+    });
+    const sessionStore = new SessionStore(this.#config.homeDirectory);
+    const sessionEvents = new SessionEventBus(sessionStore, {
+      onPersisted: (event) => traces.recordSessionEvent(event),
+    });
+    const broadcaster = new IpcEventBroadcaster(eventBus, traces);
+    const sessionBroadcaster = new IpcSessionBroadcaster(sessionEvents, traces);
+    const runner = new AgentRunner({
+      environment: this.#environment,
+      bus: eventBus,
+      homeDirectory: this.#config.homeDirectory,
+    });
+    const manager = new SessionManager({
+      store: sessionStore,
+      runner,
+      eventBus,
+      eventStore,
+      sessionEvents,
+      metadata: new RunMetadataStore(this.#config.homeDirectory),
+      traces,
+      environment: this.#environment,
+    });
     const dispatcher = createRpcDispatcher({
       handlers: [
         new PingHandler({ uptimeMs: () => performance.now() - this.#startedAt }),
         new EventSubscribeHandler(broadcaster),
-        new EventUnsubscribeHandler(broadcaster),
+        new EventUnsubscribeHandler(broadcaster, sessionBroadcaster),
         new AgentRunHandler({ manager, broadcaster }),
         new AgentCancelHandler(manager),
+        new SessionCreateHandler(manager),
+        new SessionGetHandler(manager),
+        new SessionListHandler(manager),
+        new SessionGetHistoryHandler(manager),
+        new SessionSendMessageHandler(manager),
+        new SessionSubscribeHandler(manager, sessionBroadcaster),
       ],
     });
     const server = new NdjsonRpcServer(this.#config, dispatcher, this.#logger);
@@ -60,14 +100,9 @@ export class CoreApp {
     this.#server = server;
     this.#eventBus = eventBus;
     this.#broadcaster = broadcaster;
+    this.#sessionBroadcaster = sessionBroadcaster;
     this.#manager = manager;
-
-    // startup 把未完成 journal 补记为 core_restarted；异步执行，不阻塞监听。
-    void markIncompleteRunsRestarted(eventBus, eventStore, this.#config.homeDirectory).catch(
-      (error: unknown) => {
-        this.#logger.warn(`mark incomplete runs failed: ${String(error)}`);
-      },
-    );
+    this.#traces = traces;
 
     this.#logger.info(`mc-core ${MINICODE_VERSION} listening address=${formatEndpoint(endpoint)}`);
     return endpoint;
@@ -87,9 +122,13 @@ export class CoreApp {
     await server.stop();
 
     this.#broadcaster?.close();
+    this.#sessionBroadcaster?.close();
     this.#broadcaster = undefined;
+    this.#sessionBroadcaster = undefined;
     this.#eventBus = undefined;
     this.#manager = undefined;
+    await this.#traces?.stopAll();
+    this.#traces = undefined;
   }
 
   get eventBus(): EventBus {

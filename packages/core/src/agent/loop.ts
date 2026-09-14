@@ -5,6 +5,8 @@ import type { LlmContentPart, LlmResponse, LlmStreamEvent } from "../llm/types.t
 import type { EventBus } from "../events/event-bus.ts";
 import type { ToolRegistry } from "../tools/registry.ts";
 import type { ToolInvoker } from "../tools/invoker.ts";
+import type { RunCompletion } from "../run/completion.ts";
+import type { TraceRecorder } from "../trace/recorder.ts";
 import type { ExecutionContext, FailedReason, RunFinishReason } from "./context.ts";
 
 /** 默认系统提示词；Agent 层负责，provider 不内置默认 prompt。 */
@@ -38,6 +40,8 @@ export interface AgentLoopOptions {
   readonly timeoutMs?: number;
   /** 传给 provider 的首 delta 前最大尝试次数。 */
   readonly maxAttempts?: number;
+  /** 当前 run 的 best-effort Trace 记录器。 */
+  readonly trace?: TraceRecorder;
 }
 
 /** EventBus 发布失败（如 event_store_error）时抛出，由 run 映射为结构化失败。 */
@@ -74,6 +78,7 @@ export class AgentLoop {
   readonly #systemPrompt: string;
   readonly #timeoutMs: number | undefined;
   readonly #maxAttempts: number | undefined;
+  readonly #trace: TraceRecorder | undefined;
 
   constructor(
     provider: LlmProvider,
@@ -89,10 +94,15 @@ export class AgentLoop {
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.#timeoutMs = options.timeoutMs;
     this.#maxAttempts = options.maxAttempts;
+    this.#trace = options.trace;
   }
 
-  /** 执行直到终止；同一 signal 贯穿 LLM 与工具调用。任何失败都落到 context 状态上。 */
-  async run(context: ExecutionContext, signal: AbortSignal, runStarted = false): Promise<void> {
+  /** 执行直到终止；同一 signal 贯穿 LLM 与工具调用。返回结构化 RunCompletion，不发布 run.finished。 */
+  async run(
+    context: ExecutionContext,
+    signal: AbortSignal,
+    runStarted = false,
+  ): Promise<RunCompletion> {
     try {
       if (!runStarted) {
         await this.#publish(context, { type: "run.started", payload: {} }, true);
@@ -146,17 +156,13 @@ export class AgentLoop {
       if (!context.isDone()) {
         context.markFailed(this.#mapError(error));
       }
-    } finally {
-      try {
-        await this.#publishRunFinished(context);
-      } catch {
-        // run.finished 发布失败不应覆盖已有 context 状态。
-      }
     }
+    return this.#completion(context);
   }
 
   /** 单步：选模型、消费流、累计 usage、按停止原因分派。 */
   async #runStep(context: ExecutionContext, signal: AbortSignal): Promise<StepOutcome> {
+    context.model = this.#provider.model;
     await this.#publish(
       context,
       {
@@ -212,7 +218,7 @@ export class AgentLoop {
             await this.#publish(
               context,
               { type: "llm.text_delta", payload: { text: chunk } },
-              false,
+              true,
             );
           }
           break;
@@ -228,7 +234,7 @@ export class AgentLoop {
                 reason: event.reason,
               },
             },
-            false,
+            true,
           );
           break;
         case "completed":
@@ -242,14 +248,97 @@ export class AgentLoop {
     return response;
   }
 
+  /** 使用当前上下文调用 provider，并在外层附加 best-effort Trace。 */
   #stream(context: ExecutionContext, signal: AbortSignal): AsyncIterable<LlmStreamEvent> {
-    return this.#provider.stream(context.messages, {
+    const options = {
       system: this.#systemPrompt,
       toolSchemas: this.#registry.toolSchemas(),
       signal,
       ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }),
       ...(this.#maxAttempts === undefined ? {} : { maxAttempts: this.#maxAttempts }),
+    };
+    const stream = this.#provider.stream(context.messages, options);
+    return this.#traceStream(context, stream, options);
+  }
+
+  /** 包装 provider 流并保证每个 llm.request 都有 response/error/cancelled 终结记录。 */
+  async *#traceStream(
+    context: ExecutionContext,
+    stream: AsyncIterable<LlmStreamEvent>,
+    options: {
+      readonly system: string;
+      readonly toolSchemas: readonly unknown[];
+      readonly signal: AbortSignal;
+      readonly timeoutMs?: number;
+      readonly maxAttempts?: number;
+    },
+  ): AsyncIterable<LlmStreamEvent> {
+    const startedAt = performance.now();
+    let terminalRecorded = false;
+    this.#trace?.record({
+      source: "CORE",
+      target: "LLM",
+      kind: "llm.request",
+      step: context.step,
+      data: {
+        model: this.#provider.model,
+        messages: context.messages,
+        system: options.system,
+        toolSchemas: options.toolSchemas,
+      },
     });
+    try {
+      for await (const event of stream) {
+        if (event.type === "text_delta") {
+          this.#trace?.record({
+            source: "LLM",
+            target: "CORE",
+            kind: "llm.stream_delta",
+            step: context.step,
+            data: { text: event.text },
+          });
+        } else if (event.type === "completed") {
+          terminalRecorded = true;
+          this.#trace?.record({
+            source: "LLM",
+            target: "CORE",
+            kind: "llm.response",
+            step: context.step,
+            durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+            data: {
+              model: this.#provider.model,
+              response: event.response,
+              usage: event.response.usage,
+            },
+          });
+        }
+        yield event;
+      }
+      if (!terminalRecorded) {
+        this.#trace?.record({
+          source: "LLM",
+          target: "CORE",
+          kind: "llm.error",
+          step: context.step,
+          durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+          data: { category: "invalid_response", message: "stream ended without completion" },
+        });
+      }
+    } catch (error) {
+      const cancelled = options.signal.aborted;
+      this.#trace?.record({
+        source: "LLM",
+        target: "CORE",
+        kind: cancelled ? "llm.cancelled" : "llm.error",
+        step: context.step,
+        durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        data: {
+          category: error instanceof LlmError ? error.code : "unknown",
+          message: error instanceof Error ? error.message : "unknown LLM error",
+        },
+      });
+      throw error;
+    }
   }
 
   /** 顺序执行全部工具调用，发布 tool.* 事件，结果合并为一条 user message。 */
@@ -289,7 +378,7 @@ export class AgentLoop {
               errorCode: retry.errorCode,
             },
           },
-          false,
+          true,
         );
       }
 
@@ -318,49 +407,41 @@ export class AgentLoop {
     context.addToolResults(results);
   }
 
-  /** 发布 run.finished，依据 context 终态组装合法 payload。 */
-  async #publishRunFinished(context: ExecutionContext): Promise<void> {
+  /** 依据 context 终态组装结构化 completion。 */
+  #completion(context: ExecutionContext): RunCompletion {
     const base = {
       finalText: context.finalText.slice(0, MAX_FINAL_TEXT_CHARS),
       steps: context.step,
       usage: context.usage,
+      messages: context.runMessages(),
+      model: context.model,
     };
     switch (context.status) {
       case "succeeded":
-        await this.#publish(
-          context,
-          { type: "run.finished", payload: { ...base, status: "succeeded", reason: "completed" } },
-          true,
-        );
-        return;
+        return { ...base, status: "succeeded", reason: "completed" };
       case "cancelled":
-        await this.#publish(
-          context,
-          { type: "run.finished", payload: { ...base, status: "cancelled", reason: "cancelled" } },
-          true,
-        );
-        return;
+        return { ...base, status: "cancelled", reason: "cancelled" };
       case "failed":
-        await this.#publish(
-          context,
-          {
-            type: "run.finished",
-            payload: { ...base, status: "failed", reason: context.reason ?? "internal_error" },
-          },
-          true,
-        );
-        return;
+        return {
+          ...base,
+          status: "failed",
+          reason: context.reason ?? "internal_error",
+          error: this.#safeError(context.reason ?? "internal_error"),
+        };
       case "running":
-        // 防御：极端情况下（如 run.started 未发布成功）仍尽力以失败收尾。
-        await this.#publish(
-          context,
-          {
-            type: "run.finished",
-            payload: { ...base, status: "failed", reason: "internal_error" },
-          },
-          true,
-        );
+        // 防御：极端情况下（如 run.started 未发布成功）仍以失败收尾。
+        return {
+          ...base,
+          status: "failed",
+          reason: "internal_error",
+          error: this.#safeError("internal_error"),
+        };
     }
+  }
+
+  /** 把内部失败原因转换成不含 prompt、路径、凭证或 provider 原文的安全错误。 */
+  #safeError(reason: FailedReason): { code: string; message: string } {
+    return { code: reason, message: `run failed (${reason})` };
   }
 
   /** 把领域错误映射为 run.finished 的结构化失败原因。 */
@@ -386,6 +467,7 @@ export class AgentLoop {
     return "internal_error";
   }
 
+  /** 发布一条 run 级非终态事件；持久化失败会中止当前 loop。 */
   async #publish(
     context: ExecutionContext,
     descriptor: EventDescriptor,

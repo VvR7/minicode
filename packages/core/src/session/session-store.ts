@@ -21,6 +21,7 @@ import {
   SessionEventRecordSchema,
   SessionMetaSchema,
   TurnAcceptedRecordSchema,
+  TurnCompletedRecordSchema,
   type AcceptedTurn,
   type AcceptTurnInput,
   type CompleteTurnInput,
@@ -500,7 +501,7 @@ export class SessionStore {
       const status = CompletedStatusSchema.parse(input.status);
       const reason =
         input.reason === undefined ? undefined : HistoryTurnReasonSchema.parse(input.reason);
-      const record = {
+      const record = TurnCompletedRecordSchema.safeParse({
         schemaVersion: SESSION_SCHEMA_VERSION,
         recordId: crypto.randomUUID(),
         sessionId,
@@ -514,11 +515,17 @@ export class SessionStore {
         includedInContext: status === "succeeded",
         model: input.model,
         ...(input.taskGraph === undefined ? {} : { taskGraph: input.taskGraph }),
-      };
+      });
+      if (!record.success) {
+        return {
+          ok: false,
+          error: { code: "invalid_input", message: "completion input is invalid" },
+        };
+      }
       try {
         await this.#storage.appendLine(
           this.#paths(sessionId).history,
-          `${JSON.stringify(record)}\n`,
+          `${JSON.stringify(record.data)}\n`,
         );
       } catch {
         return { ok: false, error: { code: "io_error", message: "failed to persist completion" } };
@@ -752,6 +759,9 @@ export class SessionStore {
       }
       const completion = completedByKey.get(key);
       if (completion === undefined) {
+        if (activeRun !== undefined) {
+          return this.#corrupt("multiple unfinished turns");
+        }
         turns.push({
           turnId: record.turnId,
           runId: record.runId,

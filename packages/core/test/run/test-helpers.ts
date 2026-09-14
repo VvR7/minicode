@@ -9,13 +9,18 @@ export function environmentWithLlm(overrides: Partial<Environment> = {}): Enviro
     LLM_API_KEY: "test-key",
     LLM_BASE_URL: "http://127.0.0.1:1",
     LLM_MODEL: "test-model",
+    LLM_CONTEXT_WINDOW_TOKENS: "100000",
+    LLM_MAX_OUTPUT_TOKENS: "4096",
     ...overrides,
   };
 }
 
 /** 不含任何 LLM 配置的环境，用于触发 config_error。 */
 export function environmentWithoutLlm(): Environment {
-  return {};
+  return {
+    LLM_CONTEXT_WINDOW_TOKENS: "100000",
+    LLM_MAX_OUTPUT_TOKENS: "4096",
+  };
 }
 
 /**

@@ -13,6 +13,7 @@ import {
   EVENT_SUBSCRIBE_METHOD,
   EventPushNotificationSchema,
   EventSubscribeResultSchema,
+  isAgentEvent,
 } from "@minicode/protocol";
 import { NdjsonRpcConnection } from "./ndjson-rpc-client.ts";
 
@@ -244,7 +245,12 @@ export class AgentRunClient {
             if (!parsed.success || parsed.data.params.subscriptionId !== subscriptionId) {
               return;
             }
-            const event = parsed.data.params.event;
+            const pushed = parsed.data.params.event;
+            // legacy AgentRunClient 只消费 run 事件；session 事件由 SessionController 处理。
+            if (!isAgentEvent(pushed)) {
+              return;
+            }
+            const event = pushed;
             // 防御性校验：事件必须属于本次建立的精确 run，避免错误的 core 串流。
             if (
               runIdentity === undefined ||

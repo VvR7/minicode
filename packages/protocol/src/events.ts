@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { RunIdSchema, SessionIdSchema, SubscriptionIdSchema } from "./agent.ts";
 import { jsonRpcNotificationSchema } from "./json-rpc.ts";
+import { SessionEventSchema, TaskSnapshotSchema, type SessionEvent } from "./session.ts";
 
 export const EVENT_PUSH_METHOD = "event.push" as const;
 
@@ -98,6 +99,16 @@ export const StepFinishedEventSchema = eventSchema(
   }),
 );
 
+const TaskEventPayloadSchema = z.strictObject({
+  revision: z.number().int().nonnegative(),
+  task: TaskSnapshotSchema,
+});
+
+/** 任务创建事件；payload 包含 revision 与完整 TaskSnapshot。 */
+export const TaskCreatedEventSchema = eventSchema("task.created", TaskEventPayloadSchema);
+/** 任务更新事件；payload 包含 revision 与完整 TaskSnapshot。 */
+export const TaskUpdatedEventSchema = eventSchema("task.updated", TaskEventPayloadSchema);
+
 const RunResultShape = {
   finalText: z.string().max(256 * 1024),
   steps: z.number().int().nonnegative(),
@@ -125,6 +136,7 @@ export const RunFinishedPayloadSchema = z.discriminatedUnion("status", [
       "run_timeout",
       "invalid_llm_response",
       "event_store_error",
+      "session_store_error",
       "internal_error",
       "core_restarted",
     ]),
@@ -149,15 +161,31 @@ export const AgentEventSchema = z.discriminatedUnion("type", [
   ToolRetryingEventSchema,
   ToolFinishedEventSchema,
   StepFinishedEventSchema,
+  TaskCreatedEventSchema,
+  TaskUpdatedEventSchema,
   RunFinishedEventSchema,
 ]);
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
 
 export const EventPushParamsSchema = z.strictObject({
   subscriptionId: SubscriptionIdSchema,
-  event: AgentEventSchema,
+  // event.push 同时承载 run 事件与 session 事件，二者都按 type 严格判别。
+  event: z.union([AgentEventSchema, SessionEventSchema]),
 });
 export type EventPushParams = z.infer<typeof EventPushParamsSchema>;
+
+/** event.push 载荷中的两种事件域。 */
+export type PushedEvent = AgentEvent | SessionEvent;
+
+/** 判别当前 push 事件是否为 run 级 AgentEvent（携带 runId 与 run sequence）。 */
+export function isAgentEvent(event: PushedEvent): event is AgentEvent {
+  return "runId" in event;
+}
+
+/** 判别当前 push 事件是否为 session 级 SessionEvent（携带 sessionSequence）。 */
+export function isSessionEvent(event: PushedEvent): event is SessionEvent {
+  return "sessionSequence" in event;
+}
 
 export const EventPushNotificationSchema = jsonRpcNotificationSchema(
   EVENT_PUSH_METHOD,

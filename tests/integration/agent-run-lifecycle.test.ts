@@ -10,6 +10,7 @@ import {
   CORE_PING_METHOD,
   EventPushNotificationSchema,
   PongResultSchema,
+  isAgentEvent,
 } from "../../packages/protocol/src/index.ts";
 import type { AgentEvent } from "../../packages/protocol/src/index.ts";
 import { CoreApp, EventBus, EventStore } from "../../packages/core/src/index.ts";
@@ -100,7 +101,7 @@ describe("agent.run lifecycle (integration)", () => {
     const received = new Map<string, AgentEvent[]>();
     const stop = connection.onNotification((notification) => {
       const parsed = EventPushNotificationSchema.safeParse(notification);
-      if (!parsed.success) return;
+      if (!parsed.success || !isAgentEvent(parsed.data.params.event)) return;
       const events = received.get(parsed.data.params.subscriptionId) ?? [];
       events.push(parsed.data.params.event);
       received.set(parsed.data.params.subscriptionId, events);

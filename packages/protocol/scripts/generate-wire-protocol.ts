@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   AgentCancelRequestSchema,
   AgentCancelSuccessResponseSchema,
+  AgentEventSchema,
   AgentRunRequestSchema,
   AgentRunSuccessResponseSchema,
   EventPushNotificationSchema,
@@ -18,6 +19,20 @@ import {
   PingRequestSchema,
   PingSuccessResponseSchema,
   PongResultSchema,
+  SessionCreateRequestSchema,
+  SessionCreateSuccessResponseSchema,
+  SessionEventSchema,
+  SessionGetHistoryRequestSchema,
+  SessionGetHistorySuccessResponseSchema,
+  SessionGetRequestSchema,
+  SessionGetSuccessResponseSchema,
+  SessionListRequestSchema,
+  SessionListSuccessResponseSchema,
+  SessionSendMessageRequestSchema,
+  SessionSendMessageSuccessResponseSchema,
+  SessionSubscribeRequestSchema,
+  SessionSubscribeSuccessResponseSchema,
+  SessionSummarySchema,
 } from "../src/index.ts";
 
 const outputUrl = new URL("../../../WIRE_PROTOCOL.md", import.meta.url);
@@ -38,10 +53,25 @@ export function renderWireProtocol(): string {
     schemaBlock("AgentRunSuccessResponse", AgentRunSuccessResponseSchema),
     schemaBlock("AgentCancelRequest", AgentCancelRequestSchema),
     schemaBlock("AgentCancelSuccessResponse", AgentCancelSuccessResponseSchema),
+    schemaBlock("AgentEvent", AgentEventSchema),
     schemaBlock("EventSubscribeRequest", EventSubscribeRequestSchema),
     schemaBlock("EventSubscribeSuccessResponse", EventSubscribeSuccessResponseSchema),
     schemaBlock("EventUnsubscribeRequest", EventUnsubscribeRequestSchema),
     schemaBlock("EventUnsubscribeSuccessResponse", EventUnsubscribeSuccessResponseSchema),
+    schemaBlock("SessionSummary", SessionSummarySchema),
+    schemaBlock("SessionCreateRequest", SessionCreateRequestSchema),
+    schemaBlock("SessionCreateSuccessResponse", SessionCreateSuccessResponseSchema),
+    schemaBlock("SessionGetRequest", SessionGetRequestSchema),
+    schemaBlock("SessionGetSuccessResponse", SessionGetSuccessResponseSchema),
+    schemaBlock("SessionListRequest", SessionListRequestSchema),
+    schemaBlock("SessionListSuccessResponse", SessionListSuccessResponseSchema),
+    schemaBlock("SessionSendMessageRequest", SessionSendMessageRequestSchema),
+    schemaBlock("SessionSendMessageSuccessResponse", SessionSendMessageSuccessResponseSchema),
+    schemaBlock("SessionGetHistoryRequest", SessionGetHistoryRequestSchema),
+    schemaBlock("SessionGetHistorySuccessResponse", SessionGetHistorySuccessResponseSchema),
+    schemaBlock("SessionSubscribeRequest", SessionSubscribeRequestSchema),
+    schemaBlock("SessionSubscribeSuccessResponse", SessionSubscribeSuccessResponseSchema),
+    schemaBlock("SessionEvent", SessionEventSchema),
     schemaBlock("EventPushNotification", EventPushNotificationSchema),
     schemaBlock("JsonRpcNotificationEnvelope", JsonRpcNotificationEnvelopeSchema),
     schemaBlock("JsonRpcErrorResponse", JsonRpcErrorResponseSchema),
@@ -79,6 +109,21 @@ export function renderWireProtocol(): string {
 - The \`agent.run\` response is enqueued before the first \`event.push\` for that run.
 - Event sequence numbers are positive and scoped to a run; durable events can be replayed by a
   later event-store implementation.
+
+## Sessions
+
+- Session RPCs are additive: \`agent.run\` keeps its Stage1 shape as the one-shot test entry point.
+- \`session.create\` opens a chat session rooted at a normalized workspace path.
+- \`session.sendMessage\` is idempotent per \`clientMessageId\`: a retry with the same id and content
+  returns the original \`turnId\`/\`runId\`, while a different content for the same id is rejected.
+- \`session.list\` defaults to \`includeOneShot=false\` and \`limit=50\` (max 100); results are ordered
+  by \`updatedAt\` descending, then \`sessionId\` ascending, and paged with an opaque \`cursor\`.
+- \`session.subscribe\` reuses \`event.unsubscribe\` and replays session events after \`afterSequence\`;
+  \`sessionSequence\` is an independent domain from run \`sequence\`.
+- Session events (\`session.turn_accepted\`, \`session.turn_finished\`) always carry a \`sessionId\`;
+  run events always carry \`sessionId\`, \`runId\`, and a run \`sequence\`.
+- Task planning is run-scoped: \`task.created\` and \`task.updated\` carry a \`revision\` plus a full
+  \`TaskSnapshot\`, and never use a global event scope.
 
 \`agent.run\` request (the response identifies the session, run, and initial subscription):
 
@@ -131,9 +176,14 @@ Success response:
 | -32700 | Parse error: invalid JSON, invalid UTF-8, or an empty frame |
 | -32600 | Invalid request envelope, unsupported notification/batch, or oversized frame |
 | -32601 | Method not found |
-| -32602 | Invalid \`core.ping\` parameters |
+| -32602 | Invalid \`core.ping\`, \`agent.*\`, or \`session.*\` parameters |
 | -32603 | Internal server error |
 | -32001 | Requested run was not found |
+| -32010 | \`session_not_found\` |
+| -32011 | \`session_busy\` (another turn already owns the session) |
+| -32012 | \`session_corrupted\` (read-only, diagnostic) |
+| -32013 | \`context_limit_exceeded\` (rejected before any turn/run is created) |
+| -32014 | \`one_shot_not_resumable\` (one-shot sessions cannot accept new messages) |
 
 ## JSON Schemas
 

@@ -9,6 +9,11 @@ export const JsonRpcErrorCode = {
   methodNotFound: -32601,
   invalidParams: -32602,
   internalError: -32603,
+  sessionNotFound: -32010,
+  sessionBusy: -32011,
+  sessionCorrupted: -32012,
+  contextLimitExceeded: -32013,
+  oneShotNotResumable: -32014,
 } as const;
 export type JsonRpcErrorCode = (typeof JsonRpcErrorCode)[keyof typeof JsonRpcErrorCode];
 

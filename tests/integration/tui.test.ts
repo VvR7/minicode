@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -114,24 +114,34 @@ async function startCore(llmBaseUrl?: string) {
 }
 
 interface HeadlessSetup {
-  renderer: { requestRender(): void; destroy(): void };
+  renderer: { destroy(): void };
   mockInput: { pressKey(key: string): void };
-  renderOnce(): Promise<void>;
+  waitForFrame(
+    predicate: (frame: string) => boolean | Promise<boolean>,
+    options?: { maxPasses?: number },
+  ): Promise<string>;
   captureCharFrame(): string;
 }
 
-/** 以真实时间轮询渲染帧，直到包含目标文本；比 waitForFrame 更适合跨进程异步事件。 */
+/**
+ * 事件驱动地轮询渲染帧直到包含目标文本。
+ * 只监听渲染器自身调度产出的 FRAME 事件，不直接驱动原生 loop()，
+ * 避免与调度器并发驱动导致偶发死锁；渲染器空闲时由外层重试吸收跨进程延迟。
+ */
 async function waitForText(setup: HeadlessSetup, text: string, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastFrame = "";
   while (Date.now() < deadline) {
-    // 先让异步事件与原生渲染线程推进，再主动跑一帧并读取。
-    await Bun.sleep(20);
-    setup.renderer.requestRender();
-    await setup.renderOnce();
     lastFrame = setup.captureCharFrame();
     if (lastFrame.includes(text)) {
       return;
+    }
+    try {
+      await setup.waitForFrame((frame) => frame.includes(text), { maxPasses: 4 });
+      return;
+    } catch {
+      // 渲染器暂时空闲或无新帧：等待跨进程 IPC 事件推进后再重试。
+      await Bun.sleep(20);
     }
   }
   throw new Error(`timed out waiting for frame containing: ${text}\nlast frame:\n${lastFrame}`);
@@ -162,6 +172,13 @@ async function waitUntilListening(port: number, timeoutMs = 3_000): Promise<void
 }
 
 describe("mc-tui process-level E2E (headless)", () => {
+  beforeAll(async () => {
+    // 预热原生渲染器：首个 createTestRenderer 的冷初始化存在偶发竞争导致挂起，
+    // 先用一个临时渲染器把原生模块/渲染线程加载起来，再销毁。
+    const warmup = await createTestRenderer({ width: 40, height: 4, exitOnCtrlC: false });
+    warmup.renderer.destroy();
+  });
+
   test("streams a mock-provider run and quits with 0", async () => {
     const mock = startAnthropicMock();
     cleanups.push(mock.stop);

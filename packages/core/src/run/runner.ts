@@ -187,6 +187,11 @@ export class AgentRunner {
     // 等待 RPC response 入队后才继续执行，既保证 durable start，又保持响应先于事件。
     await onStarted();
 
+    if (externalSignal.aborted) {
+      context.markCancelled();
+      return { completion: this.#completionFromContext(context) };
+    }
+
     const llmConfig = loadLlmConfig(this.#environment);
     if (!llmConfig.ok) {
       // 缺配置只让当前 run 以 config_error 失败，绝不杀 daemon。

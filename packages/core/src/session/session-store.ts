@@ -274,6 +274,7 @@ export class SessionStore {
         latestSessionSequence: 0,
         updatedAt: timestamp,
         turns: [],
+        runResults: {},
         pendingInterruptions: [],
         sessionEvents: [],
         notes: "",
@@ -515,6 +516,7 @@ export class SessionStore {
         includedInContext: status === "succeeded",
         model: input.model,
         ...(input.taskGraph === undefined ? {} : { taskGraph: input.taskGraph }),
+        ...(input.runResult === undefined ? {} : { runResult: input.runResult }),
       });
       if (!record.success) {
         return {
@@ -750,6 +752,7 @@ export class SessionStore {
     }
 
     const turns: HistoryTurn[] = [];
+    const runResults: Record<string, NonNullable<CompleteTurnInput["runResult"]>> = {};
     const pendingInterruptions: PendingInterruption[] = [];
     let activeRun: ActiveRun | undefined;
     for (const key of order) {
@@ -791,6 +794,9 @@ export class SessionStore {
         continue;
       }
       updatedAt = latestTimestamp(updatedAt, completion.timestamp);
+      if (completion.runResult !== undefined) {
+        runResults[record.runId] = completion.runResult;
+      }
       turns.push({
         turnId: record.turnId,
         runId: record.runId,
@@ -836,6 +842,7 @@ export class SessionStore {
         latestSessionSequence,
         updatedAt,
         turns,
+        runResults,
         pendingInterruptions,
         sessionEvents: events,
         notes,

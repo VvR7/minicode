@@ -34,6 +34,12 @@ const ENVIRONMENT: Environment = {
   LLM_MAX_OUTPUT_TOKENS: "4096",
   MINICODE_TRACE_ENABLED: "false",
 };
+const EMPTY_USAGE = {
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadInputTokens: 0,
+  cacheCreationInputTokens: 0,
+} as const;
 
 type RunnerBehavior = (request: AgentRunRequest, signal: AbortSignal) => Promise<AgentRunOutcome>;
 
@@ -69,6 +75,42 @@ class FailingCompletionStorage extends MemorySessionStorage {
   }
 }
 
+/** 阻塞首个 accepted run.json 写入，用于制造 admission 与 shutdown 竞态。 */
+class BlockingRunMetadataStorage extends MemorySessionStorage {
+  readonly writeStarted = Promise.withResolvers<void>();
+  readonly writeGate = Promise.withResolvers<void>();
+  blockAcceptedMetadata = true;
+
+  /** 仅阻塞 run.json accepted 初态，其他原子写保持正常。 */
+  override async writeFileAtomic(path: string, content: string): Promise<void> {
+    if (
+      this.blockAcceptedMetadata &&
+      path.endsWith("/run.json") &&
+      content.includes('"status": "accepted"')
+    ) {
+      this.blockAcceptedMetadata = false;
+      this.writeStarted.resolve();
+      await this.writeGate.promise;
+    }
+    await super.writeFileAtomic(path, content);
+  }
+}
+
+/** 阻塞 run.finished journal append，用于验证 shutdown 会等待已清 active 的终态提交。 */
+class BlockingTerminalJournalStorage extends MemoryJournalStorage {
+  readonly terminalStarted = Promise.withResolvers<void>();
+  readonly terminalGate = Promise.withResolvers<void>();
+
+  /** 只阻塞首个 run.finished，其他事件立即追加。 */
+  override async append(path: string, content: string): Promise<void> {
+    if (content.includes('"type":"run.finished"')) {
+      this.terminalStarted.resolve();
+      await this.terminalGate.promise;
+    }
+    await super.append(path, content);
+  }
+}
+
 interface Harness {
   readonly storage: MemorySessionStorage;
   readonly store: SessionStore;
@@ -91,6 +133,7 @@ function createHarness(
     readonly estimator?: SessionManagerOptions["estimator"];
     readonly shutdownTimeoutMs?: number;
     readonly order?: string[];
+    readonly journalStorage?: MemoryJournalStorage;
   } = {},
 ): Harness {
   const storage = options.storage ?? new MemorySessionStorage();
@@ -100,7 +143,7 @@ function createHarness(
     return new Date(Date.UTC(2026, 8, 14, 8, 0, clock)).toISOString();
   };
   const store = new SessionStore(HOME, storage, now);
-  const eventStore = new EventStore(HOME, new MemoryJournalStorage());
+  const eventStore = new EventStore(HOME, options.journalStorage ?? new MemoryJournalStorage());
   const eventBus = new EventBus(eventStore, {
     onPersisted: (event) => options.order?.push(event.type),
   });
@@ -339,6 +382,37 @@ describe("SessionManager accepted state machine", () => {
     expect(metadata?.startedAt).toBeDefined();
     expect(metadata?.finishedAt).toBeDefined();
   });
+
+  test("does not let cancellation bypass the accepted response gate", async () => {
+    const order: string[] = [];
+    const runner = new StubRunner(async (request, signal) =>
+      completionFor(request, signal.aborted ? "cancelled" : "succeeded"),
+    );
+    const harness = createHarness(runner, { order });
+    const session = unwrapResult(await harness.manager.create("/workspace"));
+    const prepared = unwrapResult(
+      await harness.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "cancel before response",
+      }),
+    );
+
+    expect(await harness.manager.cancel(session.sessionId, prepared.result.runId)).toBe(
+      "cancellation_requested",
+    );
+    await Bun.sleep(0);
+    expect(order).toEqual([]);
+    expect(runner.requests).toHaveLength(0);
+
+    order.push("response.enqueued");
+    prepared.activate();
+    await waitForIdle(harness.manager);
+    expect(order[0]).toBe("response.enqueued");
+    expect(unwrapResult(await harness.manager.getHistory(session.sessionId)).turns[0]?.status).toBe(
+      "cancelled",
+    );
+  });
 });
 
 describe("SessionManager multi-turn context and terminal ownership", () => {
@@ -499,6 +573,73 @@ describe("SessionManager multi-turn context and terminal ownership", () => {
     expect(journal.events.filter((event) => event.type === "run.finished")).toHaveLength(1);
   });
 
+  test("waits for an admission that passed the stopping check before taking the active snapshot", async () => {
+    const storage = new BlockingRunMetadataStorage();
+    const runner = new StubRunner(async (request, signal) => {
+      if (!signal.aborted) {
+        await new Promise<void>((resolve) =>
+          signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
+      }
+      return completionFor(request, "cancelled");
+    });
+    const harness = createHarness(runner, { storage, shutdownTimeoutMs: 100 });
+    const session = unwrapResult(await harness.manager.create("/workspace"));
+    const preparing = harness.manager.prepareMessage({
+      sessionId: session.sessionId,
+      clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+      content: "racing admission",
+    });
+    await storage.writeStarted.promise;
+
+    let shutdownFinished = false;
+    const shuttingDown = harness.manager.shutdown().then(() => {
+      shutdownFinished = true;
+    });
+    await Bun.sleep(5);
+    expect(shutdownFinished).toBe(false);
+
+    storage.writeGate.resolve();
+    const prepared = unwrapResult(await preparing);
+    prepared.activate();
+    await shuttingDown;
+    expect(harness.manager.activeCount).toBe(0);
+    expect(unwrapResult(await harness.manager.getHistory(session.sessionId)).turns[0]?.status).toBe(
+      "cancelled",
+    );
+  });
+
+  test("waits for terminal publication after activeRun has already been cleared", async () => {
+    const journalStorage = new BlockingTerminalJournalStorage();
+    const runner = new StubRunner(async (request) => completionFor(request));
+    const harness = createHarness(runner, { journalStorage, shutdownTimeoutMs: 100 });
+    const session = unwrapResult(await harness.manager.create("/workspace"));
+    const prepared = unwrapResult(
+      await harness.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "commit race",
+      }),
+    );
+    prepared.activate();
+    await journalStorage.terminalStarted.promise;
+    expect(harness.manager.activeCount).toBe(0);
+
+    let shutdownFinished = false;
+    const shuttingDown = harness.manager.shutdown().then(() => {
+      shutdownFinished = true;
+    });
+    await Bun.sleep(5);
+    expect(shutdownFinished).toBe(false);
+
+    journalStorage.terminalGate.resolve();
+    await shuttingDown;
+    const journal = unwrapResult(
+      await harness.eventStore.read(session.sessionId, prepared.result.runId),
+    );
+    expect(journal.events.filter((event) => event.type === "run.finished")).toHaveLength(1);
+  });
+
   test("marks a session corrupted when history completion persistence fails", async () => {
     const storage = new FailingCompletionStorage();
     const runner = new StubRunner(async (request) => completionFor(request));
@@ -534,6 +675,24 @@ describe("SessionManager multi-turn context and terminal ownership", () => {
 });
 
 describe("SessionManager restart reconciliation", () => {
+  test("fails closed when the startup session scan cannot complete", async () => {
+    const storage = new MemorySessionStorage();
+    storage.listError = new Error("scan failed");
+    const harness = createHarness(new StubRunner(async (request) => completionFor(request)), {
+      storage,
+    });
+    await harness.manager.ready();
+
+    expect(await harness.manager.create("/workspace")).toMatchObject({
+      ok: false,
+      error: { code: "internal_error", message: "session recovery did not complete" },
+    });
+    expect(await harness.manager.list({})).toMatchObject({
+      ok: false,
+      error: { code: "internal_error", message: "session recovery did not complete" },
+    });
+  });
+
   test("repairs an accepted turn without completion as interrupted/core_restarted", async () => {
     const runner = new StubRunner(async (request) => completionFor(request));
     const storage = new MemorySessionStorage();
@@ -609,8 +768,8 @@ describe("SessionManager restart reconciliation", () => {
     await harness.store.appendCompleted(session.sessionId, {
       turnId: TURN_A,
       runId: RUN_A,
-      status: "succeeded",
-      reason: "completed",
+      status: "failed",
+      reason: "llm_error",
       messages: [
         {
           messageId: "user",
@@ -622,6 +781,19 @@ describe("SessionManager restart reconciliation", () => {
         },
       ],
       model: "test-model",
+      runResult: {
+        status: "failed",
+        reason: "llm_error",
+        finalText: "partial answer",
+        steps: 3,
+        usage: {
+          inputTokens: 11,
+          outputTokens: 7,
+          cacheReadInputTokens: 2,
+          cacheCreationInputTokens: 1,
+        },
+        error: { code: "llm_error", message: "run failed (llm_error)" },
+      },
     });
     await harness.metadata.create({
       sessionId: session.sessionId,
@@ -643,9 +815,20 @@ describe("SessionManager restart reconciliation", () => {
     await recovering.ready();
     const repaired = unwrapResult(await recovering.getHistory(session.sessionId));
     expect(repaired.throughSessionSequence).toBe(2);
-    expect(unwrapResult(await harness.eventStore.read(session.sessionId, RUN_A)).finished).toBe(
-      true,
-    );
+    const repairedJournal = unwrapResult(await harness.eventStore.read(session.sessionId, RUN_A));
+    expect(repairedJournal.events.find((event) => event.type === "run.finished")?.payload).toEqual({
+      status: "failed",
+      reason: "llm_error",
+      finalText: "partial answer",
+      steps: 3,
+      usage: {
+        inputTokens: 11,
+        outputTokens: 7,
+        cacheReadInputTokens: 2,
+        cacheCreationInputTokens: 1,
+      },
+      error: { code: "llm_error", message: "run failed (llm_error)" },
+    });
 
     const conflictStorage = new MemorySessionStorage();
     const conflictStore = new SessionStore("/conflict", conflictStorage);
@@ -666,7 +849,8 @@ describe("SessionManager restart reconciliation", () => {
       messages: [],
       model: "test-model",
     });
-    const conflictEventStore = new EventStore("/conflict", new MemoryJournalStorage());
+    const conflictJournal = new MemoryJournalStorage();
+    const conflictEventStore = new EventStore("/conflict", conflictJournal);
     const conflictBus = new EventBus(conflictEventStore);
     await conflictBus.publish({
       sessionId: conflictSession.meta.sessionId,
@@ -675,8 +859,8 @@ describe("SessionManager restart reconciliation", () => {
       durable: true,
       type: "run.finished",
       payload: {
-        status: "failed",
-        reason: "llm_error",
+        status: "succeeded",
+        reason: "completed",
         finalText: "",
         steps: 0,
         usage: {
@@ -687,6 +871,24 @@ describe("SessionManager restart reconciliation", () => {
         },
       },
     });
+    await conflictJournal.append(
+      conflictEventStore.pathFor(conflictSession.meta.sessionId, RUN_B),
+      `${JSON.stringify({
+        sessionId: conflictSession.meta.sessionId,
+        runId: RUN_B,
+        sequence: 2,
+        timestamp: new Date().toISOString(),
+        durable: true,
+        type: "run.finished",
+        payload: {
+          status: "failed",
+          reason: "llm_error",
+          finalText: "",
+          steps: 0,
+          usage: EMPTY_USAGE,
+        },
+      })}\n`,
+    );
     const conflictManager = new SessionManager({
       store: conflictStore,
       runner,

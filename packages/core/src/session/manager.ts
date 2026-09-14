@@ -133,12 +133,15 @@ export class SessionManager {
   readonly #newId: () => string;
   readonly #shutdownTimeoutMs: number;
   readonly #locks = new Map<string, Promise<unknown>>();
+  readonly #admissions = new Set<Promise<unknown>>();
+  readonly #terminalCommits = new Set<Promise<void>>();
   readonly #active = new Map<string, ActiveExecution>();
   readonly #busySessions = new Set<string>();
   readonly #finishedRuns = new Set<string>();
   readonly #corruptedSessions = new Set<string>();
   readonly #ready: Promise<void>;
   #stopping = false;
+  #recoveryFailed = false;
 
   constructor(options: SessionManagerOptions) {
     this.#store = options.store;
@@ -167,6 +170,9 @@ export class SessionManager {
     mode: SessionMode = "chat",
   ): Promise<SessionManagerResult<SessionSummary>> {
     await this.#ready;
+    if (this.#recoveryFailed) {
+      return this.#internal("session recovery did not complete");
+    }
     if (this.#stopping) {
       return this.#internal("core is shutting down");
     }
@@ -180,6 +186,9 @@ export class SessionManager {
   /** 读取 session 摘要，并叠加运行期 corrupted 标记。 */
   async get(sessionId: string): Promise<SessionManagerResult<SessionSummary>> {
     await this.#ready;
+    if (this.#recoveryFailed) {
+      return this.#internal("session recovery did not complete");
+    }
     const loaded = await this.#store.load(sessionId);
     if (!loaded.ok) {
       return this.#fromStore(loaded.error.code, sessionId);
@@ -201,6 +210,9 @@ export class SessionManager {
     readonly limit?: number;
   }): Promise<SessionManagerResult<SessionListResult>> {
     await this.#ready;
+    if (this.#recoveryFailed) {
+      return this.#internal("session recovery did not complete");
+    }
     const listed = await this.#store.list(options);
     if (!listed.ok) {
       return this.#fromStore(listed.error.code);
@@ -221,6 +233,9 @@ export class SessionManager {
   /** 返回 provider-neutral 审计历史和同一时刻的 session sequence 水位。 */
   async getHistory(sessionId: string): Promise<SessionManagerResult<SessionGetHistoryResult>> {
     await this.#ready;
+    if (this.#recoveryFailed) {
+      return this.#internal("session recovery did not complete");
+    }
     const loaded = await this.#store.load(sessionId);
     if (!loaded.ok) {
       return this.#fromStore(loaded.error.code, sessionId);
@@ -238,12 +253,24 @@ export class SessionManager {
   }
 
   /** 为 chat session 做 accepted 前检查并准备一个延迟激活的 run。 */
-  async prepareMessage(input: {
+  prepareMessage(input: {
+    readonly sessionId: string;
+    readonly clientMessageId: ClientMessageId;
+    readonly content: string;
+  }): Promise<SessionManagerResult<PreparedSessionRun>> {
+    return this.#trackAdmission(this.#prepareMessage(input));
+  }
+
+  /** 执行 chat accepted 临界区；由公开入口同步登记为 shutdown admission。 */
+  async #prepareMessage(input: {
     readonly sessionId: string;
     readonly clientMessageId: ClientMessageId;
     readonly content: string;
   }): Promise<SessionManagerResult<PreparedSessionRun>> {
     await this.#ready;
+    if (this.#recoveryFailed) {
+      return this.#internal("session recovery did not complete");
+    }
     return this.#withSessionLock(input.sessionId, async () => {
       if (this.#stopping) {
         return this.#internal("core is shutting down");
@@ -267,7 +294,15 @@ export class SessionManager {
   }
 
   /** 创建 one_shot session，并用与 chat 相同的持久化/预算/执行管线准备首轮。 */
-  async prepareOneShot(
+  prepareOneShot(
+    workspaceRoot: string,
+    content: string,
+  ): Promise<SessionManagerResult<PreparedSessionRun>> {
+    return this.#trackAdmission(this.#prepareOneShot(workspaceRoot, content));
+  }
+
+  /** 执行 one_shot 创建与 accepted；由公开入口同步登记为 shutdown admission。 */
+  async #prepareOneShot(
     workspaceRoot: string,
     content: string,
   ): Promise<SessionManagerResult<PreparedSessionRun>> {
@@ -290,7 +325,6 @@ export class SessionManager {
     await this.#ready;
     const active = this.#active.get(this.#runKey(sessionId, runId));
     if (active !== undefined) {
-      this.#activate(active);
       active.controller.abort();
       return "cancellation_requested";
     }
@@ -303,9 +337,10 @@ export class SessionManager {
   async shutdown(): Promise<void> {
     this.#stopping = true;
     await this.#ready;
+    // accepted 临界区只含本地持久化；先排空它，保证后续 active 快照不会漏 run。
+    await Promise.allSettled([...this.#admissions]);
     const active = [...this.#active.values()];
     for (const execution of active) {
-      this.#activate(execution);
       execution.controller.abort();
     }
     await this.#waitBounded(active.map((execution) => execution.settled));
@@ -319,6 +354,7 @@ export class SessionManager {
         }),
       ),
     );
+    await this.#waitBounded([...this.#terminalCommits]);
     await this.#traces.stopAll();
   }
 
@@ -572,8 +608,14 @@ export class SessionManager {
     if (execution.commit !== undefined) {
       return execution.commit;
     }
-    execution.commit = this.#commit(execution, outcome);
-    return execution.commit;
+    const commit = this.#commit(execution, outcome);
+    execution.commit = commit;
+    this.#terminalCommits.add(commit);
+    void commit.then(
+      () => this.#terminalCommits.delete(commit),
+      () => this.#terminalCommits.delete(commit),
+    );
+    return commit;
   }
 
   /** 严格按 history、active、run event、session event 的顺序提交 completion。 */
@@ -593,6 +635,7 @@ export class SessionManager {
       messages,
       model: completion.model,
       ...(completion.taskGraph === undefined ? {} : { taskGraph: completion.taskGraph }),
+      runResult: this.#runFinishedPayload(completion),
     });
     if (!persisted.ok) {
       this.#corruptedSessions.add(execution.sessionId);
@@ -656,6 +699,7 @@ export class SessionManager {
         ...(cursor ? { cursor } : {}),
       });
       if (!page.ok) {
+        this.#recoveryFailed = true;
         return;
       }
       for (const summary of page.value.sessions) {
@@ -663,6 +707,9 @@ export class SessionManager {
         if (!loaded.ok) {
           if (loaded.error.code === "session_corrupted") {
             this.#corruptedSessions.add(summary.sessionId);
+          } else {
+            this.#recoveryFailed = true;
+            return;
           }
           continue;
         }
@@ -684,7 +731,12 @@ export class SessionManager {
         this.#corruptedSessions.add(snapshot.meta.sessionId);
         return;
       }
-      const terminal = journal.value.events.find((event) => event.type === "run.finished");
+      const terminals = journal.value.events.filter((event) => event.type === "run.finished");
+      if (terminals.length > 1) {
+        this.#corruptedSessions.add(snapshot.meta.sessionId);
+        return;
+      }
+      const terminal = terminals[0];
       const existingSessionFinished = snapshot.sessionEvents.find(
         (event) => event.type === "session.turn_finished" && event.payload.turnId === turn.turnId,
       );
@@ -709,6 +761,13 @@ export class SessionManager {
           reason: "core_restarted",
           messages: turn.messages,
           model: metadata.ok ? (metadata.value?.model ?? "") : "",
+          runResult: {
+            status: "failed",
+            reason: "core_restarted",
+            finalText: "",
+            steps: 0,
+            usage: EMPTY_USAGE,
+          },
         });
         if (!appended.ok) {
           this.#corruptedSessions.add(snapshot.meta.sessionId);
@@ -749,7 +808,7 @@ export class SessionManager {
       }
 
       if (terminal === undefined) {
-        const payload = this.#payloadFromHistory(recoveredTurn);
+        const payload = this.#payloadFromHistory(recoveredTurn, snapshot.runResults[turn.runId]);
         const published = await this.#eventBus.publish({
           sessionId: snapshot.meta.sessionId,
           runId: turn.runId,
@@ -934,7 +993,13 @@ export class SessionManager {
   }
 
   /** 由 history 恢复可重放的 run.finished payload。 */
-  #payloadFromHistory(turn: HistoryTurn): Extract<AgentEvent, { type: "run.finished" }>["payload"] {
+  #payloadFromHistory(
+    turn: HistoryTurn,
+    persisted?: Extract<AgentEvent, { type: "run.finished" }>["payload"],
+  ): Extract<AgentEvent, { type: "run.finished" }>["payload"] {
+    if (persisted !== undefined) {
+      return persisted;
+    }
     const finalText = this.#finalText(turn.messages);
     if (turn.status === "succeeded") {
       return { status: "succeeded", reason: "completed", finalText, steps: 0, usage: EMPTY_USAGE };
@@ -1047,6 +1112,16 @@ export class SessionManager {
       }
     });
     return result;
+  }
+
+  /** 同步登记 accepted admission，使 shutdown 不会漏掉已开始但尚未注册 active 的请求。 */
+  #trackAdmission<Value>(operation: Promise<Value>): Promise<Value> {
+    this.#admissions.add(operation);
+    void operation.then(
+      () => this.#admissions.delete(operation),
+      () => this.#admissions.delete(operation),
+    );
+    return operation;
   }
 
   /** 构造 session/run 联合身份键。 */

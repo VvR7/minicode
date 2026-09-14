@@ -43,6 +43,29 @@ describe("AgentRunner", () => {
     }
   });
 
+  test("honors cancellation before reporting an invalid LLM configuration", async () => {
+    const workspace = await createTempWorkspace();
+    try {
+      const bus = createBus();
+      const runner = new AgentRunner({
+        environment: environmentWithoutLlm(),
+        bus,
+        homeDirectory: workspace,
+      });
+      const controller = new AbortController();
+      controller.abort();
+
+      const outcome = await runner.run(
+        { sessionId: SESSION_A, runId: RUN_A, goal: "x", workspaceRoot: workspace },
+        controller.signal,
+      );
+
+      expect(outcome.completion).toMatchObject({ status: "cancelled", reason: "cancelled" });
+    } finally {
+      await cleanupTempWorkspace(workspace);
+    }
+  });
+
   test("runs to completion with an injected provider", async () => {
     const workspace = await createTempWorkspace();
     try {

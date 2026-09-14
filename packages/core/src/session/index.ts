@@ -54,6 +54,7 @@ export type {
   CreateSessionOptions,
   HistoryRecord,
   PendingInterruption,
+  PersistedRunResult,
   SessionListOptions,
   SessionListPage,
   SessionMeta,

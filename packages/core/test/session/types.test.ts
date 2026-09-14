@@ -118,4 +118,31 @@ describe("session persistence schemas", () => {
       }),
     ).toBe(true);
   });
+
+  test("keeps the private run result consistent with the history outcome", () => {
+    const withRunResult = {
+      ...completed,
+      runResult: {
+        status: "succeeded",
+        reason: "completed",
+        finalText: "done",
+        steps: 2,
+        usage: {
+          inputTokens: 3,
+          outputTokens: 4,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+    };
+    expect(accepts(TurnCompletedRecordSchema, withRunResult)).toBe(true);
+    expect(
+      accepts(TurnCompletedRecordSchema, {
+        ...withRunResult,
+        status: "failed",
+        reason: "llm_error",
+        includedInContext: false,
+      }),
+    ).toBe(false);
+  });
 });

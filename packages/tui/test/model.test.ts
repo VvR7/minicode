@@ -116,6 +116,28 @@ describe("TuiModel", () => {
     expect(usage[0]).toMatchObject({ line: { kind: "usage", text: "usage in=1 out=2" } });
   });
 
+  test("maps step.finished and tool.retrying events", () => {
+    const model = new TuiModel();
+    const step = model.applyEvent(event("step.finished", { step: 1, outcome: "continue" }, 1));
+    const toolRetry = model.applyEvent(
+      event(
+        "tool.retrying",
+        {
+          toolCallId: "t1",
+          name: "read_file",
+          attempt: 2,
+          maxAttempts: 3,
+          delayMs: 10,
+          errorCode: "temporary",
+        },
+        2,
+      ),
+    );
+
+    expect(step[0]).toMatchObject({ line: { kind: "info", text: "step 1 continue" } });
+    expect(toolRetry[0]).toMatchObject({ line: { kind: "retry" } });
+  });
+
   test("fills missing finalText suffix from the durable terminal event", () => {
     const model = new TuiModel();
     model.applyEvent(event("step.started", { step: 1 }, 1));
@@ -131,12 +153,32 @@ describe("TuiModel", () => {
     expect(model.snapshot().run).toEqual({ status: "finished", outcome: "succeeded" });
   });
 
+  test("replaces a corrupted streamed line when middle deltas were lost", () => {
+    const model = new TuiModel();
+    model.applyEvent(event("step.started", { step: 1 }, 1));
+    model.applyEvent(event("llm.text_delta", { text: "Hel" }, 2));
+    model.applyEvent(event("llm.text_delta", { text: "world" }, 4));
+
+    const mutations = model.applyEvent(
+      event("run.finished", finishedPayload("succeeded", "Hello world"), 5),
+    );
+
+    expect(
+      mutations.some(
+        (mutation) => mutation.type === "update" && mutation.line.text === "Hello world",
+      ),
+    ).toBe(true);
+    expect(model.snapshot().lines.find((line) => line.kind === "assistant")?.text).toBe(
+      "Hello world",
+    );
+  });
+
   test("creates an assistant line from finalText when replay has no live deltas", () => {
     const model = new TuiModel();
     const mutations = model.applyEvent(
       event("run.finished", finishedPayload("succeeded", "replayed"), 1),
     );
-    expect(mutations.some((m) => m.type === "update" && m.line.text === "replayed")).toBe(true);
+    expect(mutations.some((m) => m.type === "append" && m.line.text === "replayed")).toBe(true);
   });
 
   test("maps a failed terminal event to run-fail", () => {
@@ -156,6 +198,39 @@ describe("TuiModel", () => {
     model.applyEvent(event("run.finished", payload, 1));
     expect(model.snapshot().run).toEqual({ status: "finished", outcome: "failed" });
     expect(model.snapshot().lines.at(-1)).toMatchObject({ kind: "run-fail" });
+  });
+
+  test("strictly caps one active assistant line by UTF-8 bytes", () => {
+    const model = new TuiModel({ maxBytes: 8 });
+    model.applyEvent(event("llm.text_delta", { text: "12😀567890" }, 1));
+
+    const assistant = model.snapshot().lines.find((line) => line.kind === "assistant");
+    expect(new TextEncoder().encode(assistant?.text ?? "").length).toBeLessThanOrEqual(8);
+    expect(assistant?.text.endsWith("7890")).toBe(true);
+  });
+
+  test("maps client-side cancellation to a terminal cancelled state", () => {
+    const model = new TuiModel();
+    model.applyClientResult({ kind: "cancelled" });
+
+    expect(model.snapshot().run).toEqual({ status: "finished", outcome: "cancelled" });
+    expect(exitCodeForRunState(model.snapshot().run)).toBe(130);
+  });
+
+  test("maps lifecycle errors to visible terminal states and exit codes", () => {
+    const model = new TuiModel();
+    const mutations = model.applyClientResult({ kind: "acceptance-uncertain" });
+
+    expect(model.snapshot().run).toEqual({
+      status: "client-error",
+      kind: "acceptance-uncertain",
+    });
+    expect(mutations.at(-1)).toMatchObject({
+      type: "append",
+      line: { kind: "client-error" },
+    });
+    expect(exitCodeForRunState(model.snapshot().run)).toBe(2);
+    expect(decideQuit(model.snapshot().run, false)).toEqual({ action: "quit", code: 2 });
   });
 
   test("trims the oldest non-assistant lines when limits are exceeded", () => {
@@ -215,6 +290,8 @@ describe("exitCodeForRunState and decideQuit", () => {
     expect(exitCodeForRunState({ status: "finished", outcome: "failed" })).toBe(1);
     expect(exitCodeForRunState({ status: "finished", outcome: "cancelled" })).toBe(130);
     expect(exitCodeForRunState({ status: "running" })).toBe(130);
+    expect(exitCodeForRunState({ status: "client-error", kind: "connect-failed" })).toBe(2);
+    expect(exitCodeForRunState({ status: "client-error", kind: "internal-error" })).toBe(1);
   });
 
   test("first quit during running requests cancel, second forces quit", () => {

@@ -73,39 +73,68 @@ export interface AgentRunClientOptions {
 
 type DrainResult = "finished" | "disconnected";
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /**
- * 可被 AbortSignal 中断的延时：重连等待期间用户取消时立即返回，
- * 避免退出/取消被固定延时拖住；无 signal 时等价于 sleep。
+ * 可被一个或多个 AbortSignal 中断的延时，并在任一路径释放 timer/listener。
+ * 取消后的既有 run 重连不会监听用户 signal，只监听显式 shutdown。
  */
-function sleepAbortable(ms: number, signal: AbortSignal | undefined): Promise<void> {
-  if (signal === undefined) {
-    return sleep(ms);
-  }
-  if (signal.aborted) {
+function sleepInterruptible(ms: number, signals: readonly AbortSignal[]): Promise<void> {
+  if (signals.some((signal) => signal.aborted)) {
     return Promise.resolve();
   }
   return new Promise((resolve) => {
-    const onAbort = (): void => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       clearTimeout(timer);
+      for (const signal of signals) {
+        signal.removeEventListener("abort", finish);
+      }
       resolve();
     };
-    const timer = setTimeout(() => {
-      signal.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    signal.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(finish, ms);
+    for (const signal of signals) {
+      signal.addEventListener("abort", finish, { once: true });
+    }
   });
 }
+
+const SHUTDOWN = Symbol("agent-run-client-shutdown");
 
 /**
  * 前端共享的 Agent run 控制器：连接 core、启动精确 run、消费事件流，
  * 处理取消与断线 cursor 重连。只负责传输/归属/去重，不生成任何终端文案。
  */
 export class AgentRunClient {
+  #shutdownController = new AbortController();
+  #connections = new Set<NdjsonRpcConnection>();
+  #closedConnections = new WeakSet<NdjsonRpcConnection>();
+
+  /**
+   * 显式停止客户端：中断连接/重连等待并关闭当前 socket。
+   * 方法幂等；一个实例 shutdown 后不可再次执行 run。
+   */
+  shutdown(): void {
+    if (!this.#shutdownController.signal.aborted) {
+      this.#shutdownController.abort();
+    }
+    for (const connection of this.#connections) {
+      this.#closeConnection(connection);
+    }
+  }
+
+  /** 只关闭一次连接，避免 shutdown 与 run finally 重复释放同一 socket。 */
+  #closeConnection(connection: NdjsonRpcConnection): void {
+    if (this.#closedConnections.has(connection)) {
+      return;
+    }
+    this.#closedConnections.add(connection);
+    connection.close();
+    this.#connections.delete(connection);
+  }
+
   /**
    * 执行一次 run，把去重后的领域事件回调给前端，直到终态或错误。
    * 返回值是生命周期完成方式；run 终态（status/reason）由前端从事件推导。
@@ -117,6 +146,7 @@ export class AgentRunClient {
     const connect: AgentRunConnector =
       options.connect ?? ((endpoint) => NdjsonRpcConnection.connect(endpoint));
     const signal = options.signal;
+    const shutdownSignal = this.#shutdownController.signal;
     const reconnectDelayMs = options.reconnectDelayMs ?? 100;
     const initialConnectAttempts = options.initialConnectAttempts ?? 3;
     const cancelTimeoutMs = options.cancelTimeoutMs ?? 5_000;
@@ -128,6 +158,18 @@ export class AgentRunClient {
     let currentConnection: NdjsonRpcConnection | undefined;
     let cancelDeadline: number | undefined;
     const cancelRequested = Promise.withResolvers<void>();
+
+    /** 等待下一次重连；取消后仍按节奏重试，但不超过 cancel deadline。 */
+    const waitBeforeReconnect = async (): Promise<void> => {
+      const remaining = Math.max(0, (cancelDeadline ?? Date.now() + reconnectDelayMs) - Date.now());
+      const delay = cancelledByUser ? Math.min(reconnectDelayMs, remaining) : reconnectDelayMs;
+      await sleepInterruptible(
+        delay,
+        cancelledByUser
+          ? [shutdownSignal]
+          : [shutdownSignal, ...(signal === undefined ? [] : [signal])],
+      );
+    };
 
     /** 向当前连接发幂等 cancel；断线时静默失败，由重连逻辑补发。 */
     const requestCancel = async (): Promise<void> => {
@@ -187,7 +229,17 @@ export class AgentRunClient {
       );
       const consume = async (): Promise<DrainResult> => {
         let stopListening: (() => void) | undefined;
+        let stopShutdownListening: (() => void) | undefined;
         try {
+          const shutdownReached = new Promise<void>((resolve) => {
+            if (shutdownSignal.aborted) {
+              resolve();
+              return;
+            }
+            const onShutdown = (): void => resolve();
+            shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+            stopShutdownListening = () => shutdownSignal.removeEventListener("abort", onShutdown);
+          });
           stopListening = connection.onNotification((notification) => {
             const parsed = EventPushNotificationSchema.safeParse(notification);
             if (!parsed.success || parsed.data.params.subscriptionId !== subscriptionId) {
@@ -213,13 +265,19 @@ export class AgentRunClient {
               runFinished.resolve();
             }
           });
-          await Promise.race([runFinished.promise, connection.waitUntilClosed(), deadlineReached]);
+          await Promise.race([
+            runFinished.promise,
+            connection.waitUntilClosed(),
+            deadlineReached,
+            shutdownReached,
+          ]);
           return finished ? "finished" : "disconnected";
         } finally {
           active = false;
           if (deadlineTimer !== undefined) {
             clearTimeout(deadlineTimer);
           }
+          stopShutdownListening?.();
           stopListening?.();
         }
       };
@@ -229,6 +287,9 @@ export class AgentRunClient {
     try {
       let connectAttempts = 0;
       for (;;) {
+        if (shutdownSignal.aborted) {
+          return { kind: "cancelled" };
+        }
         if (cancelDeadline !== undefined && Date.now() >= cancelDeadline) {
           return { kind: "cancelled" };
         }
@@ -244,25 +305,64 @@ export class AgentRunClient {
 
         let connection: NdjsonRpcConnection;
         try {
-          connection = await connect(options.endpoint);
+          const pendingConnection = connect(options.endpoint);
+          const connected = await new Promise<NdjsonRpcConnection | typeof SHUTDOWN>(
+            (resolve, reject) => {
+              if (shutdownSignal.aborted) {
+                resolve(SHUTDOWN);
+                return;
+              }
+              const onShutdown = (): void => resolve(SHUTDOWN);
+              shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+              pendingConnection.then(
+                (value) => {
+                  shutdownSignal.removeEventListener("abort", onShutdown);
+                  resolve(value);
+                },
+                (error: unknown) => {
+                  shutdownSignal.removeEventListener("abort", onShutdown);
+                  reject(error);
+                },
+              );
+            },
+          );
+          if (connected === SHUTDOWN) {
+            // connect 无法从外部取消；若稍后成功，立即关闭迟到的 socket。
+            void pendingConnection.then(
+              (lateConnection) => this.#closeConnection(lateConnection),
+              () => {},
+            );
+            return { kind: "cancelled" };
+          }
+          connection = connected;
         } catch {
+          if (shutdownSignal.aborted) {
+            return { kind: "cancelled" };
+          }
           // run 尚未建立：连接失败是配置/环境问题，有限重试后返回 connect-failed。
           if (runIdentity === undefined) {
             connectAttempts += 1;
+            if (signal?.aborted === true) {
+              return { kind: "cancelled" };
+            }
             if (connectAttempts >= initialConnectAttempts) {
               return { kind: "connect-failed" };
             }
           }
-          if (signal?.aborted === true) {
-            return { kind: "cancelled" };
-          }
-          // 连接失败后报告断开状态，供前端展示“重试中”等反馈。
+          // 已建立 run 且用户取消时仍需重连补发 cancel，直到终态或 deadline。
           callbacks.onStatus({ state: "disconnected" });
-          await sleepAbortable(reconnectDelayMs, signal);
+          await waitBeforeReconnect();
           continue;
         }
         connectAttempts = 0;
         currentConnection = connection;
+        this.#connections.add(connection);
+        // connect 期间可能发生用户取消或显式 shutdown；不得继续发送 agent.run。
+        if (shutdownSignal.aborted || (signal?.aborted === true && runIdentity === undefined)) {
+          this.#closeConnection(connection);
+          currentConnection = undefined;
+          return { kind: "cancelled" };
+        }
         callbacks.onStatus({ state: "connected" });
 
         try {
@@ -316,7 +416,7 @@ export class AgentRunClient {
             return cancelledByUser ? { kind: "cancelled" } : { kind: "acceptance-uncertain" };
           }
         } finally {
-          connection.close();
+          this.#closeConnection(connection);
           currentConnection = undefined;
         }
 
@@ -325,7 +425,7 @@ export class AgentRunClient {
         if (cancelDeadline !== undefined && Date.now() >= cancelDeadline) {
           return { kind: "cancelled" };
         }
-        await sleepAbortable(reconnectDelayMs, signal);
+        await waitBeforeReconnect();
       }
     } catch {
       // 任何未预期的内部错误都不向上抛。

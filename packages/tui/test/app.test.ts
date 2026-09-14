@@ -55,13 +55,24 @@ function finished(status: "succeeded" | "failed" | "cancelled", finalText = "don
 class FakeConnection {
   #listeners = new Set<(n: JsonRpcNotificationEnvelope) => void>();
   #listening = Promise.withResolvers<void>();
+  #closed = Promise.withResolvers<void>();
+  agentRunError = false;
+  closeCalls = 0;
 
   get listening(): Promise<void> {
     return this.#listening.promise;
   }
 
+  /** 当前 listener 数，用于验证 TUI 退出后的显式回收。 */
+  get listenerCount(): number {
+    return this.#listeners.size;
+  }
+
   request(method: string): Promise<unknown> {
     if (method === "agent.run") {
+      if (this.agentRunError) {
+        return Promise.reject(new Error("response lost"));
+      }
       return Promise.resolve({ result: { status: "accepted", sessionId, runId, subscriptionId } });
     }
     if (method === "event.subscribe") {
@@ -80,10 +91,13 @@ class FakeConnection {
   }
 
   waitUntilClosed(): Promise<void> {
-    return new Promise(() => {});
+    return this.#closed.promise;
   }
 
-  close(): void {}
+  close(): void {
+    this.closeCalls += 1;
+    this.#closed.resolve();
+  }
 
   emit(notification: JsonRpcNotificationEnvelope): void {
     for (const listener of this.#listeners) {
@@ -169,6 +183,67 @@ describe("TuiApp", () => {
     setup.mockInput.pressCtrlC();
     await setup.waitForFrame((frame) => frame.includes("cancelling"));
 
+    setup.mockInput.pressKey("q");
+    expect(await codePromise).toBe(130);
+  });
+
+  test("shows an ambiguous acceptance error and exits with 2", async () => {
+    const connection = new FakeConnection();
+    connection.agentRunError = true;
+    const { setup, codePromise } = await startApp(connection);
+
+    await setup.waitForFrame((frame) => frame.includes("acceptance-uncertain"));
+    setup.mockInput.pressKey("q");
+
+    expect(await codePromise).toBe(2);
+    expect(connection.closeCalls).toBe(1);
+  });
+
+  test("force exit releases socket, listener and renderer exactly once", async () => {
+    const connection = new FakeConnection();
+    const { setup, codePromise } = await startApp(connection);
+    await connection.listening;
+    let destroyCalls = 0;
+    const originalDestroy = setup.renderer.destroy.bind(setup.renderer);
+    setup.renderer.destroy = () => {
+      destroyCalls += 1;
+      originalDestroy();
+    };
+
+    connection.emit(pushNotification(event("run.started", {}, 1)));
+    await setup.waitForFrame((frame) => frame.includes("running"));
+    setup.mockInput.pressKey("q");
+    setup.mockInput.pressKey("q");
+
+    expect(await codePromise).toBe(130);
+    expect(connection.closeCalls).toBe(1);
+    expect(connection.listenerCount).toBe(0);
+    expect(destroyCalls).toBe(1);
+  });
+
+  test("supports scrolling keys and keeps layout after resize", async () => {
+    const connection = new FakeConnection();
+    const { setup, codePromise } = await startApp(connection);
+    await connection.listening;
+    connection.emit(pushNotification(event("run.started", {}, 1)));
+    for (let index = 0; index < 20; index += 1) {
+      connection.emit(
+        pushNotification(
+          event(
+            "tool.started",
+            { toolCallId: `t${index}`, name: `tool_${index}`, attempt: 1 },
+            index + 2,
+          ),
+        ),
+      );
+    }
+
+    await setup.waitForFrame((frame) => frame.includes("tool_19"));
+    setup.mockInput.pressKey("HOME");
+    await setup.waitForFrame((frame) => frame.includes("tool_0"));
+    setup.resize(72, 12);
+    await setup.waitForFrame((frame) => frame.includes("running") && frame.includes("Ctrl-C"));
+    setup.mockInput.pressKey("q");
     setup.mockInput.pressKey("q");
     expect(await codePromise).toBe(130);
   });

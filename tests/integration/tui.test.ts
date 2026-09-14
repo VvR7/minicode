@@ -123,16 +123,42 @@ interface HeadlessSetup {
 /** 以真实时间轮询渲染帧，直到包含目标文本；比 waitForFrame 更适合跨进程异步事件。 */
 async function waitForText(setup: HeadlessSetup, text: string, timeoutMs = 8_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+  let lastFrame = "";
   while (Date.now() < deadline) {
     // 先让异步事件与原生渲染线程推进，再主动跑一帧并读取。
     await Bun.sleep(20);
     setup.renderer.requestRender();
     await setup.renderOnce();
-    if (setup.captureCharFrame().includes(text)) {
+    lastFrame = setup.captureCharFrame();
+    if (lastFrame.includes(text)) {
       return;
     }
   }
-  throw new Error(`timed out waiting for frame containing: ${text}`);
+  throw new Error(`timed out waiting for frame containing: ${text}\nlast frame:\n${lastFrame}`);
+}
+
+/** 等待跨进程测试条件成立，超时后给出明确失败原因。 */
+async function waitForCondition(predicate: () => boolean, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error("timed out waiting for integration condition");
+}
+
+/** 等待指定端口重新开始监听。 */
+async function waitUntilListening(port: number, timeoutMs = 3_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await canConnect(port)) {
+      return;
+    }
+    await Bun.sleep(10);
+  }
+  throw new Error("core did not start listening");
 }
 
 describe("mc-tui process-level E2E (headless)", () => {
@@ -155,10 +181,12 @@ describe("mc-tui process-level E2E (headless)", () => {
     });
 
     await waitForText(setup, "SUMMARY:content-alpha");
+    // 文本 delta 可能早于 run.finished；等待终态后 q 才应直接退出而不是发起取消。
+    await waitForText(setup, "succeeded");
     setup.mockInput.pressKey("q");
     expect(await codePromise).toBe(0);
     expect(mock.callCount).toBe(2);
-  });
+  }, 15_000);
 
   test("shows a failed run for missing LLM config and quits with 1", async () => {
     const { port } = await startCore();
@@ -201,4 +229,64 @@ describe("mc-tui process-level E2E (headless)", () => {
     setup.mockInput.pressKey("q");
     expect(await codePromise).toBe(130);
   });
+
+  test("cancels a real running Core run and exits with 130", async () => {
+    const mock = startAnthropicMock({ delayMs: 2_000 });
+    cleanups.push(mock.stop);
+    const { port } = await startCore(mock.url);
+    const workspace = await makeWorkspace();
+    const setup = await createTestRenderer({ width: 90, height: 14, exitOnCtrlC: false });
+    cleanups.push(() => Promise.resolve(setup.renderer.destroy()));
+
+    const app = new TuiApp();
+    const codePromise = app.run({
+      goal: "summarize",
+      workspaceRoot: workspace,
+      endpoint: { host: "127.0.0.1", port },
+      createRenderer: async () => setup.renderer,
+      reconnectDelayMs: 20,
+      cancelTimeoutMs: 3_000,
+    });
+
+    await waitForCondition(() => mock.callCount >= 1);
+    setup.mockInput.pressKey("q");
+    await waitForText(setup, "cancelled");
+    setup.mockInput.pressKey("q");
+    expect(await codePromise).toBe(130);
+  }, 10_000);
+
+  test("reconnects after Core restart and replays the terminal event", async () => {
+    const mock = startAnthropicMock({ delayMs: 5_000 });
+    cleanups.push(mock.stop);
+    const { port, core, homeDirectory } = await startCore(mock.url);
+    const workspace = await makeWorkspace();
+    const setup = await createTestRenderer({ width: 90, height: 14, exitOnCtrlC: false });
+    cleanups.push(() => Promise.resolve(setup.renderer.destroy()));
+
+    const app = new TuiApp();
+    const codePromise = app.run({
+      goal: "summarize",
+      workspaceRoot: workspace,
+      endpoint: { host: "127.0.0.1", port },
+      createRenderer: async () => setup.renderer,
+      reconnectDelayMs: 20,
+    });
+
+    await waitForCondition(() => mock.callCount >= 1);
+    // 强制终止以确保 live 终态来不及送达；重启后只能依赖 journal replay。
+    core.kill("SIGKILL");
+    await core.exited;
+    await waitForText(setup, "reconnecting");
+
+    const restarted = spawnCore(port, homeDirectory, mock.url);
+    cleanups.push(async () => {
+      restarted.kill("SIGTERM");
+      await restarted.exited;
+    });
+    await waitUntilListening(port);
+    await waitForText(setup, "core_restarted");
+    setup.mockInput.pressKey("q");
+
+    expect(await codePromise).toBe(1);
+  }, 15_000);
 });

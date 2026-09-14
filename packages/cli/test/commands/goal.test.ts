@@ -76,6 +76,34 @@ describe("GoalEventReducer", () => {
     expect(tool.stderr).toEqual(["tool read_file"]);
   });
 
+  test("emits an explicitly separated durable result when middle deltas were lost", () => {
+    const reducer = new GoalEventReducer();
+    reducer.onEvent(event("step.started", { step: 1 }, 1));
+    reducer.onEvent(event("llm.text_delta", { text: "Hel" }, 2));
+    reducer.onEvent(event("llm.text_delta", { text: "world" }, 4));
+
+    const terminal = reducer.onEvent(
+      event(
+        "run.finished",
+        {
+          status: "succeeded",
+          reason: "completed",
+          finalText: "Hello world",
+          steps: 1,
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+        },
+        5,
+      ),
+    );
+
+    expect(terminal.stdout).toBe("\n--- recovered final response ---\nHello world");
+  });
+
   test("records the terminal outcome from run.finished", () => {
     const reducer = new GoalEventReducer();
     reducer.onEvent(

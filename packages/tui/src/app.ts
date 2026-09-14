@@ -122,7 +122,7 @@ export class TuiApp {
       renderer.keyInput.on("keypress", onKeyPress);
 
       const client = new AgentRunClient();
-      // 后台 run：观察其结果；正常由共享客户端收敛为返回值，永不 reject。
+      // 后台 run：领域终态由事件归约；传输错误/取消超时由生命周期结果补成可退出状态。
       const clientRun = client.run(
         {
           goal: options.goal,
@@ -149,11 +149,17 @@ export class TuiApp {
           },
         },
       );
-      void clientRun.then(() => {});
+      void clientRun.then((result) => {
+        log.apply(model.applyClientResult(result));
+        updateStatus();
+      });
 
       const code = await quit;
-      // 用户退出：中止 run/重连；客户端通过可中断延时尽快回收，进程由 bin 层退出。
+      // 用户退出：先请求取消，再显式 shutdown 并等待 client 完成，确保 socket、listener、
+      // cancel timer 都在 renderer/raw mode 销毁前释放。
       controller.abort();
+      client.shutdown();
+      await clientRun;
       renderer.keyInput.off("keypress", onKeyPress);
       return code;
     } finally {

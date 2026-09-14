@@ -118,14 +118,14 @@ export class GoalEventReducer {
           finalText: event.payload.finalText,
           steps: event.payload.steps,
         };
-        // text_delta 不持久化；断线后的终态用 finalText 补齐当前最终 step 尚未输出的后缀。
-        const missingFinalText = event.payload.finalText.startsWith(this.#currentStepText)
+        // text_delta 不持久化；前缀一致时只补后缀，非前缀表示断线丢失了中间 delta，
+        // 此时输出带明确分隔的完整 durable finalText，避免把残缺流式文本误认为最终结果。
+        const streamedTextMatches = event.payload.finalText.startsWith(this.#currentStepText);
+        const recoveredText = streamedTextMatches
           ? event.payload.finalText.slice(this.#currentStepText.length)
-          : this.#currentStepText.length === 0
-            ? event.payload.finalText
-            : "";
+          : `\n--- recovered final response ---\n${event.payload.finalText}`;
         return {
-          ...(missingFinalText.length === 0 ? {} : { stdout: missingFinalText }),
+          ...(recoveredText.length === 0 ? {} : { stdout: recoveredText }),
           stderr: [`run ${event.payload.status} (${event.payload.reason})`],
         };
       }

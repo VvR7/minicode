@@ -1,10 +1,19 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { rm } from "node:fs/promises";
 import { createServer, createConnection } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
 const coreBin = fileURLToPath(new URL("../../packages/core/src/bin.ts", import.meta.url));
 const pingBin = fileURLToPath(new URL("../../packages/cli/src/bin.ts", import.meta.url));
+const testHome = join(tmpdir(), `minicode-ipc-ping-${process.pid}`);
+
+/** 测试结束后删除显式隔离的 Core home。 */
+afterAll(async () => {
+  await rm(testHome, { recursive: true, force: true });
+});
 
 async function getFreePort(): Promise<number> {
   const server = createServer();
@@ -28,6 +37,8 @@ function testEnvironment(port: number | string): Record<string, string | undefin
     MINICODE_CORE_HOST: "127.0.0.1",
     MINICODE_CORE_PORT: String(port),
     MINICODE_LOG_LEVEL: "error",
+    // 不继承用户 .env，避免相对路径等本地配置污染进程级测试。
+    MINICODE_HOME: testHome,
   };
 }
 

@@ -73,6 +73,11 @@ class FakeConnection {
     return this.#listening.promise;
   }
 
+  /** 当前 notification listener 数，用于验证 shutdown 清理。 */
+  get listenerCount(): number {
+    return this.#listeners.size;
+  }
+
   request(method: string, params: Record<string, unknown>): Promise<unknown> {
     this.requests.push({ method, params });
     if (method === "agent.run") {
@@ -292,6 +297,139 @@ describe("AgentRunClient", () => {
     );
     expect(result.kind).toBe("acceptance-uncertain");
     expect(connection.closed).toBe(true);
+  });
+
+  test("does not create a run when abort happens while connect is pending", async () => {
+    const controller = new AbortController();
+    const pending = Promise.withResolvers<NdjsonRpcConnection>();
+    const connection = new FakeConnection();
+    connection.requestHandler = defaultHandler;
+    const { callbacks } = collectCallbacks();
+    const client = new AgentRunClient();
+
+    const running = client.run(
+      {
+        goal: "x",
+        workspaceRoot: "/w",
+        endpoint,
+        signal: controller.signal,
+        connect: () => pending.promise,
+      },
+      callbacks,
+    );
+    controller.abort();
+    pending.resolve(connection as unknown as NdjsonRpcConnection);
+
+    expect((await running).kind).toBe("cancelled");
+    expect(connection.requests.some((request) => request.method === "agent.run")).toBe(false);
+    expect(connection.closed).toBe(true);
+  });
+
+  test("keeps reconnecting an established run after cancellation until its deadline", async () => {
+    const controller = new AbortController();
+    const first = new FakeConnection();
+    first.requestHandler = defaultHandler;
+    const disconnected = Promise.withResolvers<void>();
+    const statuses: string[] = [];
+    let attempts = 0;
+    const client = new AgentRunClient();
+
+    const running = client.run(
+      {
+        goal: "x",
+        workspaceRoot: "/w",
+        endpoint,
+        signal: controller.signal,
+        reconnectDelayMs: 0,
+        cancelTimeoutMs: 15,
+        connect: async () => {
+          attempts += 1;
+          if (attempts === 1) {
+            return first as unknown as NdjsonRpcConnection;
+          }
+          throw new Error("still disconnected");
+        },
+      },
+      {
+        onEvent: () => {},
+        onStatus: (status) => {
+          statuses.push(status.state);
+          if (status.state === "disconnected") {
+            disconnected.resolve();
+          }
+        },
+      },
+    );
+    await first.listening;
+    first.close();
+    await disconnected.promise;
+    controller.abort();
+
+    expect((await running).kind).toBe("cancelled");
+    expect(attempts).toBeGreaterThan(2);
+    expect(statuses).toContain("cancelling");
+  });
+
+  test("shutdown interrupts a pending connect and closes a late socket", async () => {
+    const pending = Promise.withResolvers<NdjsonRpcConnection>();
+    const connection = new FakeConnection();
+    connection.requestHandler = defaultHandler;
+    const { callbacks } = collectCallbacks();
+    const client = new AgentRunClient();
+    let closeCalls = 0;
+    const originalClose = connection.close.bind(connection);
+    connection.close = () => {
+      closeCalls += 1;
+      originalClose();
+    };
+
+    const running = client.run(
+      {
+        goal: "x",
+        workspaceRoot: "/w",
+        endpoint,
+        connect: () => pending.promise,
+      },
+      callbacks,
+    );
+    client.shutdown();
+
+    expect((await running).kind).toBe("cancelled");
+    pending.resolve(connection as unknown as NdjsonRpcConnection);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(closeCalls).toBe(1);
+  });
+
+  test("shutdown releases the active connection and notification listener exactly once", async () => {
+    const connection = new FakeConnection();
+    connection.requestHandler = defaultHandler;
+    const { callbacks } = collectCallbacks();
+    const client = new AgentRunClient();
+    let closeCalls = 0;
+    const originalClose = connection.close.bind(connection);
+    connection.close = () => {
+      closeCalls += 1;
+      originalClose();
+    };
+
+    const running = client.run(
+      {
+        goal: "x",
+        workspaceRoot: "/w",
+        endpoint,
+        connect: () => Promise.resolve(connection as unknown as NdjsonRpcConnection),
+      },
+      callbacks,
+    );
+    await connection.listening;
+    client.shutdown();
+    client.shutdown();
+
+    expect((await running).kind).toBe("cancelled");
+    expect(closeCalls).toBe(1);
+    expect(connection.closed).toBe(true);
+    expect(connection.listenerCount).toBe(0);
   });
 
   test("converts a throwing status callback into internal-error", async () => {

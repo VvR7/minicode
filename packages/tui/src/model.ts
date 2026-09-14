@@ -1,5 +1,5 @@
 import type { AgentEvent } from "@minicode/protocol";
-import type { AgentRunClientStatus } from "@minicode/client";
+import type { AgentRunClientResult, AgentRunClientStatus } from "@minicode/client";
 
 /** 连接阶段，来自共享客户端的状态回调。 */
 export type ConnectionPhase = "connecting" | "connected" | "disconnected" | "cancelling";
@@ -11,12 +11,17 @@ export type RunOutcome = "succeeded" | "failed" | "cancelled";
 export type RunState =
   | { readonly status: "idle" }
   | { readonly status: "running" }
-  | { readonly status: "finished"; readonly outcome: RunOutcome };
+  | { readonly status: "finished"; readonly outcome: RunOutcome }
+  | {
+      readonly status: "client-error";
+      readonly kind: "connect-failed" | "acceptance-uncertain" | "internal-error";
+    };
 
 /** 日志行的语义类别，供渲染层决定颜色，模型层不感知终端样式。 */
 export type LogKind =
   | "assistant"
   | "info"
+  | "client-error"
   | "model"
   | "tool"
   | "tool-error"
@@ -52,9 +57,26 @@ export const MAX_LOG_LINES = 1000;
 export const MAX_LOG_BYTES = 1024 * 1024;
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 function byteLength(text: string): number {
   return encoder.encode(text).length;
+}
+
+/** 从 UTF-8 文本尾部保留不超过 maxBytes 的完整字符。 */
+function truncateUtf8Tail(text: string, maxBytes: number): string {
+  const encoded = encoder.encode(text);
+  if (encoded.length <= maxBytes) {
+    return text;
+  }
+  if (maxBytes <= 0) {
+    return "";
+  }
+  let start = encoded.length - maxBytes;
+  while (start < encoded.length && ((encoded[start] ?? 0) & 0xc0) === 0x80) {
+    start += 1;
+  }
+  return decoder.decode(encoded.subarray(start));
 }
 
 /** 截取 UUID 前 8 位用于状态栏等窄空间展示。 */
@@ -74,6 +96,9 @@ export function exitCodeForRunState(run: RunState): number {
         return 130;
     }
   }
+  if (run.status === "client-error") {
+    return run.kind === "internal-error" ? 1 : 2;
+  }
   // run 尚未建立或仍在运行中退出，按用户中断处理。
   return 130;
 }
@@ -88,7 +113,7 @@ export type QuitDecision =
  * 终态直接退出；运行中首次触发取消、再次触发强制退出；未建立 run 直接退出。
  */
 export function decideQuit(run: RunState, cancelRequested: boolean): QuitDecision {
-  if (run.status === "finished") {
+  if (run.status === "finished" || run.status === "client-error") {
     return { action: "quit", code: exitCodeForRunState(run) };
   }
   if (cancelRequested) {
@@ -136,6 +161,25 @@ export class TuiModel {
   /** 应用连接状态回调：更新连接阶段，不写入日志。 */
   applyStatus(status: AgentRunClientStatus): void {
     this.#connection = status.state;
+  }
+
+  /**
+   * 应用客户端生命周期结果：终态事件已处理时保持原状态；否则把取消或错误
+   * 收敛为可退出状态，并给日志添加可见原因。
+   */
+  applyClientResult(result: AgentRunClientResult): readonly LogMutation[] {
+    if (result.kind === "finished" || this.#run.status === "finished") {
+      return [];
+    }
+    const mutations: LogMutation[] = [];
+    if (result.kind === "cancelled") {
+      this.#run = { status: "finished", outcome: "cancelled" };
+      this.#append(mutations, "run-fail", "run cancelled (client shutdown or timeout)");
+      return mutations;
+    }
+    this.#run = { status: "client-error", kind: result.kind };
+    this.#append(mutations, "client-error", `client ${result.kind}`);
+    return mutations;
   }
 
   /**
@@ -220,24 +264,21 @@ export class TuiModel {
     return mutations;
   }
 
-  /** run.finished 时用 durable finalText 补齐当前 assistant 行缺失的后缀。 */
+  /** run.finished 时用 durable finalText 校正当前 assistant 行。 */
   #fillFinalText(mutations: LogMutation[], finalText: string): void {
     if (this.#assistantLineId !== undefined) {
       const current = this.#lineText(this.#assistantLineId);
-      const missing = finalText.startsWith(current)
-        ? finalText.slice(current.length)
-        : current.length === 0
-          ? finalText
-          : "";
-      if (missing.length > 0) {
-        this.#extend(mutations, this.#assistantLineId, missing);
+      if (finalText.startsWith(current)) {
+        this.#extend(mutations, this.#assistantLineId, finalText.slice(current.length));
+      } else {
+        // 非持久 delta 可能在断线期间丢失；非前缀时必须用权威 finalText 整行替换。
+        this.#replace(mutations, this.#assistantLineId, finalText);
       }
       return;
     }
     // 断线重放等场景：没有当前 assistant 行时，直接以 finalText 新建一行。
     if (finalText.length > 0) {
-      const id = this.#append(mutations, "assistant", "");
-      this.#extend(mutations, id, finalText);
+      this.#append(mutations, "assistant", finalText);
     }
   }
 
@@ -254,6 +295,9 @@ export class TuiModel {
 
   /** 向已有行追加文本（assistant 流式增量），并发出 update 变更。 */
   #extend(mutations: LogMutation[], id: number, delta: string): void {
+    if (delta.length === 0) {
+      return;
+    }
     const index = this.#lines.findIndex((line) => line.id === id);
     const current = this.#lines[index];
     if (current === undefined) {
@@ -263,6 +307,21 @@ export class TuiModel {
     this.#lines[index] = updated;
     this.#totalBytes += byteLength(delta);
     mutations.push({ type: "update", line: updated });
+    this.#trim(mutations);
+  }
+
+  /** 用权威文本替换已有行，并重新执行字节上限裁剪。 */
+  #replace(mutations: LogMutation[], id: number, text: string): void {
+    const index = this.#lines.findIndex((line) => line.id === id);
+    const current = this.#lines[index];
+    if (current === undefined) {
+      return;
+    }
+    const updated: LogLine = { ...current, text };
+    this.#lines[index] = updated;
+    this.#totalBytes += byteLength(text) - byteLength(current.text);
+    mutations.push({ type: "update", line: updated });
+    this.#trim(mutations);
   }
 
   /** 超出内存上限时，从最旧的非当前 assistant 行开始淘汰。 */
@@ -273,7 +332,17 @@ export class TuiModel {
     ) {
       const index = this.#lines.findIndex((line) => line.id !== this.#assistantLineId);
       if (index === -1) {
-        // 只剩当前 assistant 行时无法继续裁剪，避免丢失流式内容。
+        // 只剩当前 assistant 行时保留最新尾部，仍严格满足总字节上限。
+        const assistantIndex = this.#lines.findIndex((line) => line.id === this.#assistantLineId);
+        const assistant = this.#lines[assistantIndex];
+        if (assistant === undefined) {
+          return;
+        }
+        const text = truncateUtf8Tail(assistant.text, this.#maxBytes);
+        this.#totalBytes += byteLength(text) - byteLength(assistant.text);
+        const updated: LogLine = { ...assistant, text };
+        this.#lines[assistantIndex] = updated;
+        mutations.push({ type: "update", line: updated });
         return;
       }
       const [removed] = this.#lines.splice(index, 1);

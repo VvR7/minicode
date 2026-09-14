@@ -11,6 +11,7 @@ import type { LogKind, LogLine, LogMutation } from "../model.ts";
 const KIND_COLORS: Record<LogKind, string | undefined> = {
   assistant: undefined,
   info: "#808080",
+  "client-error": "#e06c75",
   model: "#56b6c2",
   tool: "#98c379",
   "tool-error": "#e06c75",

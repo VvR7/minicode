@@ -13,6 +13,10 @@ export function formatStatus(snapshot: TuiSnapshot): string {
     return `${id}${mark} ${run.outcome}`;
   }
 
+  if (run.status === "client-error") {
+    return `${id}✗ ${run.kind}`;
+  }
+
   if (run.status === "running") {
     const state =
       connection === "connected"

@@ -541,6 +541,14 @@ describe("SessionStore corruption detection", () => {
     }
   });
 
+  test("marks a valid note owned by another session as corrupt", async () => {
+    const { store, storage } = createMemoryStore(HOME);
+    seedSession(storage, HOME, SESSION_A);
+    const foreign = store.createNoteStore(SESSION_B, RUN_A).render("foreign secret");
+    storage.files.set(sessionPaths(HOME, SESSION_A).notes, foreign);
+    expect((await store.load(SESSION_A)).ok).toBe(false);
+  });
+
   test("marks duplicate client IDs with changed identity or content as corrupt", async () => {
     const { store, storage } = createMemoryStore(HOME);
     seedSession(storage, HOME, SESSION_A);

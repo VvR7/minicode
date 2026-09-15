@@ -84,9 +84,11 @@ export class NoteStore {
   async read(): Promise<SessionStoreResult<string>> {
     try {
       const content = (await this.#storage.readFile(this.#path)) ?? "";
+      const records = parseSessionNotes(content);
       if (
         encoder.encode(content).byteLength > MAX_NOTES_BYTES ||
-        parseSessionNotes(content) === undefined
+        records === undefined ||
+        records.some((record) => record.sessionId !== this.#identity.sessionId)
       ) {
         return {
           ok: false,

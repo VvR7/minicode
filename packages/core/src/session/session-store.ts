@@ -680,10 +680,12 @@ export class SessionStore {
     let notes: string;
     try {
       const rawNotes = await this.#storage.readFile(paths.notes);
+      const noteRecords = rawNotes === undefined ? undefined : parseSessionNotes(rawNotes);
       if (
         rawNotes === undefined ||
         new TextEncoder().encode(rawNotes).byteLength > 256 * 1024 ||
-        parseSessionNotes(rawNotes) === undefined
+        noteRecords === undefined ||
+        noteRecords.some((record) => record.sessionId !== sessionId)
       ) {
         return { ok: true, value: { meta: meta.data } };
       }

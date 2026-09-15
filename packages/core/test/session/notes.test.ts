@@ -105,6 +105,12 @@ describe("NoteStore", () => {
 
     storage.files.set("/home/notes.md", "x".repeat(MAX_NOTES_BYTES + 1));
     expect((await notes.read()).ok).toBe(false);
+
+    storage.files.set(
+      "/home/notes.md",
+      notes.render("foreign").replace(SESSION_A, "550e8400-e29b-41d4-a716-446655440199"),
+    );
+    expect((await notes.read()).ok).toBe(false);
   });
 
   test("serializes appends across NoteStore instances before checking the total limit", async () => {

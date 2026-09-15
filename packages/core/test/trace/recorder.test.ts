@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { TraceRecorder } from "../../src/trace/recorder.ts";
+import { TraceRecorder, runTraceDirectory } from "../../src/trace/recorder.ts";
 import { TraceRecordSchema } from "../../src/trace/types.ts";
 import { RUN_A, SESSION_A } from "../session/test-helpers.ts";
 import { MemoryTraceStorage } from "./test-helpers.ts";
 
 const now = (): string => "2026-09-14T08:00:00.000Z";
+const TRACE_PATH = `/home/sessions/${SESSION_A}/runs/${RUN_A}/trace.jsonl`;
 
 function makeRecorder(
   storage: MemoryTraceStorage,
@@ -16,7 +17,7 @@ function makeRecorder(
     RUN_A,
     { enabled, payload, queueEvents: 100, maxBytes: 1_000_000, shutdownMs: 1000 },
     storage,
-    "/run",
+    "/home",
     now,
   );
 }
@@ -40,7 +41,7 @@ describe("TraceRecorder", () => {
       },
     });
     await recorder.stop();
-    const records = storage.lines("/run/trace.jsonl").map((line) => JSON.parse(line));
+    const records = storage.lines(TRACE_PATH).map((line) => JSON.parse(line));
     expect(records).toHaveLength(1);
     const record = records[0];
     const raw = JSON.stringify(record);
@@ -71,7 +72,7 @@ describe("TraceRecorder", () => {
       },
     });
     await recorder.stop();
-    const record = JSON.parse(storage.lines("/run/trace.jsonl")[0] as string);
+    const record = JSON.parse(storage.lines(TRACE_PATH)[0] as string);
     expect(record.data.prompt).toBe("hello world");
     expect(record.data.apiKey).toBe("[REDACTED]");
     expect(record.data.nested.authorization).toBe("[REDACTED]");
@@ -87,7 +88,7 @@ describe("TraceRecorder", () => {
     recorder.start();
     recorder.record({ source: "CORE", target: "CORE", kind: "ipc.error", data: { a: 1 } });
     await recorder.stop();
-    expect(storage.lines("/run/trace.jsonl")).toHaveLength(0);
+    expect(storage.lines(TRACE_PATH)).toHaveLength(0);
   });
 
   test("never throws on circular or unprocessable data", () => {
@@ -102,6 +103,28 @@ describe("TraceRecorder", () => {
     expect(() =>
       recorder.record({ source: "CORE", target: "CORE", kind: "ipc.error" }),
     ).not.toThrow();
+  });
+
+  test("rejects unsafe trace paths and identities", () => {
+    expect(() => runTraceDirectory("relative", SESSION_A, RUN_A)).toThrow();
+    expect(() => runTraceDirectory("/home", "../escape" as typeof SESSION_A, RUN_A)).toThrow();
+  });
+
+  test("drops records that fail the runtime schema", async () => {
+    const storage = new MemoryTraceStorage();
+    const recorder = new TraceRecorder(
+      SESSION_A,
+      RUN_A,
+      { enabled: true, payload: "full", queueEvents: 100, maxBytes: 1_000_000, shutdownMs: 100 },
+      storage,
+      "/home",
+      () => "not-a-time",
+    );
+    recorder.start();
+    recorder.record({ source: "CORE", target: "CORE", kind: "ipc.error", durationMs: -1 });
+    const report = await recorder.stop();
+    expect(storage.lines(TRACE_PATH)).toEqual([]);
+    expect(report.droppedRecords).toBe(1);
   });
 
   test("records a complete ipc/core/llm timeline with paired terminal records", async () => {
@@ -142,7 +165,7 @@ describe("TraceRecorder", () => {
     recorder.record({ source: "CORE", target: "LLM", kind: "llm.request", step: 1 });
     recorder.record({ source: "CORE", target: "LLM", kind: "llm.cancelled", step: 1 });
     await recorder.stop();
-    const records = storage.lines("/run/trace.jsonl").map((line) => JSON.parse(line));
+    const records = storage.lines(TRACE_PATH).map((line) => JSON.parse(line));
     expect(records.map((record) => record.kind)).toEqual([
       "ipc.request_received",
       "ipc.response_queued",

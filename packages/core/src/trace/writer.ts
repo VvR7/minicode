@@ -4,6 +4,7 @@ import {
   TRACE_RECORD_MAX_BYTES,
   TRACE_SCHEMA_VERSION,
   TRACE_TRUNCATED_RESERVE_BYTES,
+  TraceRecordSchema,
   type TraceConfig,
   type TraceRecord,
   type TraceRecordInput,
@@ -41,7 +42,9 @@ export class TraceWriter {
   #stopDeadline = 0;
   #wakeResolve: (() => void) | null = null;
   #workerPromise: Promise<void> | null = null;
+  #stopPromise: Promise<TraceShutdownReport> | null = null;
   #report: TraceShutdownReport | null = null;
+  #abandoned = false;
 
   constructor(
     sessionId: SessionId,
@@ -59,7 +62,7 @@ export class TraceWriter {
 
   /** 幂等启动 worker；已经运行或已停止时不做任何事。 */
   start(): void {
-    if (this.#running || this.#stopped) {
+    if (!this.#config.enabled || this.#running || this.#stopped) {
       return;
     }
     this.#running = true;
@@ -89,23 +92,48 @@ export class TraceWriter {
       this.#report = this.#buildReport();
       return Promise.resolve(this.#report);
     }
+    if (this.#stopPromise !== null) {
+      return this.#stopPromise;
+    }
     this.#stopped = true;
     this.#stopDeadline = Date.now() + this.#config.shutdownMs;
     this.#wake();
     const worker = this.#workerPromise ?? Promise.resolve();
-    return worker.then(() => {
-      if (this.#report === null) {
-        this.#report = this.#buildReport();
-      }
-      return this.#report;
+    this.#stopPromise = new Promise<TraceShutdownReport>((resolve) => {
+      const timeout = setTimeout(() => {
+        this.#timedOut = true;
+        this.#abandoned = true;
+        this.#wake();
+        void this.#handle?.close().catch(() => {});
+        this.#report ??= this.#buildReport();
+        resolve(this.#report);
+      }, this.#config.shutdownMs);
+      void worker.then(() => {
+        clearTimeout(timeout);
+        this.#report ??= this.#buildReport();
+        resolve(this.#report);
+      });
     });
+    return this.#stopPromise;
   }
 
   /** 后台 worker：打开文件后循环刷盘，直到停止且队列清空或超时。 */
   async #runWorker(): Promise<void> {
     try {
       await this.#storage.ensureDirectory(dirname(this.#path));
+      if (this.#abandoned) return;
+      const existing = await this.#storage.readFile(this.#path);
+      if (this.#abandoned) return;
+      if (!this.#restoreExisting(existing)) {
+        this.#writeFailed = true;
+        this.#stopped = true;
+        return;
+      }
       this.#handle = await this.#storage.openAppend(this.#path);
+      if (this.#abandoned) {
+        await this.#handle.close().catch(() => {});
+        return;
+      }
     } catch {
       // 打开失败：Trace 是 best-effort observer，静默停止。
       this.#writeFailed = true;
@@ -113,6 +141,9 @@ export class TraceWriter {
       return;
     }
     while (true) {
+      if (this.#abandoned) {
+        break;
+      }
       if (this.#queue.length === 0) {
         if (this.#stopped) {
           break;
@@ -133,6 +164,40 @@ export class TraceWriter {
     await this.#handle.close().catch(() => {});
   }
 
+  /** 校验已有 JSONL，并从最后一条记录恢复文件大小与下一 sequence。 */
+  #restoreExisting(content: string | undefined): boolean {
+    if (content === undefined || content.length === 0) {
+      return true;
+    }
+    if (!content.endsWith("\n")) {
+      return false;
+    }
+    const lines = content.slice(0, -1).split("\n");
+    let expected = 1;
+    for (const line of lines) {
+      try {
+        const parsed = TraceRecordSchema.safeParse(JSON.parse(line) as unknown);
+        if (
+          !parsed.success ||
+          parsed.data.sessionId !== this.#sessionId ||
+          parsed.data.runId !== this.#runId ||
+          parsed.data.sequence !== expected
+        ) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+      expected += 1;
+    }
+    this.#bytesWritten = encoder.encode(content).byteLength;
+    this.#nextSequence = expected;
+    if (this.#bytesWritten >= this.#config.maxBytes) {
+      this.#sizeLimitReached = true;
+    }
+    return true;
+  }
+
   /** 写入单条记录；处理溢出 drop 计数、record 上限与文件上限。 */
   async #writeRecord(record: TraceRecordInput): Promise<void> {
     // 下一个可写机会先附带累计的 drop 计数。
@@ -140,7 +205,16 @@ export class TraceWriter {
       await this.#writeTruncated("queue_overflow");
     }
 
-    const stamped: TraceRecord = { ...record, sequence: this.#nextSequence };
+    const parsed = TraceRecordSchema.safeParse({ ...record, sequence: this.#nextSequence });
+    if (
+      !parsed.success ||
+      parsed.data.sessionId !== this.#sessionId ||
+      parsed.data.runId !== this.#runId
+    ) {
+      this.#drop(this.#estimateBytes(record));
+      return;
+    }
+    const stamped: TraceRecord = parsed.data;
     let line: string;
     try {
       line = `${JSON.stringify(stamped)}\n`;
@@ -154,6 +228,10 @@ export class TraceWriter {
       stamped.data = { truncated: true, reason: "record_size_limit" };
       line = `${JSON.stringify(stamped)}\n`;
       lineBytes = encoder.encode(line).byteLength;
+      if (lineBytes > TRACE_RECORD_MAX_BYTES) {
+        this.#drop(lineBytes);
+        return;
+      }
     }
 
     // 文件上限：为 trace.truncated 预留空间，达到后停止写普通记录。
@@ -166,6 +244,7 @@ export class TraceWriter {
 
     try {
       await this.#handle?.write(line);
+      if (this.#abandoned) return;
       this.#bytesWritten += lineBytes;
       this.#recordsWritten += 1;
       this.#nextSequence += 1;
@@ -199,6 +278,7 @@ export class TraceWriter {
     }
     try {
       await this.#handle?.write(line);
+      if (this.#abandoned) return;
       this.#bytesWritten += lineBytes;
       this.#recordsWritten += 1;
       this.#nextSequence += 1;
@@ -219,7 +299,7 @@ export class TraceWriter {
   /** 估算记录序列化后的字节数；失败返回 0。 */
   #estimateBytes(record: TraceRecordInput): number {
     try {
-      return encoder.encode(JSON.stringify(record)).byteLength;
+      return encoder.encode(`${JSON.stringify(record)}\n`).byteLength;
     } catch {
       return 0;
     }

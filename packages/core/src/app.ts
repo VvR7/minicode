@@ -17,6 +17,13 @@ import { RunManager } from "./run/manager.ts";
 import { markIncompleteRunsRestarted } from "./run/restart.ts";
 import { AgentRunner } from "./run/runner.ts";
 import { NdjsonRpcServer } from "./transport/ndjson-server.ts";
+import {
+  TRACE_MAX_BYTES_DEFAULT,
+  TRACE_QUEUE_EVENTS_DEFAULT,
+  TRACE_SHUTDOWN_MS_DEFAULT,
+  TraceService,
+  loadTraceConfig,
+} from "./trace/index.ts";
 
 export class CoreApp {
   readonly #config: CoreConfig;
@@ -26,6 +33,7 @@ export class CoreApp {
   #eventBus: EventBus | undefined;
   #broadcaster: IpcEventBroadcaster | undefined;
   #manager: RunManager | undefined;
+  #traceService: TraceService | undefined;
   #startedAt = 0;
 
   constructor(config: CoreConfig, environment: Environment = Bun.env) {
@@ -40,18 +48,36 @@ export class CoreApp {
     }
 
     this.#startedAt = performance.now();
+    const traceConfig = loadTraceConfig(this.#environment);
+    if (!traceConfig.ok) {
+      this.#logger.warn(`trace disabled: ${traceConfig.message}`);
+    }
+    const traceService = new TraceService(
+      this.#config.homeDirectory,
+      traceConfig.ok
+        ? traceConfig.value
+        : {
+            enabled: false,
+            payload: "summary",
+            queueEvents: TRACE_QUEUE_EVENTS_DEFAULT,
+            maxBytes: TRACE_MAX_BYTES_DEFAULT,
+            shutdownMs: TRACE_SHUTDOWN_MS_DEFAULT,
+          },
+    );
     const eventStore = new EventStore(this.#config.homeDirectory);
-    const eventBus = new EventBus(eventStore);
+    const eventBus = new EventBus(eventStore, {
+      onPersisted: (event) => traceService.recordEvent(event),
+    });
     const broadcaster = new IpcEventBroadcaster(eventBus);
     const manager = new RunManager(
-      new AgentRunner({ environment: this.#environment, bus: eventBus }),
+      new AgentRunner({ environment: this.#environment, bus: eventBus, traceService }),
     );
     const dispatcher = createRpcDispatcher({
       handlers: [
         new PingHandler({ uptimeMs: () => performance.now() - this.#startedAt }),
         new EventSubscribeHandler(broadcaster),
         new EventUnsubscribeHandler(broadcaster),
-        new AgentRunHandler({ manager, broadcaster }),
+        new AgentRunHandler({ manager, broadcaster, traceService }),
         new AgentCancelHandler(manager),
       ],
     });
@@ -61,6 +87,7 @@ export class CoreApp {
     this.#eventBus = eventBus;
     this.#broadcaster = broadcaster;
     this.#manager = manager;
+    this.#traceService = traceService;
 
     // startup 把未完成 journal 补记为 core_restarted；异步执行，不阻塞监听。
     void markIncompleteRunsRestarted(eventBus, eventStore, this.#config.homeDirectory).catch(
@@ -80,16 +107,19 @@ export class CoreApp {
     this.#logger.info("mc-core shutting down");
     const server = this.#server;
     const manager = this.#manager;
+    const traceService = this.#traceService;
     this.#server = undefined;
 
     // 先取消 active runs，让它们发布 run.finished(cancelled) 后再优雅关闭连接。
     await manager?.shutdown();
     await server.stop();
+    await traceService?.shutdown();
 
     this.#broadcaster?.close();
     this.#broadcaster = undefined;
     this.#eventBus = undefined;
     this.#manager = undefined;
+    this.#traceService = undefined;
   }
 
   get eventBus(): EventBus {

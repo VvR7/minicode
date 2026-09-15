@@ -23,31 +23,42 @@ const CREDENTIAL_EXACT_KEYS = new Set<string>([
  */
 const CREDENTIAL_SUFFIXES = ["apikey", "token", "secret", "password"] as const;
 
-/** summary 模式下剥离的内容型字段（归一化后精确匹配）。 */
-const SUMMARY_CONTENT_KEYS = new Set<string>([
-  "prompt",
-  "systemprompt",
-  "text",
-  "content",
-  "usertext",
-  "assistanttext",
-  "input",
-  "output",
-  "arguments",
-  "args",
-  "result",
-  "response",
-  "body",
-  "payload",
-  "delta",
-  "finaltext",
-  "headers",
-  "description",
-  "instructions",
+/** summary 模式允许保留的安全字段；未知字段一律不保留原值。 */
+const SUMMARY_SAFE_KEYS = new Set<string>([
+  "type",
+  "kind",
+  "event",
+  "status",
+  "reason",
+  "name",
+  "toolname",
+  "toolcallid",
+  "model",
+  "provider",
+  "role",
+  "finishreason",
+  "errorcode",
+  "errorcategory",
+  "step",
+  "attempt",
+  "maxattempts",
+  "delayms",
+  "durationms",
+  "bytes",
+  "inputbytes",
+  "outputbytes",
+  "count",
+  "inputtokens",
+  "outputtokens",
+  "cachecreationinputtokens",
+  "cachereadinputtokens",
 ]);
 
+/** 这些容器本身安全，但内部仍必须逐字段套用 allowlist。 */
+const SUMMARY_SAFE_CONTAINERS = new Set<string>(["usage", "metrics", "messages", "tools"]);
+
 /** Bearer / Basic / Digest 等认证字符串；出现在任意字符串值中都替换。 */
-const AUTH_STRING_PATTERN = /\b(bearer|basic|digest)\s+[A-Za-z0-9._~+/=-]{8,}/giu;
+const AUTH_STRING_PATTERN = /\b(?:bearer|basic|digest)\s+\S+/giu;
 
 const encoder = new TextEncoder();
 
@@ -63,11 +74,6 @@ export function isCredentialKey(key: string): boolean {
     CREDENTIAL_EXACT_KEYS.has(normalized) ||
     CREDENTIAL_SUFFIXES.some((suffix) => normalized.endsWith(suffix))
   );
-}
-
-/** 判断字段是否为 summary 模式应剥离的内容型字段。 */
-function isContentKey(key: string): boolean {
-  return SUMMARY_CONTENT_KEYS.has(normalizeKey(key));
 }
 
 /**
@@ -108,7 +114,14 @@ export function summarize(value: unknown): unknown {
   }
   const result: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
-    result[key] = isContentKey(key) ? "[summarized]" : summarize(item);
+    const normalized = normalizeKey(key);
+    if (SUMMARY_SAFE_CONTAINERS.has(normalized)) {
+      result[key] = summarize(item);
+    } else if (SUMMARY_SAFE_KEYS.has(normalized)) {
+      result[key] = item;
+    } else {
+      result[key] = "[summarized]";
+    }
   }
   return result;
 }
@@ -136,7 +149,9 @@ export function truncateFields(value: unknown): unknown {
   if (typeof value === "string") {
     const bytes = encoder.encode(value).byteLength;
     if (bytes > TRACE_FIELD_MAX_BYTES) {
-      return `${truncateUtf8(value, TRACE_FIELD_MAX_BYTES)}…[truncated]`;
+      const marker = "…[truncated]";
+      const available = TRACE_FIELD_MAX_BYTES - encoder.encode(marker).byteLength;
+      return `${truncateUtf8(value, available)}${marker}`;
     }
     return value;
   }

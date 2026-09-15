@@ -449,7 +449,9 @@ export class NdjsonRpcServer {
             const dispatched = await this.#handler(parsed.value, {
               connection: state.connection,
             });
-            if (!enqueueMessage(socket, dispatched.response).accepted) {
+            const enqueued = enqueueMessage(socket, dispatched.response);
+            if (!enqueued.accepted) {
+              dispatched.afterResponseSent?.(false);
               socket.terminate();
               return;
             }
@@ -461,6 +463,9 @@ export class NdjsonRpcServer {
                 // 此时 RPC 响应已入队，不能再发送第二条错误响应；仅记录内部错误。
                 this.#logger.error("after-response action failed");
               }
+            }
+            if (dispatched.afterResponseSent !== undefined) {
+              void enqueued.completed.then(dispatched.afterResponseSent);
             }
           } catch {
             // 不把异常栈或内部细节泄漏给客户端。

@@ -1,5 +1,6 @@
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { RunId, SessionId } from "@minicode/protocol";
+import { RunIdSchema, SessionIdSchema } from "@minicode/protocol";
 import { redact, summarize, truncateFields } from "./redact.ts";
 import {
   TRACE_SCHEMA_VERSION,
@@ -31,7 +32,18 @@ export function runTraceDirectory(
   sessionId: SessionId,
   runId: RunId,
 ): string {
-  return join(homeDirectory, "sessions", sessionId, "runs", runId);
+  if (!isAbsolute(homeDirectory)) {
+    throw new Error("trace home directory must be absolute");
+  }
+  const safeSessionId = SessionIdSchema.parse(sessionId);
+  const safeRunId = RunIdSchema.parse(runId);
+  const home = resolve(homeDirectory);
+  const directory = join(home, "sessions", safeSessionId, "runs", safeRunId);
+  const suffix = relative(home, directory);
+  if (suffix.startsWith("..") || isAbsolute(suffix)) {
+    throw new Error("trace directory escapes configured home");
+  }
+  return directory;
 }
 
 /**
@@ -50,18 +62,27 @@ export class TraceRecorder {
     runId: RunId,
     config: TraceConfig,
     storage: TraceStorage,
-    directory: string,
+    homeDirectory: string,
     now: () => string = () => new Date().toISOString(),
   ) {
     this.#sessionId = sessionId;
     this.#runId = runId;
     this.#config = config;
-    this.#writer = new TraceWriter(sessionId, runId, config, storage, directory);
+    this.#writer = new TraceWriter(
+      sessionId,
+      runId,
+      config,
+      storage,
+      runTraceDirectory(homeDirectory, sessionId, runId),
+    );
     this.#now = now;
   }
 
   /** 幂等启动后台 writer。 */
   start(): void {
+    if (!this.#config.enabled) {
+      return;
+    }
     this.#writer.start();
   }
 

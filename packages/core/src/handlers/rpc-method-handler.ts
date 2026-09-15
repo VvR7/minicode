@@ -7,6 +7,7 @@ export type RpcMethodInvocation =
       readonly kind: "success";
       readonly result: unknown;
       readonly afterResponseEnqueued?: () => void;
+      readonly afterResponseSent?: (sent: boolean) => void;
     }
   | { readonly kind: "invalid-params" };
 

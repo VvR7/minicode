@@ -100,6 +100,8 @@ export interface TraceShutdownReport {
 export interface TraceStorage {
   /** 递归创建目录并收紧 0700。 */
   ensureDirectory(path: string): Promise<void>;
+  /** 读取已有 trace；文件不存在返回 undefined，用于恢复大小与 sequence。 */
+  readFile(path: string): Promise<string | undefined>;
   /** 以追加模式打开 trace 文件并收紧 0600。 */
   openAppend(path: string): Promise<TraceStorageHandle>;
 }

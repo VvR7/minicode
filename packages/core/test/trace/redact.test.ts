@@ -131,6 +131,11 @@ describe("redact", () => {
     const output = redact(circular) as { a: number; self: unknown };
     expect(output.self).toBe("[Circular]");
   });
+
+  test("masks short authorization values", () => {
+    expect(redact("Bearer abc")).toBe(REDACTED);
+    expect(redact("prefix Basic x suffix")).toBe(`prefix ${REDACTED} suffix`);
+  });
 });
 
 describe("summarize", () => {
@@ -153,6 +158,11 @@ describe("summarize", () => {
     expect(output.tools[0]?.description).toBe("[summarized]");
     expect(output.usage).toEqual({ inputTokens: 10, outputTokens: 3 });
   });
+
+  test("summarizes unknown content-like fields by default", () => {
+    const output = summarize({ userMessage: "secret", toolInput: "secret", random: "secret" });
+    expect(JSON.stringify(output)).not.toContain("secret");
+  });
 });
 
 describe("truncateFields", () => {
@@ -161,7 +171,7 @@ describe("truncateFields", () => {
     const output = truncateFields({ small: "ok", big, nested: { alsoBig: big } }) as TruncateInput;
     expect(output.small).toBe("ok");
     expect(new TextEncoder().encode(output.big).byteLength).toBeLessThanOrEqual(
-      TRACE_FIELD_MAX_BYTES + 32,
+      TRACE_FIELD_MAX_BYTES,
     );
     expect(output.big.endsWith("…[truncated]")).toBe(true);
     expect(output.nested.alsoBig.endsWith("…[truncated]")).toBe(true);

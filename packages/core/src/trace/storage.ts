@@ -1,4 +1,4 @@
-import { chmod, mkdir, open } from "node:fs/promises";
+import { chmod, mkdir, open, readFile } from "node:fs/promises";
 import type { TraceStorage, TraceStorageHandle } from "./types.ts";
 
 /**
@@ -9,6 +9,21 @@ export const nodeTraceStorage: TraceStorage = {
   async ensureDirectory(path) {
     await mkdir(path, { recursive: true, mode: 0o700 });
     await chmod(path, 0o700);
+  },
+  async readFile(path) {
+    try {
+      return await readFile(path, "utf8");
+    } catch (error) {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "ENOENT"
+      ) {
+        return undefined;
+      }
+      throw error;
+    }
   },
   async openAppend(path): Promise<TraceStorageHandle> {
     const handle = await open(path, "a", 0o600);

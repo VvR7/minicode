@@ -21,6 +21,10 @@ export class MemoryTraceStorage implements TraceStorage {
     this.directories.add(path);
   }
 
+  async readFile(path: string): Promise<string | undefined> {
+    return this.files.get(path);
+  }
+
   async openAppend(path: string): Promise<TraceStorageHandle> {
     if (this.openGate !== null) {
       await this.openGate;

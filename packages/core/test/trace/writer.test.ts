@@ -167,6 +167,44 @@ describe("TraceWriter", () => {
     expect(report.pendingRecords).toBeGreaterThan(0);
   });
 
+  test("returns within the deadline when open or write never settles", async () => {
+    for (const blocked of ["open", "write"] as const) {
+      const storage = new MemoryTraceStorage();
+      const never = new Promise<void>(() => {});
+      if (blocked === "open") storage.openGate = never;
+      else storage.writeGate = never;
+      const writer = new TraceWriter(
+        SESSION_A,
+        RUN_B,
+        { ...fullConfig, shutdownMs: 20 },
+        storage,
+        "/run",
+      );
+      writer.start();
+      writer.enqueue(makeTraceRecord(0, {}, RUN_B));
+      const started = performance.now();
+      const report = await writer.stop();
+      expect(performance.now() - started).toBeLessThan(150);
+      expect(report.timedOut).toBe(true);
+    }
+  });
+
+  test("restores file bytes and sequence before appending", async () => {
+    const storage = new MemoryTraceStorage();
+    const path = "/run/trace.jsonl";
+    const existing = { ...makeTraceRecord(0, {}, RUN_B), sequence: 1 };
+    storage.files.set(path, `${JSON.stringify(existing)}\n`);
+    const writer = new TraceWriter(SESSION_A, RUN_B, fullConfig, storage, "/run");
+    writer.start();
+    writer.enqueue(makeTraceRecord(1, {}, RUN_B));
+    const report = await writer.stop();
+    const records = storage.lines(path).map((line) => JSON.parse(line));
+    expect(records.map((record) => record.sequence)).toEqual([1, 2]);
+    expect(report.bytesWritten).toBe(
+      new TextEncoder().encode(storage.files.get(path) ?? "").byteLength,
+    );
+  });
+
   test("keeps independent writers on their own sequences and files", async () => {
     const firstStorage = new MemoryTraceStorage();
     const secondStorage = new MemoryTraceStorage();

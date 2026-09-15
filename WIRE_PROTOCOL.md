@@ -45,6 +45,12 @@
   run events always carry `sessionId`, `runId`, and a run `sequence`.
 - Task planning is run-scoped: `task.created` and `task.updated` carry a `revision` plus a full
   `TaskSnapshot`, and never use a global event scope.
+- Only successful, completely paired history enters the next turn context; failed, cancelled, and
+  interrupted turns remain auditable but are excluded. Session notes persist, while TaskManager is
+  recreated empty for every run.
+- A context-budget rejection returns `-32013` before allocating a turn ID, run ID, or run directory.
+- Consumers merge session and run journals by identity plus their independent sequence domains;
+  timestamps and coincidentally equal text are not deduplication keys.
 
 `agent.run` request (the response identifies the session, run, and initial subscription):
 

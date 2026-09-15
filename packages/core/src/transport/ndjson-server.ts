@@ -285,6 +285,11 @@ export class NdjsonRpcServer {
           socket.data = createConnectionState(socket);
           // 记录活动连接，供优雅关闭时遍历。
           this.#activeSockets.add(socket);
+          if (this.#stopping) {
+            // listener.stop 与已被内核接受的 open 回调可能交错；停机期连接立即关闭。
+            socket.data.acceptingInput = false;
+            socket.terminate();
+          }
           this.#logger.debug(
             `client connected remote=${socket.remoteAddress}:${socket.remotePort}`,
           );
@@ -333,6 +338,8 @@ export class NdjsonRpcServer {
     this.#listener.stop(false);
     // 清空引用，令之后的 start() 可重新创建监听器。
     this.#listener = undefined;
+    // 让 listener.stop 前已被内核接受的 open 回调完成登记，再拍活动连接快照。
+    await Bun.sleep(0);
 
     // 复制集合，避免 socket.close 回调在遍历时修改原集合。
     const sockets = [...this.#activeSockets];
@@ -356,10 +363,14 @@ export class NdjsonRpcServer {
       });
     });
 
-    for (const socket of this.#activeSockets) {
-      // 宽限期后仍存在的连接不再等待，强制释放其资源。
+    const remaining = [...this.#activeSockets];
+    for (const socket of remaining) {
+      // 宽限期后仍存在的连接强制释放，不再等待其业务处理或写队列。
+      socket.data.acceptingInput = false;
       socket.terminate();
     }
+    // terminate 与 Bun close 回调之间仍有异步窗口；真实 close 后才能安全发布强制终态。
+    await Promise.all(remaining.map((socket) => socket.data.closed));
     // stop() 完成，允许实例未来再次启动。
     this.#stopping = false;
   }

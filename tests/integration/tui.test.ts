@@ -119,8 +119,19 @@ async function startCore(llmBaseUrl?: string) {
 
 interface HeadlessSetup {
   renderer: { destroy(): void };
-  mockInput: { pressKey(key: string): void };
+  mockInput: {
+    pressKey(key: string): void;
+    typeText(text: string): Promise<void>;
+    pressEnter(): void;
+    pressCtrlC(): void;
+  };
   captureCharFrame(): string;
+}
+
+/** 使用多轮 TUI 的本地 slash command 正常退出。 */
+async function exitTui(setup: HeadlessSetup): Promise<void> {
+  await setup.mockInput.typeText("/exit");
+  setup.mockInput.pressEnter();
 }
 
 /**
@@ -178,7 +189,7 @@ describe("mc-tui process-level E2E (headless)", () => {
 
     const app = new TuiApp();
     const codePromise = app.run({
-      goal: "summarize the README",
+      mode: { kind: "new", goal: "summarize the README" },
       workspaceRoot: workspace,
       endpoint: { host: "127.0.0.1", port },
       createRenderer: async () => setup.renderer,
@@ -188,12 +199,12 @@ describe("mc-tui process-level E2E (headless)", () => {
     // 只等待 durable 终态，再在同一帧检查最终文本；避免停在流式中间态时误触取消。
     await waitForText(setup, "succeeded");
     expect(setup.captureCharFrame()).toContain("SUMMARY:content-alpha");
-    setup.mockInput.pressKey("q");
+    await exitTui(setup);
     expect(await codePromise).toBe(0);
     expect(mock.callCount).toBe(2);
   }, 60_000);
 
-  test("shows a failed run for missing LLM config and quits with 1", async () => {
+  test("shows a failed turn for missing LLM config and remains available for /exit", async () => {
     const { port } = await startCore();
     const workspace = await makeWorkspace();
 
@@ -202,7 +213,7 @@ describe("mc-tui process-level E2E (headless)", () => {
 
     const app = new TuiApp();
     const codePromise = app.run({
-      goal: "summarize",
+      mode: { kind: "new", goal: "summarize" },
       workspaceRoot: workspace,
       endpoint: { host: "127.0.0.1", port },
       createRenderer: async () => setup.renderer,
@@ -210,11 +221,11 @@ describe("mc-tui process-level E2E (headless)", () => {
     });
 
     await waitForText(setup, "config_error");
-    setup.mockInput.pressKey("q");
-    expect(await codePromise).toBe(1);
+    await exitTui(setup);
+    expect(await codePromise).toBe(0);
   });
 
-  test("keeps retrying an unreachable core and quits with 130", async () => {
+  test("shows an unreachable Core as a launch error and exits with 2", async () => {
     const port = await getFreePort();
     const workspace = await makeWorkspace();
 
@@ -223,19 +234,19 @@ describe("mc-tui process-level E2E (headless)", () => {
 
     const app = new TuiApp();
     const codePromise = app.run({
-      goal: "summarize",
+      mode: { kind: "new", goal: "summarize" },
       workspaceRoot: workspace,
       endpoint: { host: "127.0.0.1", port },
       createRenderer: async () => setup.renderer,
       reconnectDelayMs: 20,
     });
 
-    await waitForText(setup, "retrying");
-    setup.mockInput.pressKey("q");
-    expect(await codePromise).toBe(130);
+    await waitForText(setup, "cannot connect");
+    await exitTui(setup);
+    expect(await codePromise).toBe(2);
   });
 
-  test("cancels a real running Core run and exits with 130", async () => {
+  test("cancels a real running Core turn and remains available for /exit", async () => {
     const mock = startAnthropicMock({ delayMs: 2_000 });
     cleanups.push(mock.stop);
     const { port } = await startCore(mock.url);
@@ -245,19 +256,18 @@ describe("mc-tui process-level E2E (headless)", () => {
 
     const app = new TuiApp();
     const codePromise = app.run({
-      goal: "summarize",
+      mode: { kind: "new", goal: "summarize" },
       workspaceRoot: workspace,
       endpoint: { host: "127.0.0.1", port },
       createRenderer: async () => setup.renderer,
       reconnectDelayMs: 20,
-      cancelTimeoutMs: 3_000,
     });
 
     await waitForCondition(() => mock.callCount >= 1);
-    setup.mockInput.pressKey("q");
+    setup.mockInput.pressCtrlC();
     await waitForText(setup, "cancelled");
-    setup.mockInput.pressKey("q");
-    expect(await codePromise).toBe(130);
+    await exitTui(setup);
+    expect(await codePromise).toBe(0);
   }, 30_000);
 
   test("reconnects after Core restart and replays the terminal event", async () => {
@@ -270,7 +280,7 @@ describe("mc-tui process-level E2E (headless)", () => {
 
     const app = new TuiApp();
     const codePromise = app.run({
-      goal: "summarize",
+      mode: { kind: "new", goal: "summarize" },
       workspaceRoot: workspace,
       endpoint: { host: "127.0.0.1", port },
       createRenderer: async () => setup.renderer,
@@ -290,8 +300,8 @@ describe("mc-tui process-level E2E (headless)", () => {
     });
     await waitUntilListening(port);
     await waitForText(setup, "core_restarted");
-    setup.mockInput.pressKey("q");
+    await exitTui(setup);
 
-    expect(await codePromise).toBe(1);
+    expect(await codePromise).toBe(0);
   }, 60_000);
 });

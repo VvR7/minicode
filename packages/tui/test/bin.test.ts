@@ -8,8 +8,8 @@ const env = {
 };
 
 describe("mc-tui entry point", () => {
-  test("rejects a missing goal with exit code 2", async () => {
-    expect(await main([], env, true)).toBe(2);
+  test("accepts no launch arguments but still rejects non-TTY", async () => {
+    expect(await main([], env, false)).toBe(2);
   });
 
   test("rejects an unknown argument with exit code 2", async () => {

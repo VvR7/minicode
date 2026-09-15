@@ -1,361 +1,381 @@
-import type { AgentEvent } from "@minicode/protocol";
-import type { AgentRunClientResult, AgentRunClientStatus } from "@minicode/client";
+import type {
+  AgentEvent,
+  HistoryContent,
+  HistoryTurn,
+  SessionSummary,
+  TaskSnapshot,
+} from "@minicode/protocol";
+import type { SessionControllerEvent, SessionControllerStatus } from "@minicode/client";
 
-/** 连接阶段，来自共享客户端的状态回调。 */
-export type ConnectionPhase = "connecting" | "connected" | "disconnected" | "cancelling";
-
-/** run 的终态结果，来自 run.finished 事件。 */
-export type RunOutcome = "succeeded" | "failed" | "cancelled";
-
-/** run 的运行阶段。 */
-export type RunState =
-  | { readonly status: "idle" }
-  | { readonly status: "running" }
-  | { readonly status: "finished"; readonly outcome: RunOutcome }
-  | {
-      readonly status: "client-error";
-      readonly kind: "connect-failed" | "acceptance-uncertain" | "internal-error";
-    };
-
-/** 日志行的语义类别，供渲染层决定颜色，模型层不感知终端样式。 */
+/** 会话运行阶段；cancelling 表示已发取消请求但尚未收到权威终态。 */
+export type RunState = "idle" | "running" | "cancelling";
+/** 日志语义决定稳定标签和颜色；关闭颜色后仍能由文字识别。 */
 export type LogKind =
+  | "you"
   | "assistant"
-  | "info"
-  | "client-error"
-  | "model"
+  | "turn"
+  | "task-pending"
+  | "task-running"
+  | "task-completed"
+  | "task-blocked"
   | "tool"
+  | "tool-retry"
   | "tool-error"
+  | "model"
   | "retry"
   | "usage"
-  | "run-ok"
-  | "run-fail";
-
-/** 一条展示日志：id 稳定，便于增量更新与裁剪。 */
+  | "error"
+  | "info";
+/** 一条可增量更新的 transcript 行。 */
 export interface LogLine {
   readonly id: number;
   readonly kind: LogKind;
   readonly text: string;
 }
-
-/** 模型只读快照，供状态栏与测试读取。 */
-export interface TuiSnapshot {
-  readonly connection: ConnectionPhase;
-  readonly run: RunState;
-  readonly sessionId: string | undefined;
-  readonly runId: string | undefined;
-  readonly lines: readonly LogLine[];
-}
-
-/** 事件应用到日志后的增量变更，渲染层据此更新对应的终端组件。 */
+/** EventLog 执行的最小增量变更。 */
 export type LogMutation =
   | { readonly type: "append"; readonly line: LogLine }
   | { readonly type: "update"; readonly line: LogLine }
   | { readonly type: "remove"; readonly ids: readonly number[] };
+/** TUI 状态快照。 */
+export interface TuiSnapshot {
+  readonly connection: SessionControllerStatus;
+  readonly run: RunState;
+  readonly session: SessionSummary | undefined;
+  readonly activeRunId: string | undefined;
+  readonly readOnly: boolean;
+  readonly lines: readonly LogLine[];
+  readonly notice: string | undefined;
+}
 
-/** 展示模型的内存上限：逻辑行数与 UTF-8 字节数，超出后淘汰最旧行。 */
 export const MAX_LOG_LINES = 1000;
 export const MAX_LOG_BYTES = 1024 * 1024;
-
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
 
-function byteLength(text: string): number {
-  return encoder.encode(text).length;
-}
-
-/** 从 UTF-8 文本尾部保留不超过 maxBytes 的完整字符。 */
-function truncateUtf8Tail(text: string, maxBytes: number): string {
-  const encoded = encoder.encode(text);
-  if (encoded.length <= maxBytes) {
-    return text;
-  }
-  if (maxBytes <= 0) {
-    return "";
-  }
-  let start = encoded.length - maxBytes;
-  while (start < encoded.length && ((encoded[start] ?? 0) & 0xc0) === 0x80) {
-    start += 1;
-  }
-  return decoder.decode(encoded.subarray(start));
-}
-
-/** 截取 UUID 前 8 位用于状态栏等窄空间展示。 */
+/** 截取 UUID 前八位，避免窄终端状态栏溢出。 */
 export function shortId(id: string): string {
   return id.slice(0, 8);
 }
-
-/** 把 run 状态映射为进程退出码：succeeded=0、failed=1、用户取消=130。 */
-export function exitCodeForRunState(run: RunState): number {
-  if (run.status === "finished") {
-    switch (run.outcome) {
-      case "succeeded":
-        return 0;
-      case "failed":
-        return 1;
-      case "cancelled":
-        return 130;
-    }
-  }
-  if (run.status === "client-error") {
-    return run.kind === "internal-error" ? 1 : 2;
-  }
-  // run 尚未建立或仍在运行中退出，按用户中断处理。
-  return 130;
+/** 返回任务的文字状态；blocked 优先于存储状态。 */
+export function taskDisplayStatus(
+  task: TaskSnapshot,
+): "pending" | "in_progress" | "completed" | "blocked" {
+  return task.blocked ? "blocked" : task.status;
 }
 
-/** 按下退出键（q / Ctrl-C）时的决策。 */
-export type QuitDecision =
-  | { readonly action: "quit"; readonly code: number }
-  | { readonly action: "cancel" };
-
-/**
- * 根据当前 run 状态与是否已请求取消，决定退出键是直接退出还是先取消。
- * 终态直接退出；运行中首次触发取消、再次触发强制退出；未建立 run 直接退出。
- */
-export function decideQuit(run: RunState, cancelRequested: boolean): QuitDecision {
-  if (run.status === "finished" || run.status === "client-error") {
-    return { action: "quit", code: exitCodeForRunState(run) };
-  }
-  if (cancelRequested) {
-    return { action: "quit", code: 130 };
-  }
-  if (run.status === "running") {
-    return { action: "cancel" };
-  }
-  return { action: "quit", code: 130 };
+/** 把历史内容块压缩为可审计文字。 */
+function historyBlock(block: HistoryContent): { kind: LogKind; text: string } {
+  if (block.type === "text") return { kind: "assistant", text: `[ASSISTANT] ${block.text}` };
+  if (block.type === "tool_use")
+    return { kind: "tool", text: `[TOOL] ▶ running ${block.name} ${JSON.stringify(block.input)}` };
+  return {
+    kind: block.isError ? "tool-error" : "tool",
+    text: `[TOOL] ${block.isError ? "✗ failed" : "✓ completed"} ${block.content}`,
+  };
 }
 
 /**
- * 纯展示模型：把已校验归属、已去重的领域事件归约为日志行与运行状态。
- * 不依赖任何终端框架，便于单元测试覆盖全部事件 variant 与裁剪边界。
+ * 多轮展示归约器：以 turn/run identity 与 event sequence 去重，维护 transcript
+ * 和会话忙闲状态，不以显示文本作为去重依据。
  */
 export class TuiModel {
-  #connection: ConnectionPhase = "connecting";
-  #run: RunState = { status: "idle" };
-  #sessionId: string | undefined;
-  #runId: string | undefined;
+  #connection: SessionControllerStatus = "connecting";
+  #run: RunState = "idle";
+  #session: SessionSummary | undefined;
+  #activeRunId: string | undefined;
+  #readOnly = false;
   #lines: LogLine[] = [];
+  #notice: string | undefined;
   #nextId = 1;
-  #assistantLineId: number | undefined;
-  #totalBytes = 0;
+  #bytes = 0;
   #maxLines: number;
   #maxBytes: number;
+  #knownTurns = new Set<string>();
+  #runSequences = new Map<string, number>();
+  #assistantLines = new Map<string, number>();
+  #turnLines = new Map<string, number>();
+  #taskLines = new Map<string, number>();
 
-  /** 内存上限默认取全局常量，测试可注入更小值以覆盖裁剪边界。 */
+  /** 测试可注入更小的 transcript 上限。 */
   constructor(options: { readonly maxLines?: number; readonly maxBytes?: number } = {}) {
     this.#maxLines = options.maxLines ?? MAX_LOG_LINES;
     this.#maxBytes = options.maxBytes ?? MAX_LOG_BYTES;
   }
-
-  /** 返回当前状态的不可变视图。 */
+  /** 返回当前不可变快照。 */
   snapshot(): TuiSnapshot {
     return {
       connection: this.#connection,
       run: this.#run,
-      sessionId: this.#sessionId,
-      runId: this.#runId,
+      session: this.#session,
+      activeRunId: this.#activeRunId,
+      readOnly: this.#readOnly,
       lines: this.#lines,
+      notice: this.#notice,
     };
   }
 
-  /** 应用连接状态回调：更新连接阶段，不写入日志。 */
-  applyStatus(status: AgentRunClientStatus): void {
-    this.#connection = status.state;
+  /** 切换 session 前清空会话状态，防止 transcript 泄漏。 */
+  reset(readOnly = false): readonly LogMutation[] {
+    const removed = this.#lines.map((line) => line.id);
+    this.#run = "idle";
+    this.#session = undefined;
+    this.#activeRunId = undefined;
+    this.#readOnly = readOnly;
+    this.#lines = [];
+    this.#bytes = 0;
+    this.#notice = undefined;
+    this.#knownTurns.clear();
+    this.#runSequences.clear();
+    this.#assistantLines.clear();
+    this.#turnLines.clear();
+    this.#taskLines.clear();
+    return removed.length === 0 ? [] : [{ type: "remove", ids: removed }];
+  }
+  /** 设置本地提示。 */
+  setNotice(message: string | undefined): void {
+    this.#notice = message;
+  }
+  /** 标记取消中，阻止重复取消 RPC。 */
+  markCancelling(): void {
+    if (this.#run === "running") this.#run = "cancelling";
   }
 
-  /**
-   * 应用客户端生命周期结果：终态事件已处理时保持原状态；否则把取消或错误
-   * 收敛为可退出状态，并给日志添加可见原因。
-   */
-  applyClientResult(result: AgentRunClientResult): readonly LogMutation[] {
-    if (result.kind === "finished" || this.#run.status === "finished") {
-      return [];
-    }
+  /** 应用 SessionController 的已校验事件。 */
+  apply(event: SessionControllerEvent): readonly LogMutation[] {
     const mutations: LogMutation[] = [];
-    if (result.kind === "cancelled") {
-      this.#run = { status: "finished", outcome: "cancelled" };
-      this.#append(mutations, "run-fail", "run cancelled (client shutdown or timeout)");
-      return mutations;
-    }
-    this.#run = { status: "client-error", kind: result.kind };
-    this.#append(mutations, "client-error", `client ${result.kind}`);
+    if (event.type === "controller.status") this.#connection = event.status;
+    else if (event.type === "session.attached") {
+      this.#session = event.session;
+      this.#readOnly = event.session.mode === "one_shot" || event.session.status === "corrupted";
+      this.#run = event.session.status === "running" ? "running" : "idle";
+      this.#activeRunId = event.session.activeRun?.runId;
+    } else if (event.type === "turn.snapshot") this.#applyHistory(event.turn, mutations);
+    else if (event.type === "turn.accepted") {
+      if (!this.#knownTurns.has(event.turnId)) {
+        this.#knownTurns.add(event.turnId);
+        this.#append(mutations, "you", `[YOU] ${event.userMessage}`);
+        this.#turnLines.set(
+          event.runId,
+          this.#append(mutations, "turn", `[TURN] ● running ${shortId(event.runId)}`),
+        );
+      }
+      this.#run = "running";
+      this.#activeRunId = event.runId;
+    } else if (event.type === "run.event") this.#applyRunEvent(event.event, mutations);
+    else this.#finishTurn(event.runId, event.status, event.reason, mutations);
     return mutations;
   }
 
-  /**
-   * 应用一条领域事件，返回渲染层应执行的增量变更。
-   * assistant 文本累积到当前 step 的同一行；其余事件各追加一行。
-   */
-  applyEvent(event: AgentEvent): readonly LogMutation[] {
+  /** 添加明确的错误行。 */
+  addError(message: string): readonly LogMutation[] {
     const mutations: LogMutation[] = [];
+    this.#append(mutations, "error", `[ERROR] ${message}`);
+    return mutations;
+  }
+
+  /** 展开持久历史 turn，并将任务图保持默认折叠。 */
+  #applyHistory(turn: HistoryTurn, mutations: LogMutation[]): void {
+    if (this.#knownTurns.has(turn.turnId)) return;
+    this.#knownTurns.add(turn.turnId);
+    for (const message of turn.messages) {
+      if (message.role === "user") {
+        const text = message.content
+          .filter((block) => block.type === "text")
+          .map((block) => block.text)
+          .join("\n");
+        this.#append(mutations, "you", `[YOU] ${text}`);
+      } else
+        for (const block of message.content) {
+          const formatted = historyBlock(block);
+          this.#append(mutations, formatted.kind, formatted.text);
+        }
+    }
+    const symbol =
+      turn.status === "running"
+        ? "●"
+        : turn.status === "succeeded"
+          ? "✓"
+          : turn.status === "cancelled"
+            ? "⊘"
+            : "✗";
+    this.#turnLines.set(
+      turn.runId,
+      this.#append(
+        mutations,
+        "turn",
+        `[TURN] ${symbol} ${turn.status} ${shortId(turn.runId)}${turn.reason === undefined ? "" : ` (${turn.reason})`}`,
+      ),
+    );
+    if (turn.taskGraph !== undefined)
+      this.#append(
+        mutations,
+        "info",
+        `[TASK] ▸ run ${shortId(turn.runId)} — ${turn.taskGraph.tasks.length} tasks (collapsed)`,
+      );
+    if (turn.status === "running") {
+      this.#run = "running";
+      this.#activeRunId = turn.runId;
+    }
+  }
+
+  /** 归约 run journal，并按 sequence 丢弃重复重放。 */
+  #applyRunEvent(event: AgentEvent, mutations: LogMutation[]): void {
+    if (event.sequence <= (this.#runSequences.get(event.runId) ?? 0)) return;
+    this.#runSequences.set(event.runId, event.sequence);
     switch (event.type) {
       case "run.started":
-        this.#sessionId = event.sessionId;
-        this.#runId = event.runId;
-        this.#run = { status: "running" };
-        this.#assistantLineId = undefined;
-        this.#append(mutations, "info", `run ${event.runId}`);
+        this.#run = "running";
+        this.#activeRunId = event.runId;
         break;
+      case "llm.text_delta": {
+        let id = this.#assistantLines.get(event.runId);
+        if (id === undefined) {
+          id = this.#append(mutations, "assistant", "[ASSISTANT] ");
+          this.#assistantLines.set(event.runId, id);
+        }
+        this.#extend(mutations, id, event.payload.text);
+        break;
+      }
       case "llm.model_selected":
         this.#append(
           mutations,
           "model",
-          `model ${event.payload.model} (${event.payload.provider})`,
+          `[MODEL] ${event.payload.model} (${event.payload.provider})`,
         );
         break;
-      case "llm.text_delta": {
-        if (this.#assistantLineId === undefined) {
-          this.#assistantLineId = this.#append(mutations, "assistant", "");
-        }
-        this.#extend(mutations, this.#assistantLineId, event.payload.text);
-        break;
-      }
       case "llm.retrying":
         this.#append(
           mutations,
           "retry",
-          `retrying ${event.payload.attempt}/${event.payload.maxAttempts} (${event.payload.reason})`,
+          `[RETRY] ${event.payload.attempt}/${event.payload.maxAttempts} ${event.payload.reason}`,
         );
         break;
       case "llm.usage":
         this.#append(
           mutations,
           "usage",
-          `usage in=${event.payload.inputTokens} out=${event.payload.outputTokens}`,
+          `[USAGE] in=${event.payload.inputTokens} out=${event.payload.outputTokens}`,
         );
         break;
-      case "step.started":
-        // 新 step 开始：结束上一 step 的 assistant 行，开启新的空 assistant 行。
-        this.#assistantLineId = undefined;
-        this.#append(mutations, "info", `step ${event.payload.step}`);
-        break;
-      case "step.finished":
-        this.#append(mutations, "info", `step ${event.payload.step} ${event.payload.outcome}`);
-        break;
       case "tool.started":
-        this.#append(mutations, "tool", `tool ${event.payload.name}`);
+        this.#append(mutations, "tool", `[TOOL] ▶ running ${event.payload.name}`);
         break;
       case "tool.retrying":
         this.#append(
           mutations,
-          "retry",
-          `tool ${event.payload.name} retrying ${event.payload.attempt}/${event.payload.maxAttempts}`,
+          "tool-retry",
+          `[TOOL] ↻ retry ${event.payload.name} ${event.payload.attempt}/${event.payload.maxAttempts}`,
         );
         break;
       case "tool.finished":
         this.#append(
           mutations,
           event.payload.isError ? "tool-error" : "tool",
-          `tool ${event.payload.name} ${event.payload.isError ? "error" : "done"} ${event.payload.outputBytes}B${event.payload.truncated ? " (truncated)" : ""}`,
+          `[TOOL] ${event.payload.isError ? "✗ failed" : "✓ completed"} ${event.payload.name}`,
         );
         break;
-      case "run.finished": {
-        this.#run = { status: "finished", outcome: event.payload.status };
-        this.#fillFinalText(mutations, event.payload.finalText);
-        this.#append(
-          mutations,
-          event.payload.status === "succeeded" ? "run-ok" : "run-fail",
-          `run ${event.payload.status} (${event.payload.reason})`,
-        );
-        this.#assistantLineId = undefined;
+      case "task.created":
+      case "task.updated":
+        this.#applyTask(event.runId, event.payload.task, mutations);
         break;
-      }
-    }
-    return mutations;
-  }
-
-  /** run.finished 时用 durable finalText 校正当前 assistant 行。 */
-  #fillFinalText(mutations: LogMutation[], finalText: string): void {
-    if (this.#assistantLineId !== undefined) {
-      const current = this.#lineText(this.#assistantLineId);
-      if (finalText.startsWith(current)) {
-        this.#extend(mutations, this.#assistantLineId, finalText.slice(current.length));
-      } else {
-        // 非持久 delta 可能在断线期间丢失；非前缀时必须用权威 finalText 整行替换。
-        this.#replace(mutations, this.#assistantLineId, finalText);
-      }
-      return;
-    }
-    // 断线重放等场景：没有当前 assistant 行时，直接以 finalText 新建一行。
-    if (finalText.length > 0) {
-      this.#append(mutations, "assistant", finalText);
+      case "run.finished":
+        this.#correctFinalText(event.runId, event.payload.finalText, mutations);
+        this.#finishTurn(event.runId, event.payload.status, event.payload.reason, mutations);
+        break;
+      case "step.started":
+      case "step.finished":
+        break;
     }
   }
 
-  /** 追加一行并返回其稳定 id。 */
+  /** 实时任务按 run/task 稳定更新同一行。 */
+  #applyTask(runId: string, task: TaskSnapshot, mutations: LogMutation[]): void {
+    const status = taskDisplayStatus(task);
+    const kind: LogKind =
+      status === "blocked"
+        ? "task-blocked"
+        : status === "in_progress"
+          ? "task-running"
+          : status === "completed"
+            ? "task-completed"
+            : "task-pending";
+    const symbol =
+      status === "completed"
+        ? "✓"
+        : status === "in_progress"
+          ? "●"
+          : status === "blocked"
+            ? "!"
+            : "○";
+    const text = `[TASK] ${symbol} ${status} #${task.id} ${task.subject}`;
+    const key = `${runId}:${task.id}`;
+    const id = this.#taskLines.get(key);
+    if (id === undefined) this.#taskLines.set(key, this.#append(mutations, kind, text));
+    else this.#replace(mutations, id, kind, text);
+  }
+  /** finalText 是权威值：替换流式块而不重复全文。 */
+  #correctFinalText(runId: string, finalText: string, mutations: LogMutation[]): void {
+    const id = this.#assistantLines.get(runId);
+    if (id === undefined) {
+      if (finalText.length > 0)
+        this.#assistantLines.set(
+          runId,
+          this.#append(mutations, "assistant", `[ASSISTANT] ${finalText}`),
+        );
+    } else this.#replace(mutations, id, "assistant", `[ASSISTANT] ${finalText}`);
+  }
+  /** 应用权威终态并更新原 TURN 行。 */
+  #finishTurn(
+    runId: string,
+    status: string,
+    reason: string | undefined,
+    mutations: LogMutation[],
+  ): void {
+    const symbol = status === "succeeded" ? "✓" : status === "cancelled" ? "⊘" : "✗";
+    const text = `[TURN] ${symbol} ${status} ${shortId(runId)}${reason === undefined ? "" : ` (${reason})`}`;
+    const id = this.#turnLines.get(runId);
+    if (id === undefined) this.#turnLines.set(runId, this.#append(mutations, "turn", text));
+    else this.#replace(mutations, id, "turn", text);
+    if (this.#activeRunId === runId) {
+      this.#run = "idle";
+      this.#activeRunId = undefined;
+    }
+  }
+  /** 追加日志并执行双重上限裁剪。 */
   #append(mutations: LogMutation[], kind: LogKind, text: string): number {
-    const line: LogLine = { id: this.#nextId, kind, text };
-    this.#nextId += 1;
+    const line = { id: this.#nextId++, kind, text };
     this.#lines.push(line);
-    this.#totalBytes += byteLength(text);
+    this.#bytes += encoder.encode(text).length;
     mutations.push({ type: "append", line });
     this.#trim(mutations);
     return line.id;
   }
-
-  /** 向已有行追加文本（assistant 流式增量），并发出 update 变更。 */
-  #extend(mutations: LogMutation[], id: number, delta: string): void {
-    if (delta.length === 0) {
-      return;
-    }
+  /** 追加流式文本。 */
+  #extend(mutations: LogMutation[], id: number, text: string): void {
+    const line = this.#lines.find((candidate) => candidate.id === id);
+    if (line !== undefined && text.length > 0)
+      this.#replace(mutations, id, line.kind, line.text + text);
+  }
+  /** 替换稳定日志行。 */
+  #replace(mutations: LogMutation[], id: number, kind: LogKind, text: string): void {
     const index = this.#lines.findIndex((line) => line.id === id);
-    const current = this.#lines[index];
-    if (current === undefined) {
-      return;
-    }
-    const updated: LogLine = { ...current, text: current.text + delta };
-    this.#lines[index] = updated;
-    this.#totalBytes += byteLength(delta);
-    mutations.push({ type: "update", line: updated });
+    const old = this.#lines[index];
+    if (old === undefined) return;
+    const line = { id, kind, text };
+    this.#lines[index] = line;
+    this.#bytes += encoder.encode(text).length - encoder.encode(old.text).length;
+    mutations.push({ type: "update", line });
     this.#trim(mutations);
   }
-
-  /** 用权威文本替换已有行，并重新执行字节上限裁剪。 */
-  #replace(mutations: LogMutation[], id: number, text: string): void {
-    const index = this.#lines.findIndex((line) => line.id === id);
-    const current = this.#lines[index];
-    if (current === undefined) {
-      return;
-    }
-    const updated: LogLine = { ...current, text };
-    this.#lines[index] = updated;
-    this.#totalBytes += byteLength(text) - byteLength(current.text);
-    mutations.push({ type: "update", line: updated });
-    this.#trim(mutations);
-  }
-
-  /** 超出内存上限时，从最旧的非当前 assistant 行开始淘汰。 */
+  /** 淘汰最旧日志，避免长会话无限占用内存。 */
   #trim(mutations: LogMutation[]): void {
-    while (
-      (this.#lines.length > this.#maxLines || this.#totalBytes > this.#maxBytes) &&
-      this.#lines.length > 0
-    ) {
-      const index = this.#lines.findIndex((line) => line.id !== this.#assistantLineId);
-      if (index === -1) {
-        // 只剩当前 assistant 行时保留最新尾部，仍严格满足总字节上限。
-        const assistantIndex = this.#lines.findIndex((line) => line.id === this.#assistantLineId);
-        const assistant = this.#lines[assistantIndex];
-        if (assistant === undefined) {
-          return;
-        }
-        const text = truncateUtf8Tail(assistant.text, this.#maxBytes);
-        this.#totalBytes += byteLength(text) - byteLength(assistant.text);
-        const updated: LogLine = { ...assistant, text };
-        this.#lines[assistantIndex] = updated;
-        mutations.push({ type: "update", line: updated });
-        return;
-      }
-      const [removed] = this.#lines.splice(index, 1);
-      if (removed === undefined) {
-        return;
-      }
-      this.#totalBytes -= byteLength(removed.text);
-      mutations.push({ type: "remove", ids: [removed.id] });
+    const removed: number[] = [];
+    while (this.#lines.length > this.#maxLines || this.#bytes > this.#maxBytes) {
+      const line = this.#lines.shift();
+      if (line === undefined) break;
+      this.#bytes -= encoder.encode(line.text).length;
+      removed.push(line.id);
     }
-  }
-
-  /** 读取指定 id 行的当前文本。 */
-  #lineText(id: number): string {
-    return this.#lines.find((line) => line.id === id)?.text ?? "";
+    if (removed.length > 0) mutations.push({ type: "remove", ids: removed });
   }
 }

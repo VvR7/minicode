@@ -8,17 +8,22 @@ import {
 import type { LogKind, LogLine, LogMutation } from "../model.ts";
 
 /** 各日志类别对应的前景色；undefined 表示使用终端默认色。 */
-const KIND_COLORS: Record<LogKind, string | undefined> = {
+export const LOG_KIND_COLORS: Record<LogKind, string | undefined> = {
+  you: "#00ffff",
   assistant: undefined,
+  turn: "#ff00ff",
+  "task-pending": "#e5c07b",
+  "task-running": "#61afef",
+  "task-completed": "#98c379",
+  "task-blocked": "#b8a46a",
   info: "#808080",
-  "client-error": "#e06c75",
+  error: "#ff5555",
   model: "#56b6c2",
   tool: "#98c379",
   "tool-error": "#e06c75",
+  "tool-retry": "#e5c07b",
   retry: "#e5c07b",
-  usage: "#808080",
-  "run-ok": "#98c379",
-  "run-fail": "#e06c75",
+  usage: "#5799a8",
 };
 
 /** 长文本的换行策略：assistant 按词、其余按字符，避免密集文本溢出。 */
@@ -69,9 +74,14 @@ export class EventLog {
     this.scrollbox.scrollBy(delta, unit);
   }
 
+  /** 清空 transcript 组件，用于 session 切换。 */
+  clear(): void {
+    this.#remove([...this.#lines.keys()]);
+  }
+
   /** 新建一行并加入滚动容器。 */
   #append(line: LogLine): void {
-    const fg = KIND_COLORS[line.kind];
+    const fg = LOG_KIND_COLORS[line.kind];
     const child = new TextRenderable(this.#ctx, {
       content: line.text,
       ...(fg === undefined ? {} : { fg }),
@@ -87,6 +97,8 @@ export class EventLog {
     const child = this.#lines.get(line.id);
     if (child !== undefined) {
       child.content = line.text;
+      const fg = LOG_KIND_COLORS[line.kind];
+      if (fg !== undefined) child.fg = fg;
     }
   }
 

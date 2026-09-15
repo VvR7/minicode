@@ -6,6 +6,8 @@ import { AnthropicAdapter } from "../llm/anthropic-adapter.ts";
 import { loadLlmConfig } from "../llm/config.ts";
 import type { LlmConfig } from "../llm/config.ts";
 import type { LlmProvider } from "../llm/provider.ts";
+import { TaskManager, createTaskTools, nodeTaskStorage, tasksPath } from "../tasks/index.ts";
+import type { TaskStorage } from "../tasks/index.ts";
 import { builtinTools } from "../tools/builtin/index.ts";
 import { ToolInvoker } from "../tools/invoker.ts";
 import { ToolRegistry } from "../tools/registry.ts";
@@ -25,11 +27,15 @@ export interface AgentRunRequest {
 export interface AgentRunnerOptions {
   readonly environment: Environment;
   readonly bus: EventBus;
+  /** minicode 数据根目录；TaskManager 只会在其当前 run 目录内持久化。 */
+  readonly homeDirectory: string;
   readonly runTimeoutMs?: number;
   /** 可注入的 provider 工厂，测试用 fake provider 替代真实网络。 */
   readonly providerFactory?: (config: LlmConfig) => LlmProvider;
   /** Core 级 run recorder 注册表；省略时禁用 Trace 集成。 */
   readonly traceService?: TraceService;
+  /** 可注入的任务存储，测试用内存实现替代真实文件系统。 */
+  readonly taskStorage?: TaskStorage;
 }
 
 /**
@@ -39,18 +45,24 @@ export interface AgentRunnerOptions {
 export class AgentRunner {
   readonly #environment: Environment;
   readonly #bus: EventBus;
+  readonly #homeDirectory: string;
   readonly #runTimeoutMs: number;
   readonly #providerFactory: (config: LlmConfig) => LlmProvider;
   readonly #traceService: TraceService | undefined;
+  readonly #taskStorage: TaskStorage;
 
+  /** 保存 run 组装所需的环境、存储、事件与可注入依赖。 */
   constructor(options: AgentRunnerOptions) {
     this.#environment = options.environment;
     this.#bus = options.bus;
+    this.#homeDirectory = options.homeDirectory;
     this.#runTimeoutMs = options.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
     this.#providerFactory = options.providerFactory ?? ((config) => new AnthropicAdapter(config));
     this.#traceService = options.traceService;
+    this.#taskStorage = options.taskStorage ?? nodeTaskStorage;
   }
 
+  /** 执行一个 run，并把所有异常收敛为 run.finished，最后关闭对应 Trace。 */
   async run(
     request: AgentRunRequest,
     externalSignal: AbortSignal,
@@ -65,6 +77,7 @@ export class AgentRunner {
     }
   }
 
+  /** 组装并驱动实际 AgentLoop；缺配置或组合失败时补齐唯一终态。 */
   async #run(
     request: AgentRunRequest,
     externalSignal: AbortSignal,
@@ -106,6 +119,18 @@ export class AgentRunner {
       for (const tool of builtinTools) {
         // builtinTools 为联合类型，注册时收敛为通用 Tool 契约。
         registry.register(tool as Tool);
+      }
+      const taskManager = new TaskManager(
+        this.#taskStorage,
+        tasksPath(this.#homeDirectory, request.sessionId, request.runId),
+      );
+      for (const tool of createTaskTools({
+        manager: taskManager,
+        bus: this.#bus,
+        sessionId: request.sessionId,
+        runId: request.runId,
+      })) {
+        registry.register(tool);
       }
       const invoker = new ToolInvoker(registry);
       const traceRecorder = this.#traceService?.recorderFor(request.sessionId, request.runId);

@@ -86,6 +86,36 @@ async function runAndDrain(
 }
 
 describe("AgentLoop", () => {
+  test("publishes the configured context window with per-call usage", async () => {
+    const workspace = await createTempWorkspace();
+    try {
+      const { bus, loop } = buildHarness(
+        [
+          {
+            response: textResponse("done", {
+              usage: {
+                inputTokens: 159,
+                outputTokens: 122,
+                cacheReadInputTokens: 1152,
+                cacheCreationInputTokens: 0,
+              },
+            }),
+          },
+        ],
+        { contextWindowTokens: 200_000 },
+      );
+      const { events } = await runAndDrain(loop, makeContext(workspace), bus);
+      const usageEvent = events.find((event) => event.type === "llm.usage");
+      expect(usageEvent?.payload).toMatchObject({
+        inputTokens: 159,
+        cacheReadInputTokens: 1152,
+        contextWindowTokens: 200_000,
+      });
+    } finally {
+      await cleanupTempWorkspace(workspace);
+    }
+  });
+
   test("completes a plain-text run and pairs every step.started with step.finished", async () => {
     const workspace = await createTempWorkspace();
     try {

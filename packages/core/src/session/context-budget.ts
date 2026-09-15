@@ -1,9 +1,11 @@
-import type { Environment } from "@minicode/protocol";
+import { DEFAULT_LLM_CONTEXT_WINDOW_TOKENS, type Environment } from "@minicode/protocol";
 import { LlmError } from "../llm/errors.ts";
 import type { LlmMessage, LlmToolSchema } from "../llm/types.ts";
 
 /** 安全预算比例：只使用 context window 的 90%，为模型输出与估算误差留余量。 */
 export const CONTEXT_SAFE_RATIO = 0.9;
+/** LLM_CONTEXT_WINDOW_TOKENS 的兼容默认值。 */
+export const DEFAULT_CONTEXT_WINDOW_TOKENS = DEFAULT_LLM_CONTEXT_WINDOW_TOKENS;
 /** LLM_MAX_OUTPUT_TOKENS 的默认值。 */
 export const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
 
@@ -70,16 +72,20 @@ function parsePositiveInteger(raw: string | undefined): number | undefined {
 
 /**
  * 从环境变量加载上下文预算配置。
- * LLM_CONTEXT_WINDOW_TOKENS 必填；LLM_MAX_OUTPUT_TOKENS 可选且必须小于 context window。
+ * 两项配置均可省略以兼容已有 .env；显式配置时必须是正整数，且输出上限小于 context window。
  */
 export function loadContextBudgetConfig(environment: Environment): ContextBudgetConfigResult {
-  const contextWindowTokens = parsePositiveInteger(environment.LLM_CONTEXT_WINDOW_TOKENS);
+  const rawContextWindow = environment.LLM_CONTEXT_WINDOW_TOKENS;
+  const contextWindowTokens =
+    rawContextWindow === undefined || rawContextWindow === ""
+      ? DEFAULT_CONTEXT_WINDOW_TOKENS
+      : parsePositiveInteger(rawContextWindow);
   if (contextWindowTokens === undefined) {
     return {
       ok: false,
       error: new LlmError(
         "config_error",
-        "missing or invalid LLM_CONTEXT_WINDOW_TOKENS (expected a positive integer)",
+        "invalid LLM_CONTEXT_WINDOW_TOKENS (expected a positive integer)",
       ),
     };
   }

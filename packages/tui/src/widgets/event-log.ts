@@ -1,6 +1,10 @@
 import {
+  BoxRenderable,
+  MarkdownRenderable,
   ScrollBoxRenderable,
+  SyntaxStyle,
   TextRenderable,
+  type Renderable,
   type RenderContext,
   type ScrollUnit,
 } from "@opentui/core";
@@ -37,11 +41,27 @@ function wrapModeFor(kind: LogKind): "none" | "char" | "word" {
  */
 export class EventLog {
   readonly scrollbox: ScrollBoxRenderable;
-  #lines = new Map<number, TextRenderable>();
+  #lines = new Map<
+    number,
+    { readonly root: Renderable; readonly content: TextRenderable | MarkdownRenderable }
+  >();
   #ctx: RenderContext;
+  #markdownStyle: SyntaxStyle;
 
   constructor(ctx: RenderContext) {
     this.#ctx = ctx;
+    this.#markdownStyle = SyntaxStyle.fromStyles({
+      default: { fg: "#c6d0f5" },
+      "markup.heading": { fg: "#8caaee", bold: true },
+      "markup.strong": { fg: "#e5c890", bold: true },
+      "markup.italic": { fg: "#babbf1", italic: true },
+      "markup.raw": { fg: "#a6d189" },
+      "markup.link": { fg: "#85c1dc", underline: true },
+      "markup.quote": { fg: "#a5adce", italic: true },
+      comment: { fg: "#838ba7", italic: true },
+      keyword: { fg: "#ca9ee6" },
+      string: { fg: "#a6d189" },
+    });
     this.scrollbox = new ScrollBoxRenderable(ctx, {
       id: "log",
       width: "100%",
@@ -79,8 +99,45 @@ export class EventLog {
     this.#remove([...this.#lines.keys()]);
   }
 
+  /** 释放 Markdown syntax style 的原生资源。 */
+  destroy(): void {
+    this.clear();
+    this.#markdownStyle.destroy();
+  }
+
   /** 新建一行并加入滚动容器。 */
   #append(line: LogLine): void {
+    if (line.kind === "assistant") {
+      const root = new BoxRenderable(this.#ctx, {
+        width: "100%",
+        flexDirection: "column",
+        marginTop: 1,
+        marginBottom: 1,
+      });
+      root.add(
+        new TextRenderable(this.#ctx, {
+          content: "ASSISTANT",
+          height: 1,
+          fg: "#8caaee",
+        }),
+      );
+      const markdown = new MarkdownRenderable(this.#ctx, {
+        content: "",
+        syntaxStyle: this.#markdownStyle,
+        streaming: true,
+        width: "100%",
+        conceal: true,
+        tableOptions: { style: "columns", widthMode: "full", wrapMode: "word" },
+      });
+      root.add(markdown);
+      this.#lines.set(line.id, { root, content: markdown });
+      this.scrollbox.add(root);
+      const content = this.#assistantContent(line.text);
+      // 初次挂载统一走 streaming parser；OpenTUI 冷路径直接以 false 初始化会留下空正文。
+      // 实时回复在 run.finished 的 update 中切到 false，历史内容保持稳定的完整 streaming block。
+      markdown.content = content;
+      return;
+    }
     const fg = LOG_KIND_COLORS[line.kind];
     const child = new TextRenderable(this.#ctx, {
       content: line.text,
@@ -88,7 +145,7 @@ export class EventLog {
       width: "100%",
       wrapMode: wrapModeFor(line.kind),
     });
-    this.#lines.set(line.id, child);
+    this.#lines.set(line.id, { root: child, content: child });
     this.scrollbox.add(child);
   }
 
@@ -96,9 +153,12 @@ export class EventLog {
   #update(line: LogLine): void {
     const child = this.#lines.get(line.id);
     if (child !== undefined) {
-      child.content = line.text;
+      child.content.content =
+        child.content instanceof MarkdownRenderable ? this.#assistantContent(line.text) : line.text;
+      if (child.content instanceof MarkdownRenderable)
+        child.content.streaming = line.streaming ?? false;
       const fg = LOG_KIND_COLORS[line.kind];
-      if (fg !== undefined) child.fg = fg;
+      if (fg !== undefined && child.content instanceof TextRenderable) child.content.fg = fg;
     }
   }
 
@@ -109,9 +169,14 @@ export class EventLog {
       if (child === undefined) {
         continue;
       }
-      this.scrollbox.remove(child);
-      child.destroy();
+      this.scrollbox.remove(child.root);
+      child.root.destroyRecursively();
       this.#lines.delete(id);
     }
+  }
+
+  /** Markdown 组件不显示 transcript 的稳定语义标签。 */
+  #assistantContent(text: string): string {
+    return text.replace(/^\[ASSISTANT\]\s?/u, "");
   }
 }

@@ -11,6 +11,7 @@ import type { LlmMessage } from "../llm/types.ts";
 import type { LlmToolSchema } from "../llm/types.ts";
 import { z } from "zod";
 import { createNoteSaveTool, NoteSaveParamsSchema } from "../session/note-tool.ts";
+import { loadContextBudgetConfig } from "../session/context-budget.ts";
 import { NoteStore } from "../session/notes.ts";
 import { nodeSessionStorage } from "../session/storage.ts";
 import { TaskManager, nodeTaskStorage, tasksPath } from "../tasks/task-store.ts";
@@ -204,6 +205,11 @@ export class AgentRunner {
       context.markFailed("config_error");
       return { completion: this.#completionFromContext(context) };
     }
+    const contextBudgetConfig = loadContextBudgetConfig(this.#environment);
+    if (!contextBudgetConfig.ok) {
+      context.markFailed("config_error");
+      return { completion: this.#completionFromContext(context) };
+    }
 
     const controller = new AbortController();
     const onExternalAbort = (): void => controller.abort();
@@ -251,6 +257,7 @@ export class AgentRunner {
       const loop = new AgentLoop(provider, registry, invoker, this.#bus, {
         ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
         ...(request.trace === undefined ? {} : { trace: request.trace }),
+        contextWindowTokens: contextBudgetConfig.value.contextWindowTokens,
       });
       const completion = await loop.run(context, controller.signal, true);
 

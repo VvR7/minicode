@@ -15,7 +15,7 @@ import {
   EventSubscribeResultSchema,
   isAgentEvent,
 } from "@minicode/protocol";
-import { NdjsonRpcConnection } from "./ndjson-rpc-client.ts";
+import { NdjsonRpcConnection, RpcClientError } from "./ndjson-rpc-client.ts";
 
 /** 一次 run 的 sessionId/runId 标识，run 建立后不再变化。 */
 interface RunIdentity {
@@ -43,6 +43,7 @@ export interface AgentRunClientCallbacks {
  * - finished：收到 run.finished，前端从事件流自取终态；
  * - cancelled：用户取消且等待超时，或取消发生在 run 建立前；
  * - connect-failed：run 建立前耗尽初始连接尝试；
+ * - request-error：Core 明确返回 JSON-RPC error，保留安全错误码和消息；
  * - acceptance-uncertain：agent.run 响应丢失，无法确认是否已建立 run；
  * - internal-error：未预期的内部错误。
  */
@@ -50,6 +51,7 @@ export type AgentRunClientResult =
   | { readonly kind: "finished" }
   | { readonly kind: "cancelled" }
   | { readonly kind: "connect-failed" }
+  | { readonly kind: "request-error"; readonly code: number; readonly message: string }
   | { readonly kind: "acceptance-uncertain" }
   | { readonly kind: "internal-error" };
 
@@ -403,12 +405,16 @@ export class AgentRunClient {
             return { kind: "finished" };
           }
           // 连接断开：run 未结束时进入重连循环。
-        } catch {
+        } catch (error) {
           // request 或 drain 异常：run 已结束则直接结束，否则当作断线重连。
           if (finished) {
             return { kind: "finished" };
           }
           if (runIdentity === undefined) {
+            // 已收到 JSON-RPC error 时请求结果是确定的，不能误报为响应丢失。
+            if (error instanceof RpcClientError && error.code !== undefined) {
+              return { kind: "request-error", code: error.code, message: error.message };
+            }
             // agent.run 的响应可能在 accepted 后丢失；禁止重试创建，避免产生重复的孤儿 run。
             return cancelledByUser ? { kind: "cancelled" } : { kind: "acceptance-uncertain" };
           }

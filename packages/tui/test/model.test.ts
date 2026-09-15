@@ -72,6 +72,34 @@ describe("TuiModel", () => {
     const assistants = model.snapshot().lines.filter((line) => line.kind === "assistant");
     expect(assistants).toHaveLength(1);
     expect(assistants[0]?.text).toBe("[ASSISTANT] Hello");
+    expect(assistants[0]?.streaming).toBe(false);
+  });
+  test("projects model and latest context without adding noisy transcript lines", () => {
+    const model = new TuiModel({ contextWindowTokens: 100_000 });
+    model.apply({
+      type: "run.event",
+      event: event("llm.model_selected", { model: "deepseek-flash", provider: "anthropic" }, 1),
+    });
+    model.apply({
+      type: "run.event",
+      event: event(
+        "llm.usage",
+        {
+          inputTokens: 159,
+          outputTokens: 122,
+          cacheReadInputTokens: 1152,
+          cacheCreationInputTokens: 10,
+          contextWindowTokens: 200_000,
+        },
+        2,
+      ),
+    });
+    expect(model.snapshot()).toMatchObject({
+      model: "deepseek-flash",
+      contextUsedTokens: 1443,
+      contextWindowTokens: 200_000,
+    });
+    expect(model.snapshot().lines).toHaveLength(0);
   });
   test("restores history with folded task graph and tool summaries", () => {
     const task: TaskSnapshot = {

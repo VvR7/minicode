@@ -5,6 +5,7 @@ import type { LlmMessage, LlmToolSchema } from "../../src/llm/types.ts";
 import {
   CONTEXT_SAFE_RATIO,
   checkContextBudget,
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
   DEFAULT_MAX_OUTPUT_TOKENS,
   defaultContextBudgetEstimator,
   estimateInputTokens,
@@ -22,9 +23,19 @@ const toolSchemas: LlmToolSchema[] = [
 ];
 
 describe("loadContextBudgetConfig", () => {
-  test("requires a positive context window", () => {
-    expect(loadContextBudgetConfig(env({})).ok).toBe(false);
-    for (const value of ["0", "-1", "abc", "1.5", ""]) {
+  test("defaults the context window for existing environments", () => {
+    for (const value of [undefined, ""]) {
+      const result = loadContextBudgetConfig(env({ LLM_CONTEXT_WINDOW_TOKENS: value }));
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value.contextWindowTokens).toBe(DEFAULT_CONTEXT_WINDOW_TOKENS);
+        expect(result.value.maxOutputTokens).toBe(DEFAULT_MAX_OUTPUT_TOKENS);
+      }
+    }
+  });
+
+  test("rejects an explicitly invalid context window", () => {
+    for (const value of ["0", "-1", "abc", "1.5"]) {
       const result = loadContextBudgetConfig(env({ LLM_CONTEXT_WINDOW_TOKENS: value }));
       expect(result.ok).toBe(false);
       if (!result.ok) {

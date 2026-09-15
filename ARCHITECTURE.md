@@ -95,8 +95,8 @@ outcome 保持不变。当前没有 Trace viewer。
 ## 从 Stage1 配置迁移
 
 已有 `.env` 的 Core 地址、`MINICODE_HOME`、`LLM_API_KEY`、`LLM_BASE_URL` 和 `LLM_MODEL` 无需
-修改。Stage2 必须确认 `LLM_CONTEXT_WINDOW_TOKENS` 和 `LLM_MAX_OUTPUT_TOKENS` 与实际模型匹配，
-且最大输出小于上下文窗口；缺失最大输出时仍兼容默认值 8192。Trace 新变量都可省略，默认开启
+修改。`LLM_CONTEXT_WINDOW_TOKENS` 和 `LLM_MAX_OUTPUT_TOKENS` 可省略并分别默认使用 200000 和
+8192；显式配置时应与实际模型匹配，且最大输出小于上下文窗口。Trace 新变量都可省略，默认开启
 `summary`、队列 1024 条、单 run 32 MiB、停机等待 2000 ms。希望维持不生成 Trace 文件的旧行为
 时显式设置 `MINICODE_TRACE_ENABLED=false`。
 

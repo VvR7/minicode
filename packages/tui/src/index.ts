@@ -3,5 +3,6 @@ export * from "./model.ts";
 export * from "./options.ts";
 export * from "./selector.ts";
 export * from "./widgets/event-log.ts";
+export * from "./widgets/chat-footer.ts";
 export * from "./widgets/help-bar.ts";
 export * from "./widgets/status-bar.ts";

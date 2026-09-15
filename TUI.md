@@ -23,7 +23,9 @@ Tab 切换当前/全部 workspace，`O` 切换 one-shot，`↑/↓` 或 `j/k` �
 
 ## 聊天操作
 
-TUI 包含状态栏、可滚动 transcript、Textarea 输入框和随状态变化的帮助栏。
+TUI 主体是可滚动 transcript；底部固定显示带上下边框的多行输入框、规范化 workspace、
+session/连接状态、上下文占用和当前模型。Assistant 内容按 Markdown 渲染，标题、列表、强调、
+代码块和表格不再作为普通纯文本显示。
 
 | 操作 | 行为 |
 | --- | --- |
@@ -38,17 +40,22 @@ TUI 包含状态栏、可滚动 transcript、Textarea 输入框和随状态变�
 运行中输入被冻结，直到 Core 发布权威终态。用户消息只有在 Core 返回 accepted 后才进入
 transcript。普通 `q` 是输入字符。
 
-## 标记与同步
+## 上下文与标记
 
-即使终端关闭颜色，也可通过稳定标记识别内容：`YOU`、`ASSISTANT`、`TURN`、`MODEL`、`TOOL`、
-`TASK`、`USAGE`、`RETRY`、`ERROR`。任务按 pending、in-progress、completed、blocked 使用不同
-标记和颜色；历史任务图默认折叠显示。
+左下角 `context used/limit percent` 表示最近一次模型调用结束后的实际上下文占用，其中 used
+包含普通输入、cache read、cache creation 和本次输出 token；它不是跨调用累计计费量。模型调用
+工具后会再次请求 provider，因此该值会随最新上下文更新。逐调用 Usage 和重复 Model 事件不写入
+transcript，当前模型固定显示在右下角。
+
+即使终端关闭颜色，也可通过稳定标记识别 transcript 内容：`YOU`、`ASSISTANT`、`TURN`、`TOOL`、
+`TASK`、`RETRY`、`ERROR`。任务按 pending、in-progress、completed、blocked 使用不同标记和颜色；
+历史任务图默认折叠显示。
 
 多个 TUI 可以同时附着同一 session。Core 持久化文本 delta、工具、任务与终态，Controller 以
 session/run sequence 去重重放，因此各窗口最终显示相同内容；任一窗口发出的取消也同步为同一
 cancelled outcome。不同 session 不共享 transcript 或 busy/cancel 状态。
 
-Core 暂时断开时状态栏显示 reconnecting，恢复后从最后成功消费的 cursor 继续。无法一致恢复的
+Core 暂时断开时 workspace 行右侧显示 reconnecting，恢复后从最后成功消费的 cursor 继续。无法一致恢复的
 session 会变为 corrupted，只能查询诊断，不能继续提交。
 
 ## CLI 边界

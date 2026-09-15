@@ -1,10 +1,23 @@
 #!/usr/bin/env bun
 
-import { ConfigurationError, parseCoreEndpoint } from "@minicode/protocol";
+import {
+  ConfigurationError,
+  DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
+  parseCoreEndpoint,
+} from "@minicode/protocol";
 import type { Environment } from "@minicode/protocol";
 
 import { TuiApp } from "./app.ts";
 import { parseTuiArgs } from "./options.ts";
+
+/** 读取 TUI 启动时的上下文上限；非法显式值留给 Core 返回配置错误。 */
+export function initialContextWindow(environment: Environment): number | undefined {
+  const raw = environment.LLM_CONTEXT_WINDOW_TOKENS;
+  if (raw === undefined || raw === "") return DEFAULT_LLM_CONTEXT_WINDOW_TOKENS;
+  if (!/^\d+$/u.test(raw)) return undefined;
+  const value = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
 
 /**
  * `mc-tui` 入口：校验五种启动模式与 TTY、加载 core 地址后启动多轮界面。
@@ -40,10 +53,13 @@ export async function main(
   }
 
   const app = new TuiApp();
+  const contextWindowTokens = initialContextWindow(environment);
   return await app.run({
     mode: parsed.mode,
     workspaceRoot: process.cwd(),
     endpoint,
+    ...(environment.LLM_MODEL === undefined ? {} : { model: environment.LLM_MODEL }),
+    ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
   });
 }
 

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { AgentEvent, CoreEndpoint, JsonRpcNotificationEnvelope } from "@minicode/protocol";
-import type { NdjsonRpcConnection } from "../src/ndjson-rpc-client.ts";
+import { RpcClientError, type NdjsonRpcConnection } from "../src/ndjson-rpc-client.ts";
 import {
   AgentRunClient,
   type AgentRunClientCallbacks,
@@ -297,6 +297,28 @@ describe("AgentRunClient", () => {
     );
     expect(result.kind).toBe("acceptance-uncertain");
     expect(connection.closed).toBe(true);
+  });
+
+  test("preserves a definite Core application error instead of reporting uncertain acceptance", async () => {
+    const connection = new FakeConnection();
+    connection.requestHandler = () => {
+      throw new RpcClientError("core error -32603: invalid configuration", { code: -32603 });
+    };
+    const { callbacks } = collectCallbacks();
+    const result = await new AgentRunClient().run(
+      {
+        goal: "x",
+        workspaceRoot: "/w",
+        endpoint,
+        connect: () => Promise.resolve(connection as unknown as NdjsonRpcConnection),
+      },
+      callbacks,
+    );
+    expect(result).toEqual({
+      kind: "request-error",
+      code: -32603,
+      message: "core error -32603: invalid configuration",
+    });
   });
 
   test("does not create a run when abort happens while connect is pending", async () => {

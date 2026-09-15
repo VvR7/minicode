@@ -88,6 +88,11 @@ interface RunObservation {
   finished: boolean;
 }
 
+interface QueuedNotification {
+  readonly connection: NdjsonRpcConnection;
+  readonly notification: JsonRpcNotificationEnvelope;
+}
+
 /** 可被 dispose 打断的短暂重连等待。 */
 function waitForRetry(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
@@ -126,8 +131,8 @@ export class SessionController {
   #pendingCommits = new Map<RunId, Extract<SessionEvent, { type: "session.turn_finished" }>>();
   #deferredSessionEvents: SessionEvent[] = [];
   #activeRun: ActiveRun | undefined;
-  #notificationQueue: JsonRpcNotificationEnvelope[] = [];
-  #draining = false;
+  #notificationQueue: QueuedNotification[] = [];
+  #drainTask: Promise<void> | undefined;
   #notificationsPaused = true;
   #ready = Promise.withResolvers<void>();
   #watchTask: Promise<void> | undefined;
@@ -274,6 +279,7 @@ export class SessionController {
       connection.close();
     }
     this.#detachNotificationListener();
+    await this.#drainTask;
     await this.#watchTask;
     this.#watchTask = undefined;
     this.#connection = undefined;
@@ -289,7 +295,7 @@ export class SessionController {
     this.#deferredSessionEvents = [];
     this.#activeRun = undefined;
     this.#notificationQueue = [];
-    this.#draining = false;
+    this.#drainTask = undefined;
     this.#notificationsPaused = true;
   }
 
@@ -313,7 +319,7 @@ export class SessionController {
     this.#connection = connection;
     this.#notificationsPaused = true;
     this.#stopNotifications = connection.onNotification((notification) =>
-      this.#enqueueNotification(notification),
+      this.#enqueueNotification(connection, notification),
     );
 
     const historyResponse = await connection.request(
@@ -334,6 +340,11 @@ export class SessionController {
 
     await this.#emit({ type: "session.attached", session: history.session });
     for (const turn of history.turns) await this.#applyHistoryTurn(turn);
+    for (const pendingCommit of [...this.#pendingCommits.values()]) {
+      if (this.#committedTurns.has(pendingCommit.payload.turnId)) {
+        await this.#commitTurn(pendingCommit);
+      }
+    }
     this.#sessionCursor = Math.max(this.#sessionCursor, history.throughSessionSequence);
 
     const runsToObserve = new Map<RunId, ActiveRun>();
@@ -370,6 +381,7 @@ export class SessionController {
       if (connection === undefined) return;
       await connection.waitUntilClosed();
       if (this.#lifecycle.signal.aborted) return;
+      await this.#drainTask;
       this.#detachNotificationListener();
       if (this.#connection === connection) this.#connection = undefined;
       this.#sessionSubscriptionId = undefined;
@@ -412,8 +424,6 @@ export class SessionController {
     this.#knownTurns.add(turn.turnId);
     if (turn.status !== "running") {
       this.#committedTurns.add(turn.turnId);
-      this.#pendingCommits.delete(turn.runId);
-      if (this.#pendingCommits.size === 0) this.#deferredSessionEvents = [];
     }
   }
 
@@ -437,24 +447,46 @@ export class SessionController {
   }
 
   /** notification 先入队，再由串行 consumer 推进 cursor，避免网络接收抢跑。 */
-  #enqueueNotification(notification: JsonRpcNotificationEnvelope): void {
-    this.#notificationQueue.push(notification);
+  #enqueueNotification(
+    connection: NdjsonRpcConnection,
+    notification: JsonRpcNotificationEnvelope,
+  ): void {
+    this.#notificationQueue.push({ connection, notification });
     if (!this.#notificationsPaused) {
-      void this.#drainNotifications().catch(() => this.#connection?.close());
+      void this.#drainNotifications();
     }
   }
 
-  /** 串行消费所有已入队 notification。 */
-  async #drainNotifications(): Promise<void> {
-    if (this.#draining) return;
-    this.#draining = true;
-    try {
-      while (this.#notificationQueue.length > 0) {
-        const notification = this.#notificationQueue.shift();
-        if (notification !== undefined) await this.#applyNotification(notification);
+  /** 串行消费所有已入队 notification；并发调用共享同一个 drain Promise。 */
+  #drainNotifications(): Promise<void> {
+    if (this.#drainTask !== undefined) return this.#drainTask;
+    const completion = Promise.withResolvers<void>();
+    const task = completion.promise;
+    // 先登记共享 Promise，再启动 drain，避免同步 fake/transport 回调重入第二个 consumer。
+    this.#drainTask = task;
+    void this.#runNotificationDrain().then(completion.resolve, completion.reject);
+    void task.finally(() => {
+      if (this.#drainTask === task) this.#drainTask = undefined;
+      if (!this.#notificationsPaused && this.#notificationQueue.length > 0) {
+        void this.#drainNotifications();
       }
-    } finally {
-      this.#draining = false;
+    });
+    return task;
+  }
+
+  /** 消费队列；consumer 失败只丢弃并关闭同一旧连接的数据，等待 journal 重放。 */
+  async #runNotificationDrain(): Promise<void> {
+    while (this.#notificationQueue.length > 0) {
+      const queued = this.#notificationQueue.shift();
+      if (queued === undefined) continue;
+      try {
+        await this.#applyNotification(queued.notification);
+      } catch {
+        queued.connection.close();
+        this.#notificationQueue = this.#notificationQueue.filter(
+          (candidate) => candidate.connection !== queued.connection,
+        );
+      }
     }
   }
 
@@ -481,8 +513,9 @@ export class SessionController {
       observation.finished = true;
       const pendingCommit = this.#pendingCommits.get(event.runId);
       if (pendingCommit !== undefined) {
-        this.#pendingCommits.delete(event.runId);
         await this.#commitTurn(pendingCommit);
+      } else if (this.#committedTurns.has(observation.turnId)) {
+        this.#releaseRunObservation(observation);
       }
     }
   }
@@ -503,7 +536,10 @@ export class SessionController {
         });
         this.#knownTurns.add(event.payload.turnId);
       }
-    } else if (!this.#committedTurns.has(event.payload.turnId)) {
+    } else if (
+      !this.#committedTurns.has(event.payload.turnId) ||
+      this.#pendingCommits.has(event.payload.runId)
+    ) {
       const observation = this.#runs.get(event.payload.runId);
       if (observation !== undefined && !observation.finished) {
         this.#pendingCommits.set(event.payload.runId, event);
@@ -525,12 +561,23 @@ export class SessionController {
       ...event.payload,
     });
     this.#committedTurns.add(event.payload.turnId);
+    this.#pendingCommits.delete(event.payload.runId);
     if (this.#activeRun?.runId === event.payload.runId) this.#activeRun = undefined;
+    const observation = this.#runs.get(event.payload.runId);
+    if (observation?.finished) this.#releaseRunObservation(observation);
     this.#sessionCursor = event.sessionSequence;
     const deferred = this.#deferredSessionEvents
       .splice(0)
       .sort((left, right) => left.sessionSequence - right.sessionSequence);
     for (const next of deferred) await this.#applySessionEvent(next);
+  }
+
+  /** run 详细终态与 session commit 都已交付后，释放本地订阅索引。 */
+  #releaseRunObservation(observation: RunObservation): void {
+    if (observation.subscriptionId !== undefined) {
+      this.#runBySubscription.delete(observation.subscriptionId);
+    }
+    this.#runs.delete(observation.runId);
   }
 
   /** 等待当前或重连后的可用连接；可指定排除刚失败的旧连接。 */

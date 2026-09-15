@@ -287,8 +287,12 @@ describe("SessionController", () => {
       ),
     ).toBeLessThan(events.findIndex((event) => event.type === "turn.committed"));
     expect(connection.requests.some((request) => request.method === "event.subscribe")).toBe(true);
+    await new Promise<void>((resolve) => setImmediate(resolve));
     await controller.dispose();
     expect(connection.listenerCount).toBe(0);
+    expect(
+      connection.requests.filter((request) => request.method === "event.unsubscribe"),
+    ).toHaveLength(1);
   });
 
   test("fills an accept-and-finish race between getHistory and session.subscribe", async () => {
@@ -402,6 +406,161 @@ describe("SessionController", () => {
     expect(
       subscribe === undefined ? undefined : Reflect.get(subscribe.params, "afterSequence"),
     ).toBe(0);
+    await controller.dispose();
+  });
+
+  test("waits for an old slow consumer before establishing the reconnect generation", async () => {
+    const first = new FakeConnection(attachHandler([runningTurn]));
+    const secondEvent = Promise.withResolvers<void>();
+    const second = new FakeConnection(
+      attachHandler([runningTurn], (connection) => {
+        connection.emit(push(runSubscriptionId, runEvent("llm.text_delta", 2, { text: "next" })));
+      }),
+    );
+    const slowConsumer = Promise.withResolvers<void>();
+    const consumerEntered = Promise.withResolvers<void>();
+    const connections = [first, second];
+    let connectCount = 0;
+    const controller = new SessionController({
+      endpoint,
+      reconnectDelayMs: 0,
+      connect: () => {
+        connectCount += 1;
+        const connection = connections.shift();
+        if (connection === undefined) throw new Error("unexpected connection");
+        return Promise.resolve(asConnection(connection));
+      },
+      onEvent: async (event) => {
+        if (event.type !== "run.event") return;
+        if (event.event.sequence === 1) {
+          consumerEntered.resolve();
+          await slowConsumer.promise;
+        } else {
+          secondEvent.resolve();
+        }
+      },
+    });
+    await controller.attach(sessionId);
+
+    first.emit(push(runSubscriptionId, runEvent("llm.text_delta", 1, { text: "slow" })));
+    await consumerEntered.promise;
+    first.close();
+    await Promise.resolve();
+    expect(connectCount).toBe(1);
+    slowConsumer.resolve();
+    await secondEvent.promise;
+
+    expect(connectCount).toBe(2);
+    const subscribe = second.requests.find((request) => request.method === "event.subscribe");
+    expect(Reflect.get(subscribe?.params ?? {}, "afterSequence")).toBe(1);
+    await controller.dispose();
+  });
+
+  test("retries turn.committed when its consumer failed after run.finished", async () => {
+    const idleSummary = { ...summary, status: "idle" as const, activeRun: undefined };
+    const completedTurn: HistoryTurn = {
+      ...runningTurn,
+      status: "succeeded",
+      reason: "completed",
+      finishedAt: now,
+      includedInContext: true,
+    };
+    const first = new FakeConnection((method) => {
+      if (method === "session.getHistory") {
+        return { result: { session: idleSummary, turns: [], throughSessionSequence: 0 } };
+      }
+      if (method === "session.subscribe") {
+        return {
+          result: { subscriptionId: sessionSubscriptionId, sessionId, latestSequence: 0 },
+        };
+      }
+      if (method === "event.subscribe") {
+        return { result: { subscriptionId: runSubscriptionId, sessionId, runId } };
+      }
+      if (method === "event.unsubscribe") return { result: { removed: true } };
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const completedSummary = {
+      ...idleSummary,
+      latestSessionSequence: 2,
+      updatedAt: "2026-09-15T08:00:01.000Z",
+    };
+    const second = new FakeConnection((method) => {
+      if (method === "session.getHistory") {
+        return {
+          result: { session: completedSummary, turns: [completedTurn], throughSessionSequence: 2 },
+        };
+      }
+      if (method === "session.subscribe") {
+        return {
+          result: { subscriptionId: sessionSubscriptionId, sessionId, latestSequence: 2 },
+        };
+      }
+      if (method === "event.unsubscribe") return { result: { removed: true } };
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const connections = [first, second];
+    const committedAgain = Promise.withResolvers<void>();
+    let commitAttempts = 0;
+    const controller = new SessionController({
+      endpoint,
+      reconnectDelayMs: 0,
+      connect: () => {
+        const connection = connections.shift();
+        if (connection === undefined) throw new Error("unexpected connection");
+        return Promise.resolve(asConnection(connection));
+      },
+      onEvent: (event) => {
+        if (event.type !== "turn.committed") return;
+        commitAttempts += 1;
+        if (commitAttempts === 1) throw new Error("renderer rejected terminal");
+        committedAgain.resolve();
+      },
+    });
+    await controller.attach(sessionId);
+
+    first.emit(
+      push(
+        sessionSubscriptionId,
+        sessionEvent("session.turn_accepted", 1, {
+          turnId,
+          runId,
+          clientMessageId,
+          userMessage: "terminal retry",
+        }),
+      ),
+    );
+    first.emit(
+      push(
+        sessionSubscriptionId,
+        sessionEvent("session.turn_finished", 2, {
+          turnId,
+          runId,
+          status: "succeeded",
+          reason: "completed",
+        }),
+      ),
+    );
+    first.emit(
+      push(
+        runSubscriptionId,
+        runEvent("run.finished", 1, {
+          status: "succeeded",
+          reason: "completed",
+          finalText: "done",
+          steps: 1,
+          usage: {
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+        }),
+      ),
+    );
+    await committedAgain.promise;
+
+    expect(commitAttempts).toBe(2);
     await controller.dispose();
   });
 

@@ -4,8 +4,9 @@ minicode 是一个本地运行的 TypeScript coding agent。目标形态包括�
 TUI 前端、类型化 IPC、事件流、工具与权限系统、任务规划、会话记忆、上下文压缩、子 Agent
 以及 MCP 外部工具接入。
 
-当前版本实现了本地 coding agent 闭环：常驻 `mc-core` 前台进程、一次性 `mc-ping` 健康检查，
-`mc --goal` 流式 AgentLoop（只读工具调用 + 事件流 + 断线恢复），以及 `mc-tui` 交互式终端界面。
+当前版本实现了本地 coding agent 闭环：常驻 `mc-core`、一次性 `mc-ping`、用于单轮测试的
+`mc --goal`，以及支持持久多轮会话、恢复和多窗口同步的 `mc-tui`。Core 统一拥有 AgentLoop、
+历史、notes、run 级任务图、Trace 和事件流。
 
 ## 环境要求
 
@@ -34,45 +35,84 @@ bun run ping
 # pong server=0.1.0 uptime=12ms latency=2ms
 ```
 
-配置好 `.env` 中的 `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` 后，以当前目录为 workspace
-发起一次 run（assistant 文本写 stdout，进度写 stderr）：
+配置好 `.env` 中的 `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` 后，启动交互会话：
+
+```bash
+bun run tui
+```
+
+启动时的规范化当前目录固定为 session 的 `workspaceRoot`；恢复会话时也必须从同一 workspace
+启动。符号链接会解析为真实路径，session 创建后不会随进程 cwd 改变。
+
+需要单轮回归测试时，可使用 one-shot 入口（assistant 文本写 stdout，进度写 stderr）：
 
 ```bash
 bun run mc --goal "Read README.md and summarize it"
 ```
 
-Ctrl-C 会取消当前 run 并以退出码 130 结束；退出码 0 表示成功、1 表示 run 失败、2 表示参数或配置错误。
+`mc --goal` 不提供多轮会话；Ctrl-C 会取消 run 并以退出码 130 结束。退出码 0 表示成功、1
+表示 run 失败、2 表示参数或配置错误。
 
 Core 默认监听 `127.0.0.1:7437`。可通过 `.env` 中的 `MINICODE_CORE_HOST` 和
 `MINICODE_CORE_PORT` 修改 loopback 地址；当前不允许监听非本机地址。
-持久化事件默认写入 `~/.minicode`，可通过绝对路径 `MINICODE_HOME` 覆盖。
+持久化数据默认写入 `~/.minicode`，可通过绝对路径 `MINICODE_HOME` 覆盖。模型上下文预算由
+`LLM_CONTEXT_WINDOW_TOKENS` 和 `LLM_MAX_OUTPUT_TOKENS` 控制；无法容纳的新消息会在创建 turn/run
+前被拒绝。
 
 ## 终端界面（TUI）
 
-启动 Core 并配置好 LLM 后，以目标目录作为 workspace 启动交互式 TUI：
+启动 Core 并配置好 LLM 后，在目标 workspace 中选择一种启动方式：
 
 ```bash
-bun run tui --goal "Read README.md and summarize it"
+bun run tui                         # 新建 chat
+bun run tui --goal "Read README" # 新建 chat 并提交首条消息
+bun run tui --continue           # 恢复当前 workspace 最近的 chat
+bun run tui --session <uuid>     # 打开指定 session（one-shot 只读）
+bun run tui --sessions           # 打开 session selector
 ```
 
-TUI 以启动目录作为 workspaceRoot，连接正在运行的 Core，实时展示本次 run 的
-run/step/tool/LLM 事件流与 assistant 流式输出；Core 未运行时持续重试并在顶部状态栏显示连接状态。
-界面为顶部状态栏 + 可滚动事件日志 + 底部快捷键提示。
+两个 TUI 附着同一 session 时会重放同一持久事件并同步后续文本、工具、任务和终态；不同
+session 的 history、事件、取消和磁盘数据相互隔离。中途附着也会将持久文本前缀与 live 后缀
+按 sequence 去重合并。`corrupted` session 可在 selector 中诊断，但不可继续；当前没有
+close/delete/rename 操作。
 
 快捷键（纯键盘，不支持鼠标）：
 
 | 按键 | 作用 |
 | --- | --- |
-| `q` | 空闲/结束后退出；运行中首次按下请求取消，再次按下强制退出 |
-| `Ctrl-C` | 运行中取消当前 run |
-| `↑` / `↓` | 向上/向下滚动事件日志 |
+| `Enter` | 提交输入 |
+| `Ctrl+Enter` | 在输入框换行 |
+| `Ctrl-C` | 有草稿时清空草稿；运行中请求取消 |
+| `/new` | 当前 workspace 新建 chat |
+| `/exit` | 空闲时退出 |
 | `PgUp` / `PgDn` | 向上/向下翻页 |
-| `Home` / `End` | 跳到日志开头/结尾 |
+| `Ctrl+Home` / `Ctrl+End` | 跳到日志开头/结尾 |
 
-退出码：`0` 成功、`1` run 失败、`2` 参数/配置错误或非 TTY 环境、`130` 用户取消或中断。
+selector 使用 `↑/↓` 或 `j/k` 选择、Enter 打开、Tab 切换当前/全部 workspace、`O` 显示或隐藏
+one-shot、Esc 退出。输入区中的普通 `q` 只是文本，不是退出键。终端标记以稳定文字和颜色区分
+`YOU`、`ASSISTANT`、`TURN`、`MODEL`、`TOOL`、`TASK`、`USAGE` 与 `ERROR`。
 
-当前限制：一次 TUI 进程只发起并展示一个隔离 run，结束后按 `q` 退出；不支持交互聊天、
-多 run 列表、历史 run 回放和鼠标操作。需要这些能力时请另建 Issue。
+详细说明见 [TUI 使用说明](TUI.md)。
+
+## 会话、任务与 Trace
+
+所有中间文件都位于 `MINICODE_HOME`，不会写进 workspace：
+
+```text
+sessions/<sessionId>/meta.json
+sessions/<sessionId>/history.jsonl
+sessions/<sessionId>/notes.md
+sessions/<sessionId>/session-events.jsonl
+sessions/<sessionId>/runs/<runId>/{run.json,events.jsonl,trace.jsonl,tasks.json}
+```
+
+目录权限为 `0700`，文件权限为 `0600`。只有成功且工具消息配对完整的 turn 会进入下一轮上下文；
+failed/cancelled/interrupted turn 保留用于审计。notes 属于 session，TaskManager 和 `tasks.json`
+只属于单个 run，下一轮从空任务图开始。
+
+Trace 默认开启，`summary` 只保留结构、名称、状态和用量；`full` 保留经容量限制后的业务 payload。
+两种模式都会递归脱敏 credential。Trace 使用有界队列和文件上限，写入失败只丢弃 Trace，不改变
+Agent 终态；当前没有 Trace viewer。配置项和完整设计见 [Stage2 架构](ARCHITECTURE.md)。
 
 提交前运行：
 
@@ -106,4 +146,7 @@ LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run 
 
 ## 文档
 
+- [Stage2 架构与持久化](ARCHITECTURE.md)
+- [Stage2 验证矩阵](STAGE2_TEST_MATRIX.md)
+- [TUI 使用说明](TUI.md)
 - [Wire protocol](WIRE_PROTOCOL.md)

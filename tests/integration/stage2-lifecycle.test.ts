@@ -426,8 +426,10 @@ describe("Stage2 complete lifecycle", () => {
     const endpoint = app.start();
     const firstEvents: SessionControllerEvent[] = [];
     const secondEvents: SessionControllerEvent[] = [];
+    const cancelledObserverEvents: SessionControllerEvent[] = [];
     let firstCommit = nextCommit(firstEvents);
     const secondCommit = nextCommit(secondEvents);
+    const cancelledObserverCommit = nextCommit(cancelledObserverEvents);
     const first = new SessionController({
       endpoint,
       onEvent: (event) => firstCommit.accept(event),
@@ -436,27 +438,44 @@ describe("Stage2 complete lifecycle", () => {
       endpoint,
       onEvent: (event) => secondCommit.accept(event),
     });
+    const cancelledObserver = new SessionController({
+      endpoint,
+      onEvent: (event) => cancelledObserverCommit.accept(event),
+    });
 
     try {
       const [firstSession, secondSession] = await Promise.all([
         first.create(firstWorkspace),
         second.create(secondWorkspace),
       ]);
+      await cancelledObserver.attach(firstSession.sessionId);
       const cancelledSend = first.sendMessage(`cancel this turn Authorization: Bearer ${SECRET}`);
       await cancelBarrier.reached;
       const successfulSend = await second.sendMessage("other workspace question");
       expect(await first.cancelActiveRun()).toEqual({ outcome: "cancellation_requested" });
       cancelBarrier.release();
-      const [cancelledAccepted, firstTerminal, secondTerminal] = await Promise.all([
-        cancelledSend,
-        firstCommit.promise,
-        secondCommit.promise,
-      ]);
+      const [cancelledAccepted, firstTerminal, secondTerminal, observerTerminal] =
+        await Promise.all([
+          cancelledSend,
+          firstCommit.promise,
+          secondCommit.promise,
+          cancelledObserverCommit.promise,
+        ]);
       expect(firstTerminal).toMatchObject({
         runId: cancelledAccepted.runId,
         status: "cancelled",
       });
       expect(secondTerminal).toMatchObject({ runId: successfulSend.runId, status: "succeeded" });
+      expect(observerTerminal).toEqual(firstTerminal);
+      expect(
+        cancelledObserverEvents.filter(
+          (event) =>
+            event.type === "run.event" &&
+            event.event.runId === cancelledAccepted.runId &&
+            event.event.type === "run.finished" &&
+            event.event.payload.status === "cancelled",
+        ),
+      ).toHaveLength(1);
       expect(
         firstEvents.some(
           (event) => "sessionId" in event && event.sessionId === secondSession.sessionId,
@@ -546,7 +565,7 @@ describe("Stage2 complete lifecycle", () => {
       ]);
     } finally {
       cancelBarrier.release();
-      await Promise.all([first.dispose(), second.dispose()]);
+      await Promise.all([first.dispose(), second.dispose(), cancelledObserver.dispose()]);
       await app.stop();
       await mock.stop();
       await Promise.all([
@@ -740,6 +759,12 @@ describe("Stage2 complete lifecycle", () => {
       expect(
         interruptedJournal.events.filter((event) => event.type === "run.finished"),
       ).toHaveLength(1);
+      expect(
+        must(await sessions.load(interrupted.sessionId)).sessionEvents.filter(
+          (event) =>
+            event.type === "session.turn_finished" && event.payload.turnId === interrupted.turnId,
+        ),
+      ).toHaveLength(1);
 
       const repairedHistory = await audit.request(
         SESSION_GET_HISTORY_METHOD,
@@ -751,6 +776,13 @@ describe("Stage2 complete lifecycle", () => {
         must(
           await eventStore.read(historyCompleted.sessionId, historyCompleted.runId),
         ).events.filter((event) => event.type === "run.finished"),
+      ).toHaveLength(1);
+      expect(
+        must(await sessions.load(historyCompleted.sessionId)).sessionEvents.filter(
+          (event) =>
+            event.type === "session.turn_finished" &&
+            event.payload.turnId === historyCompleted.turnId,
+        ),
       ).toHaveLength(1);
 
       const listed = await controller.list({ workspaceRoot: workspace });
@@ -848,6 +880,12 @@ describe("Stage2 complete lifecycle", () => {
         expect(
           must(await new EventStore(home).read(session.sessionId, accepted.runId)).events.filter(
             (event) => event.type === "run.finished",
+          ),
+        ).toHaveLength(1);
+        expect(
+          must(await new SessionStore(home).load(session.sessionId)).sessionEvents.filter(
+            (event) =>
+              event.type === "session.turn_finished" && event.payload.runId === accepted.runId,
           ),
         ).toHaveLength(1);
       } finally {

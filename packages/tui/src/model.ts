@@ -100,6 +100,7 @@ export class TuiModel {
   #maxBytes: number;
   #knownTurns = new Set<string>();
   #runSequences = new Map<string, number>();
+  /** 每个 run 当前 step 正在流式输出的 assistant 块；新 step 必须另起一块以保持事件顺序。 */
   #assistantLines = new Map<string, number>();
   #turnLines = new Map<string, number>();
   #taskLines = new Map<string, number>();
@@ -248,6 +249,10 @@ export class TuiModel {
         this.#run = "running";
         this.#activeRunId = event.runId;
         break;
+      case "step.started":
+        // 一次 run 可能经历多次 LLM -> 工具调用；不能把后续 step 的最终回答写回工具前的旧块。
+        this.#assistantLines.delete(event.runId);
+        break;
       case "llm.text_delta": {
         let id = this.#assistantLines.get(event.runId);
         if (id === undefined) {
@@ -301,7 +306,6 @@ export class TuiModel {
         this.#correctFinalText(event.runId, event.payload.finalText, mutations);
         this.#finishTurn(event.runId, event.payload.status, event.payload.reason, mutations);
         break;
-      case "step.started":
       case "step.finished":
         break;
     }

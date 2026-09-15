@@ -185,6 +185,100 @@ describe("TuiApp multi-turn interaction", () => {
     expect(await code).toBe(0);
   });
 
+  test("renders the final Markdown answer after preceding tool events", async () => {
+    const { setup, controller, code } = await start();
+    const emitRunEvent = (event: Parameters<typeof controller.emit>[0] & { type: "run.event" }) =>
+      controller.emit(event);
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 1,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "step.started",
+        payload: { step: 1 },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 2,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "llm.text_delta",
+        payload: { text: "Checking files" },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 3,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "tool.started",
+        payload: { toolCallId: "call-1", name: "read_file", attempt: 1 },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 4,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "tool.finished",
+        payload: {
+          toolCallId: "call-1",
+          name: "read_file",
+          isError: false,
+          durationMs: 1,
+          outputBytes: 10,
+          truncated: false,
+        },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 5,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "step.started",
+        payload: { step: 2 },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 6,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "llm.text_delta",
+        payload: { text: "## Final answer" },
+      },
+    });
+
+    await setup.waitForFrame(
+      (frame) => frame.includes("Final answer") && frame.includes("✓ completed read_file"),
+    );
+    const frame = setup.captureCharFrame();
+    expect(frame.indexOf("Checking files")).toBeLessThan(frame.indexOf("▶ running read_file"));
+    expect(frame.indexOf("✓ completed read_file")).toBeLessThan(frame.indexOf("Final answer"));
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
+
   test("Enter sends while Ctrl+Enter inserts a newline at the OpenTUI key layer", async () => {
     const { setup, controller, code } = await start();
     await setup.mockInput.typeText("hello");

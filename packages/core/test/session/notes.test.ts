@@ -22,7 +22,7 @@ describe("NoteStore", () => {
 
     const content = storage.files.get("/home/notes.md") ?? "";
     expect(content).toBe(
-      `### 2026-09-14T08:00:00.000Z\nsessionId: ${SESSION_A}\nrunId: ${RUN_A}\n\nremember the workspace layout\n\n`,
+      `### 2026-09-14T08:00:00.000Z\nschemaVersion: 1\nsessionId: ${SESSION_A}\nrunId: ${RUN_A}\n\nremember the workspace layout\n\n`,
     );
     const read = await notes.read();
     expect(read.ok).toBe(true);
@@ -91,6 +91,39 @@ describe("NoteStore", () => {
     }
   });
 
+  test("rejects malformed, unknown-version, and oversized persisted notes", async () => {
+    const storage = new MemorySessionStorage();
+    const notes = makeNoteStore(storage);
+    storage.files.set("/home/notes.md", "not a note\n");
+    expect((await notes.read()).ok).toBe(false);
+
+    storage.files.set(
+      "/home/notes.md",
+      notes.render("valid").replace("schemaVersion: 1", "schemaVersion: 2"),
+    );
+    expect((await notes.read()).ok).toBe(false);
+
+    storage.files.set("/home/notes.md", "x".repeat(MAX_NOTES_BYTES + 1));
+    expect((await notes.read()).ok).toBe(false);
+  });
+
+  test("serializes appends across NoteStore instances before checking the total limit", async () => {
+    const storage = new MemorySessionStorage();
+    const first = makeNoteStore(storage);
+    const second = makeNoteStore(storage);
+    storage.files.set("/home/notes.md", first.render("x".repeat(MAX_NOTE_CHARS)).repeat(15));
+
+    const results = await Promise.all([
+      first.append("a".repeat(8_000)),
+      second.append("b".repeat(8_000)),
+    ]);
+    expect(results.filter((result) => result.ok)).toHaveLength(1);
+    expect(results.filter((result) => !result.ok)).toHaveLength(1);
+    expect(encoderSize(storage.files.get("/home/notes.md") ?? "")).toBeLessThanOrEqual(
+      MAX_NOTES_BYTES,
+    );
+  });
+
   test("reports the current notes byte size", async () => {
     const storage = new MemorySessionStorage();
     const notes = makeNoteStore(storage);
@@ -148,3 +181,7 @@ describe("NoteStore", () => {
     }
   });
 });
+
+function encoderSize(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}

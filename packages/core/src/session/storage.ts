@@ -84,19 +84,19 @@ export const nodeSessionStorage: SessionStorage = {
   async writeFileAtomic(path, content) {
     const directory = dirname(path);
     const temporary = join(directory, `.${crypto.randomUUID()}.tmp`);
-    const handle = await open(temporary, "wx", 0o600);
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
+      handle = await open(temporary, "wx", 0o600);
       await handle.chmod(0o600);
       await handle.writeFile(content, { encoding: "utf8" });
       await handle.sync();
-    } finally {
       await handle.close();
-    }
-    try {
+      handle = undefined;
       await rename(temporary, path);
       await syncDirectory(directory);
     } catch (error) {
-      // rename 失败时尽力清理临时文件，避免泄露半成品内容。
+      // 任一阶段失败时关闭句柄并清理临时文件，避免泄露半成品内容。
+      await handle?.close().catch(() => {});
       await rm(temporary, { force: true }).catch(() => {});
       throw error;
     }

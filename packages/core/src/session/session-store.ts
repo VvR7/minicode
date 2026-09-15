@@ -8,19 +8,19 @@ import type {
   SessionId,
   SessionSummary,
 } from "@minicode/protocol";
-import { HistoryTurnReasonSchema, SessionIdSchema, SessionSummarySchema } from "@minicode/protocol";
+import { SessionIdSchema, SessionSummarySchema } from "@minicode/protocol";
 import { z } from "zod";
 import type { LlmContentPart, LlmMessage } from "../llm/types.ts";
-import { NoteStore } from "./notes.ts";
+import { NoteStore, parseSessionNotes } from "./notes.ts";
 import type { SessionStorage } from "./storage.ts";
 import { nodeSessionStorage } from "./storage.ts";
 import {
-  CompletedStatusSchema,
   HistoryRecordSchema,
   SESSION_SCHEMA_VERSION,
   SessionEventRecordSchema,
   SessionMetaSchema,
   TurnAcceptedRecordSchema,
+  TurnCompletedRecordSchema,
   type AcceptedTurn,
   type AcceptTurnInput,
   type CompleteTurnInput,
@@ -120,15 +120,20 @@ export function deriveTitle(userMessage: string): string {
 
 /** 取两个 ISO 时间戳中较晚的一个。 */
 function latestTimestamp(left: string, right: string): string {
-  return left >= right ? left : right;
+  return Date.parse(left) >= Date.parse(right) ? left : right;
 }
 
 /** 校验 tool_use 与 tool_result 是否按 ID 完整配对（含尾部未配对检测）。 */
 function hasCompleteToolPairing(messages: readonly HistoryTurn["messages"][number][]): boolean {
   const pending = new Set<string>();
+  const seenToolUses = new Set<string>();
   for (const message of messages) {
     for (const block of message.content) {
       if (block.type === "tool_use") {
+        if (seenToolUses.has(block.id)) {
+          return false;
+        }
+        seenToolUses.add(block.id);
         pending.add(block.id);
       } else if (block.type === "tool_result" && !pending.delete(block.toolUseId)) {
         return false;
@@ -343,8 +348,9 @@ export class SessionStore {
     }
 
     summaries.sort((left, right) => {
-      if (left.updatedAt !== right.updatedAt) {
-        return left.updatedAt < right.updatedAt ? 1 : -1;
+      const timestampOrder = Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+      if (timestampOrder !== 0) {
+        return timestampOrder;
       }
       return left.sessionId < right.sessionId ? -1 : 1;
     });
@@ -358,8 +364,9 @@ export class SessionStore {
         ? 0
         : summaries.findIndex(
             (summary) =>
-              summary.updatedAt < cursor.updatedAt ||
-              (summary.updatedAt === cursor.updatedAt && summary.sessionId > cursor.sessionId),
+              Date.parse(summary.updatedAt) < Date.parse(cursor.updatedAt) ||
+              (Date.parse(summary.updatedAt) === Date.parse(cursor.updatedAt) &&
+                summary.sessionId > cursor.sessionId),
           );
     const effectiveStart = startIndex === -1 ? summaries.length : startIndex;
     const page = summaries.slice(effectiveStart, effectiveStart + limit);
@@ -497,10 +504,7 @@ export class SessionStore {
       }
 
       const timestamp = this.#now();
-      const status = CompletedStatusSchema.parse(input.status);
-      const reason =
-        input.reason === undefined ? undefined : HistoryTurnReasonSchema.parse(input.reason);
-      const record = {
+      const record = TurnCompletedRecordSchema.safeParse({
         schemaVersion: SESSION_SCHEMA_VERSION,
         recordId: crypto.randomUUID(),
         sessionId,
@@ -508,17 +512,23 @@ export class SessionStore {
         runId: input.runId,
         timestamp,
         kind: "turn.completed" as const,
-        status,
-        ...(reason === undefined ? {} : { reason }),
+        status: input.status,
+        ...(input.reason === undefined ? {} : { reason: input.reason }),
         messages: input.messages,
-        includedInContext: status === "succeeded",
+        includedInContext: input.status === "succeeded",
         model: input.model,
         ...(input.taskGraph === undefined ? {} : { taskGraph: input.taskGraph }),
-      };
+      });
+      if (
+        !record.success ||
+        (record.data.includedInContext && !hasCompleteToolPairing(record.data.messages))
+      ) {
+        return { ok: false, error: { code: "invalid_input", message: "completion is invalid" } };
+      }
       try {
         await this.#storage.appendLine(
           this.#paths(sessionId).history,
-          `${JSON.stringify(record)}\n`,
+          `${JSON.stringify(record.data)}\n`,
         );
       } catch {
         return { ok: false, error: { code: "io_error", message: "failed to persist completion" } };
@@ -546,6 +556,23 @@ export class SessionStore {
       }
       if (event.sessionId !== sessionId) {
         return { ok: false, error: { code: "invalid_input", message: "event scope mismatch" } };
+      }
+      const turn = loaded.value.snapshot.turns.find(
+        (candidate) =>
+          candidate.turnId === event.payload.turnId && candidate.runId === event.payload.runId,
+      );
+      if (turn === undefined) {
+        return { ok: false, error: { code: "invalid_input", message: "event turn is unknown" } };
+      }
+      if (event.type === "session.turn_accepted") {
+        if (
+          event.payload.clientMessageId !== turn.clientMessageId ||
+          event.payload.userMessage !== userMessageOf(turn)
+        ) {
+          return { ok: false, error: { code: "invalid_input", message: "event turn mismatch" } };
+        }
+      } else if (event.payload.status !== turn.status || event.payload.reason !== turn.reason) {
+        return { ok: false, error: { code: "invalid_input", message: "event result mismatch" } };
       }
       const expected = loaded.value.snapshot.latestSessionSequence + 1;
       if (event.sessionSequence !== expected) {
@@ -648,11 +675,19 @@ export class SessionStore {
     });
     const events = await this.#readRecords(paths.sessionEvents, (value) => {
       const parsed = SessionEventRecordSchema.safeParse(value);
-      return parsed.success ? parsed.data.event : undefined;
+      return parsed.success ? parsed.data : undefined;
     });
     let notes: string;
     try {
-      notes = (await this.#storage.readFile(paths.notes)) ?? "";
+      const rawNotes = await this.#storage.readFile(paths.notes);
+      if (
+        rawNotes === undefined ||
+        new TextEncoder().encode(rawNotes).byteLength > 256 * 1024 ||
+        parseSessionNotes(rawNotes) === undefined
+      ) {
+        return { ok: true, value: { meta: meta.data } };
+      }
+      notes = rawNotes;
     } catch {
       return { ok: false, error: { code: "io_error", message: "failed to read session notes" } };
     }
@@ -667,7 +702,7 @@ export class SessionStore {
     return { ok: true, value: { meta: meta.data, snapshot: built.value } };
   }
 
-  /** 读取 JSONL 记录；文件缺失视为空。 */
+  /** 读取固定 JSONL journal；文件缺失或读取失败均视为损坏。 */
   async #readRecords<Record>(
     path: string,
     parse: (value: unknown) => Record | undefined,
@@ -677,6 +712,9 @@ export class SessionStore {
       content = await this.#storage.readFile(path);
     } catch {
       return { ok: false, reason: "read failed" };
+    }
+    if (content === undefined) {
+      return { ok: false, reason: "journal file is missing" };
     }
     return parseJsonLines(content, parse);
   }
@@ -688,7 +726,7 @@ export class SessionStore {
   #buildSnapshot(
     meta: SessionMeta,
     history: readonly HistoryRecord[],
-    events: readonly SessionEvent[],
+    eventRecords: readonly z.infer<typeof SessionEventRecordSchema>[],
     notes: string,
   ): SessionStoreResult<SessionSnapshot> {
     const accepted = new Map<string, Extract<HistoryRecord, { kind: "turn.accepted" }>>();
@@ -721,13 +759,12 @@ export class SessionStore {
       }
     }
 
-    const seenClientMessages = new Map<string, string>();
+    const seenClientMessages = new Set<string>();
     for (const record of accepted.values()) {
-      const existingTurn = seenClientMessages.get(record.clientMessageId);
-      if (existingTurn !== undefined && existingTurn !== record.turnId) {
-        return this.#corrupt("clientMessageId reused across turns");
+      if (seenClientMessages.has(record.clientMessageId)) {
+        return this.#corrupt("duplicate clientMessageId record");
       }
-      seenClientMessages.set(record.clientMessageId, record.turnId);
+      seenClientMessages.add(record.clientMessageId);
     }
 
     const completedByKey = new Map<string, Extract<HistoryRecord, { kind: "turn.completed" }>>();
@@ -796,15 +833,41 @@ export class SessionStore {
     }
 
     let latestSessionSequence = 0;
-    for (const event of events) {
+    const eventRecordIds = new Set<string>();
+    const events: SessionEvent[] = [];
+    for (const eventRecord of eventRecords) {
+      if (eventRecordIds.has(eventRecord.recordId)) {
+        return this.#corrupt("duplicate session event record id");
+      }
+      eventRecordIds.add(eventRecord.recordId);
+      const event = eventRecord.event;
       if (event.sessionId !== meta.sessionId) {
         return this.#corrupt("session event identity mismatch");
       }
       if (event.sessionSequence !== latestSessionSequence + 1) {
         return this.#corrupt("session event sequence gap");
       }
+      const key = `${event.payload.turnId}:${event.payload.runId}`;
+      const acceptedRecord = accepted.get(key);
+      const completion = completedByKey.get(key);
+      if (event.type === "session.turn_accepted") {
+        if (
+          acceptedRecord === undefined ||
+          event.payload.clientMessageId !== acceptedRecord.clientMessageId ||
+          event.payload.userMessage !== acceptedRecord.userMessage
+        ) {
+          return this.#corrupt("accepted event does not match history");
+        }
+      } else if (
+        completion === undefined ||
+        event.payload.status !== completion.status ||
+        event.payload.reason !== completion.reason
+      ) {
+        return this.#corrupt("finished event does not match history");
+      }
       latestSessionSequence = event.sessionSequence;
       updatedAt = latestTimestamp(updatedAt, event.timestamp);
+      events.push(event);
     }
 
     // 首条用户消息已落盘但 meta 缓存落后的场景：以合法 journal 为准重建标题。

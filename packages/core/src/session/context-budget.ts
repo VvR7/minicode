@@ -50,7 +50,11 @@ export interface ContextBudgetUsage {
 
 export type ContextBudgetCheck =
   | { readonly ok: true; readonly usage: ContextBudgetUsage }
-  | { readonly ok: false; readonly usage: ContextBudgetUsage };
+  | {
+      readonly ok: false;
+      readonly code: "context_limit_exceeded";
+      readonly usage: ContextBudgetUsage;
+    };
 
 /** 解析正整数环境变量；非法返回 undefined。 */
 function parsePositiveInteger(raw: string | undefined): number | undefined {
@@ -138,7 +142,7 @@ export function checkContextBudget(
     safeBudgetTokens,
   };
   if (estimatedInputTokens + config.maxOutputTokens > safeBudgetTokens) {
-    return { ok: false, usage };
+    return { ok: false, code: "context_limit_exceeded", usage };
   }
   return { ok: true, usage };
 }

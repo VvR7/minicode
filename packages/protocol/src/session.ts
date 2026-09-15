@@ -1,7 +1,12 @@
 import { z } from "zod";
 
 import { RunIdSchema, SessionIdSchema, SubscriptionIdSchema } from "./agent.ts";
-import { JSON_RPC_VERSION, JsonRpcIdSchema, jsonRpcSuccessSchema } from "./json-rpc.ts";
+import {
+  JSON_RPC_VERSION,
+  JsonRpcIdSchema,
+  JsonRpcSessionErrorDataSchema,
+  jsonRpcSuccessSchema,
+} from "./json-rpc.ts";
 
 /** Stage2 session 相关 RPC 方法名，集中定义避免各处硬编码字符串。 */
 export const SESSION_CREATE_METHOD = "session.create" as const;
@@ -29,6 +34,8 @@ export type SessionStatus = z.infer<typeof SessionStatusSchema>;
 
 /** 单条消息的文本上限，与 session.sendMessage content 一致。 */
 export const MAX_SESSION_MESSAGE_CHARS = 32 * 1024;
+/** 单个历史文本块上限；与 run.finished 最终文本及工具结果的审计上限一致。 */
+export const MAX_HISTORY_TEXT_CHARS = 256 * 1024;
 /** session.list 的默认与最大分页大小。 */
 export const DEFAULT_SESSION_LIST_LIMIT = 50;
 export const MAX_SESSION_LIST_LIMIT = 100;
@@ -149,7 +156,7 @@ export type SessionGetHistoryParams = z.infer<typeof SessionGetHistoryParamsSche
 /** provider-neutral 的消息内容：文本、工具调用与工具结果。 */
 export const HistoryTextContentSchema = z.strictObject({
   type: z.literal("text"),
-  text: z.string(),
+  text: z.string().max(MAX_HISTORY_TEXT_CHARS),
 });
 export type HistoryTextContent = z.infer<typeof HistoryTextContentSchema>;
 
@@ -215,9 +222,14 @@ export type HistoryTurnReason = z.infer<typeof HistoryTurnReasonSchema>;
 /** 校验 tool_use 与 tool_result 是否按 ID 完整配对（含尾部未配对检测）。 */
 function hasCompleteToolPairing(messages: readonly HistoryMessage[]): boolean {
   const pending = new Set<string>();
+  const seenToolUses = new Set<string>();
   for (const message of messages) {
     for (const block of message.content) {
       if (block.type === "tool_use") {
+        if (seenToolUses.has(block.id)) {
+          return false;
+        }
+        seenToolUses.add(block.id);
         pending.add(block.id);
       } else if (block.type === "tool_result") {
         if (!pending.delete(block.toolUseId)) {
@@ -247,6 +259,22 @@ export const HistoryTurnSchema = z
     messages: z.array(HistoryMessageSchema),
   })
   .superRefine((turn, ctx) => {
+    for (const [index, message] of turn.messages.entries()) {
+      if (message.turnId !== turn.turnId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "history message turnId must match its containing turn",
+          path: ["messages", index, "turnId"],
+        });
+      }
+      if (message.runId !== turn.runId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "history message runId must match its containing turn",
+          path: ["messages", index, "runId"],
+        });
+      }
+    }
     if (!turn.includedInContext) {
       return;
     }
@@ -297,7 +325,7 @@ const SessionEventBaseShape = {
   sessionId: SessionIdSchema,
   sessionSequence: z.number().int().positive(),
   timestamp: z.iso.datetime({ offset: true }),
-  durable: z.boolean(),
+  durable: z.literal(true),
 };
 
 function sessionEventSchema<const Type extends string, PayloadSchema extends z.ZodType>(
@@ -392,11 +420,7 @@ export const SessionSubscribeSuccessResponseSchema = jsonRpcSuccessSchema(
  * session 类错误的 data 只允许安全、类型化的诊断字段，
  * 不允许出现路径、prompt 或底层异常信息。
  */
-export const SessionErrorDataSchema = z.strictObject({
-  sessionId: SessionIdSchema.optional(),
-  turnId: TurnIdSchema.optional(),
-  runId: RunIdSchema.optional(),
-});
+export const SessionErrorDataSchema = JsonRpcSessionErrorDataSchema;
 export type SessionErrorData = z.infer<typeof SessionErrorDataSchema>;
 
 /** 供 Core handler 复用的 session 错误码名称。 */

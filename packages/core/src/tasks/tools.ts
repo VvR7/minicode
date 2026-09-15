@@ -34,7 +34,7 @@ async function publishTaskEvent(
   revision: number,
   task: TaskSnapshot,
 ): Promise<void> {
-  await deps.bus.publish({
+  const published = await deps.bus.publish({
     sessionId: deps.sessionId,
     runId: deps.runId,
     timestamp: new Date().toISOString(),
@@ -42,6 +42,30 @@ async function publishTaskEvent(
     type,
     payload: { revision, task },
   });
+  if (!published.ok) {
+    throw new ToolError("io_error", "failed to persist task event");
+  }
+}
+
+/** 发布失败时补偿 tasks.json；无论补偿结果如何都以安全工具错误结束。 */
+async function publishOrRollback(
+  deps: TaskToolDependencies,
+  type: "task.created" | "task.updated",
+  revision: number,
+  task: TaskSnapshot,
+): Promise<void> {
+  try {
+    await publishTaskEvent(deps, type, revision, task);
+    deps.manager.confirmMutation(revision);
+  } catch {
+    const rolledBack = await deps.manager.rollbackMutation(revision);
+    throw new ToolError(
+      "io_error",
+      rolledBack.ok
+        ? "failed to persist task event"
+        : "failed to persist task event and roll back task state",
+    );
+  }
 }
 
 const TaskCreateParamsSchema = z.strictObject({
@@ -85,6 +109,7 @@ function taskCreateTool(deps: TaskToolDependencies): Tool<TaskCreateParams> {
     description:
       "Create a task in the run's task plan. Use for complex multi-step goals before starting work.",
     inputSchema: TaskCreateParamsSchema,
+    /** 创建任务、持久化对应事件，并在事件失败时补偿任务图。 */
     async execute(params) {
       const input: CreateTaskInput = {
         subject: params.subject,
@@ -95,7 +120,7 @@ function taskCreateTool(deps: TaskToolDependencies): Tool<TaskCreateParams> {
       if (!result.ok) {
         throw toToolError(result.error);
       }
-      await publishTaskEvent(deps, "task.created", result.value.revision, result.value.task);
+      await publishOrRollback(deps, "task.created", result.value.revision, result.value.task);
       return { content: JSON.stringify(result.value) };
     },
   };
@@ -107,6 +132,7 @@ function taskUpdateTool(deps: TaskToolDependencies): Tool<TaskUpdateParams> {
     description:
       "Update a task's subject, description, status, or dependencies. Provide at least one change.",
     inputSchema: TaskUpdateParamsSchema,
+    /** 更新任务、持久化对应事件，并在事件失败时补偿任务图。 */
     async execute(params) {
       const input: UpdateTaskInput = {
         id: params.id,
@@ -119,7 +145,7 @@ function taskUpdateTool(deps: TaskToolDependencies): Tool<TaskUpdateParams> {
       if (!result.ok) {
         throw toToolError(result.error);
       }
-      await publishTaskEvent(deps, "task.updated", result.value.revision, result.value.task);
+      await publishOrRollback(deps, "task.updated", result.value.revision, result.value.task);
       return { content: JSON.stringify(result.value) };
     },
   };
@@ -130,6 +156,7 @@ function taskListTool(deps: TaskToolDependencies): Tool<TaskListParams> {
     name: "task_list",
     description: "List tasks in the run's plan, optionally filtered by status.",
     inputSchema: TaskListParamsSchema,
+    /** 读取当前 revision 下的任务列表，不发布变更事件。 */
     async execute(params) {
       const result = await deps.manager.list(params.status);
       if (!result.ok) {
@@ -145,6 +172,7 @@ function taskGetTool(deps: TaskToolDependencies): Tool<TaskGetParams> {
     name: "task_get",
     description: "Read a single task from the run's plan.",
     inputSchema: TaskGetParamsSchema,
+    /** 读取指定任务及当前 revision，不发布变更事件。 */
     async execute(params) {
       const result = await deps.manager.get(params.id);
       if (!result.ok) {

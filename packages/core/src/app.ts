@@ -76,7 +76,12 @@ export class CoreApp {
     });
     const broadcaster = new IpcEventBroadcaster(eventBus);
     const manager = new RunManager(
-      new AgentRunner({ environment: this.#environment, bus: eventBus, traceService }),
+      new AgentRunner({
+        environment: this.#environment,
+        bus: eventBus,
+        homeDirectory: this.#config.homeDirectory,
+        traceService,
+      }),
     );
     const dispatcher = createRpcDispatcher({
       handlers: [

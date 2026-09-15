@@ -136,4 +136,39 @@ describe("task planning tools", () => {
     const fetched = await invoker.invoke("task_get", { id: 1 }, context);
     expect(fetched.result.isError).toBe(true);
   });
+
+  test("reports a durable task event persistence failure as a tool error", async () => {
+    const { manager, storage } = createTaskManager();
+    const bus = new EventBus(
+      new EventStore("/memory", {
+        /** 模拟事件 journal 无法持久化。 */
+        async append() {
+          throw new Error("disk full");
+        },
+        /** 首次发布不需要已有 journal。 */
+        async read() {
+          return undefined;
+        },
+      }),
+    );
+    const registry = new ToolRegistry();
+    for (const tool of createTaskTools({ manager, bus, sessionId: SESSION_A, runId: RUN_A })) {
+      registry.register(tool);
+    }
+
+    const result = await new ToolInvoker(registry).invoke(
+      "task_create",
+      { subject: "a", description: "b" },
+      makeContext(),
+    );
+
+    expect(result.result.isError).toBe(true);
+    expect(result.result.content).toBe("failed to persist task event");
+    expect(JSON.parse(storage.files.get("/home/sessions/a/runs/b/tasks.json") ?? "null")).toEqual({
+      schemaVersion: 1,
+      revision: 0,
+      nextId: 1,
+      tasks: [],
+    });
+  });
 });

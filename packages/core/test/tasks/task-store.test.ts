@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { TaskManager } from "../../src/tasks/task-store.ts";
+import { TaskManager, tasksPath } from "../../src/tasks/task-store.ts";
+import { RUN_A, SESSION_A } from "../session/test-helpers.ts";
 import { MemoryTaskStorage, createTaskManager } from "./test-helpers.ts";
 
 function okOf<Value>(result: { ok: true; value: Value } | { ok: false; error: unknown }): Value {
@@ -175,6 +176,31 @@ describe("TaskManager", () => {
     expect(errorCodeOf(await second.update({ id: 1, status: "completed" }))).toBe("stale_revision");
   });
 
+  test("serializes concurrent mutations on the same manager", async () => {
+    const { manager } = createTaskManager("/x/tasks.json");
+    const [first, second] = await Promise.all([
+      manager.create({ subject: "A", description: "a" }),
+      manager.create({ subject: "B", description: "b" }),
+    ]);
+
+    expect(okOf(first)).toMatchObject({ revision: 1, task: { id: 1 } });
+    expect(okOf(second)).toMatchObject({ revision: 2, task: { id: 2 } });
+    expect(okOf(await manager.list()).tasks.map((task) => task.subject)).toEqual(["A", "B"]);
+  });
+
+  test("does not overwrite a schema-valid graph that became structurally corrupted", async () => {
+    const { manager, storage } = createTaskManager("/x/tasks.json");
+    okOf(await manager.create({ subject: "A", description: "a" }));
+    const graph = JSON.parse(storage.files.get("/x/tasks.json") ?? "null");
+    graph.tasks[0].blockedBy = [99];
+    storage.files.set("/x/tasks.json", JSON.stringify(graph));
+
+    expect(errorCodeOf(await manager.create({ subject: "B", description: "b" }))).toBe(
+      "task_store_corrupted",
+    );
+    expect(JSON.parse(storage.files.get("/x/tasks.json") ?? "null").tasks).toHaveLength(1);
+  });
+
   test("write failure does not advance in-memory revision or graph", async () => {
     const { manager, storage } = createTaskManager("/x/tasks.json");
     okOf(await manager.create({ subject: "A", description: "a" }));
@@ -230,5 +256,62 @@ describe("TaskManager", () => {
     );
     const manager = new TaskManager(storage, "/x/tasks.json");
     expect(errorCodeOf(await manager.load())).toBe("task_store_corrupted");
+  });
+
+  test("rejects non-canonical dependencies, task order and blocked terminal states", async () => {
+    const baseTask = {
+      subject: "A",
+      description: "a",
+      status: "pending",
+      blockedBy: [] as number[],
+      createdAt: "2026-09-14T09:00:00.000Z",
+      updatedAt: "2026-09-14T09:00:00.000Z",
+    };
+    for (const tasks of [
+      [
+        { ...baseTask, id: 2 },
+        { ...baseTask, id: 1 },
+      ],
+      [
+        { ...baseTask, id: 1 },
+        { ...baseTask, id: 2, blockedBy: [1, 1] },
+      ],
+      [
+        { ...baseTask, id: 1 },
+        { ...baseTask, id: 2, status: "completed", blockedBy: [1] },
+      ],
+    ]) {
+      const storage = new MemoryTaskStorage();
+      storage.files.set(
+        "/x/tasks.json",
+        JSON.stringify({ schemaVersion: 1, revision: 2, nextId: 3, tasks }),
+      );
+      expect(errorCodeOf(await new TaskManager(storage, "/x/tasks.json").load())).toBe(
+        "task_store_corrupted",
+      );
+    }
+  });
+
+  test("does not persist a graph when revision or nextId can no longer advance safely", async () => {
+    const storage = new MemoryTaskStorage();
+    storage.files.set(
+      "/x/tasks.json",
+      JSON.stringify({
+        schemaVersion: 1,
+        revision: Number.MAX_SAFE_INTEGER,
+        nextId: Number.MAX_SAFE_INTEGER,
+        tasks: [],
+      }),
+    );
+    const manager = new TaskManager(storage, "/x/tasks.json");
+    expect(errorCodeOf(await manager.create({ subject: "A", description: "a" }))).toBe(
+      "invalid_task",
+    );
+    expect(JSON.parse(storage.files.get("/x/tasks.json") ?? "null").tasks).toEqual([]);
+  });
+
+  test("rejects unsafe identities before constructing a task path", () => {
+    expect(() => tasksPath("/safe", "../../outside" as typeof SESSION_A, RUN_A)).toThrow();
+    expect(() => tasksPath("/safe", SESSION_A, "../../outside" as typeof RUN_A)).toThrow();
   });
 });

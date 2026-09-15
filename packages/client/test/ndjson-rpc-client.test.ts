@@ -150,6 +150,33 @@ describe("NDJSON RPC client", () => {
     await expect(pingCore(server.endpoint)).rejects.toThrow("core error -32603: Internal error");
   });
 
+  test("preserves a JSON-RPC application error code and safe data", async () => {
+    const server = await startMockServer((request, socket) => {
+      socket.end(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: {
+            code: -32011,
+            message: "session is busy",
+            data: { sessionId: "550e8400-e29b-41d4-a716-446655440000" },
+          },
+        })}\n`,
+      );
+    });
+
+    try {
+      await pingCore(server.endpoint);
+      throw new Error("expected an application error");
+    } catch (error) {
+      expect(error).toBeInstanceOf(RpcClientError);
+      expect(error).toMatchObject({
+        code: -32011,
+        data: { sessionId: "550e8400-e29b-41d4-a716-446655440000" },
+      });
+    }
+  });
+
   test("reports EOF before a response", async () => {
     const server = await startMockServer((_request, socket) => socket.end());
 

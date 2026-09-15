@@ -498,6 +498,7 @@ export class SessionManager {
     active?: ActiveExecution,
   ): PreparedSessionRun {
     const trace = active?.trace ?? this.#traces.get(sessionId, runId);
+    const traces = this.#traces;
     let requestIdentity:
       | { readonly connectionId: string; readonly requestId: string; readonly method: string }
       | undefined;
@@ -549,6 +550,7 @@ export class SessionManager {
           requestId,
           data: { status: sent ? "sent" : "connection_closed" },
         });
+        void traces.finishResponse(sessionId, runId);
       },
     };
   }
@@ -735,7 +737,7 @@ export class SessionManager {
       }
     }
     this.#busySessions.delete(execution.sessionId);
-    await this.#traces.stop(execution.sessionId, execution.runId);
+    await this.#traces.finishRun(execution.sessionId, execution.runId);
   }
 
   /** daemon 启动时逐 session 对齐 history、run event 与 session event。 */

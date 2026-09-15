@@ -9,6 +9,11 @@ export const JsonRpcErrorCode = {
   methodNotFound: -32601,
   invalidParams: -32602,
   internalError: -32603,
+  sessionNotFound: -32010,
+  sessionBusy: -32011,
+  sessionCorrupted: -32012,
+  contextLimitExceeded: -32013,
+  oneShotNotResumable: -32014,
 } as const;
 export type JsonRpcErrorCode = (typeof JsonRpcErrorCode)[keyof typeof JsonRpcErrorCode];
 
@@ -34,11 +39,40 @@ export function jsonRpcSuccessSchema<ResultSchema extends z.ZodType>(result: Res
 export const JsonRpcSuccessEnvelopeSchema = jsonRpcSuccessSchema(z.unknown());
 export type JsonRpcSuccessEnvelope = z.infer<typeof JsonRpcSuccessEnvelopeSchema>;
 
-export const JsonRpcErrorObjectSchema = z.strictObject({
-  code: z.number().int(),
-  message: z.string(),
-  data: z.unknown().optional(),
+/** session application error 只允许携带不含路径、prompt 的安全身份字段。 */
+export const JsonRpcSessionErrorDataSchema = z.strictObject({
+  sessionId: z.uuid().optional(),
+  turnId: z.uuid().optional(),
+  runId: z.uuid().optional(),
 });
+
+const sessionErrorCodes = new Set<number>([
+  JsonRpcErrorCode.sessionNotFound,
+  JsonRpcErrorCode.sessionBusy,
+  JsonRpcErrorCode.sessionCorrupted,
+  JsonRpcErrorCode.contextLimitExceeded,
+  JsonRpcErrorCode.oneShotNotResumable,
+]);
+
+export const JsonRpcErrorObjectSchema = z
+  .strictObject({
+    code: z.number().int(),
+    message: z.string(),
+    data: z.unknown().optional(),
+  })
+  .superRefine((error, ctx) => {
+    if (
+      sessionErrorCodes.has(error.code) &&
+      error.data !== undefined &&
+      !JsonRpcSessionErrorDataSchema.safeParse(error.data).success
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "session error data contains unsafe fields",
+        path: ["data"],
+      });
+    }
+  });
 export type JsonRpcErrorObject = z.infer<typeof JsonRpcErrorObjectSchema>;
 
 export const JsonRpcErrorResponseSchema = z.strictObject({

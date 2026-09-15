@@ -111,6 +111,14 @@ export class GoalEventReducer {
             `tool ${event.payload.name} ${event.payload.isError ? "error" : "done"} ${event.payload.outputBytes}B${event.payload.truncated ? " truncated" : ""}`,
           ],
         };
+      case "task.created":
+      case "task.updated":
+        // 任务事件只作为进度展示，不进入 assistant 输出流。
+        return {
+          stderr: [
+            `task #${event.payload.task.id} ${event.payload.task.status} ${event.payload.task.subject}`,
+          ],
+        };
       case "run.finished": {
         this.#outcome = {
           status: event.payload.status,

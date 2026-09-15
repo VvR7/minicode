@@ -20,6 +20,7 @@ import {
   EventPushNotificationSchema,
   EventSubscribeResultSchema,
   EventUnsubscribeResultSchema,
+  isAgentEvent,
 } from "../../packages/protocol/src/index.ts";
 
 const sessionId = "550e8400-e29b-41d4-a716-446655440000";
@@ -83,13 +84,17 @@ describe("typed IPC event stream", () => {
       );
       unsubscribe = connection.onNotification((notification) => {
         const parsed = EventPushNotificationSchema.safeParse(notification);
-        if (parsed.success) {
+        if (parsed.success && isAgentEvent(parsed.data.params.event)) {
           eventReceived.resolve(parsed.data);
         }
       });
       const notification = await eventReceived.promise;
 
       expect(response.result).toEqual({ status: "accepted", sessionId, runId, subscriptionId });
+      expect(isAgentEvent(notification.params.event)).toBe(true);
+      if (!isAgentEvent(notification.params.event)) {
+        throw new Error("expected an agent event");
+      }
       expect(notification.params.event.type).toBe("run.started");
       expect(notification.params.event.sequence).toBe(1);
     } finally {

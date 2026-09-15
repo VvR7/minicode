@@ -119,7 +119,7 @@ describe("IpcEventBroadcaster", () => {
     for (let index = 0; index <= MAX_SUBSCRIBER_QUEUE_EVENTS + 1; index += 1) {
       await bus.publish({
         ...startedInput(),
-        durable: false,
+        durable: true,
         type: "llm.text_delta",
         payload: { text: `${index}` },
       });

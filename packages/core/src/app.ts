@@ -116,7 +116,8 @@ export class CoreApp {
     const traceService = this.#traceService;
     this.#server = undefined;
 
-    // 先取消 active runs，让它们发布 run.finished(cancelled) 后再优雅关闭连接。
+    // 先关闭 admission，再取消快照内全部 run，最后排空连接，避免 shutdown 插入新 run。
+    server.beginShutdown();
     await manager?.shutdown();
     await server.stop();
     await traceService?.shutdown();

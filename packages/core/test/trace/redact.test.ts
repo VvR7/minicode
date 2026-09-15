@@ -168,6 +168,11 @@ describe("summarize", () => {
     const output = summarize({ messages: ["SECRET"], tools: "SECRET", usage: "SECRET" });
     expect(JSON.stringify(output)).not.toContain("SECRET");
   });
+
+  test("only keeps scalar values for safe summary fields", () => {
+    const output = summarize({ model: { hidden: "SECRET" }, status: ["SECRET"] });
+    expect(JSON.stringify(output)).not.toContain("SECRET");
+  });
 });
 
 describe("truncateFields", () => {

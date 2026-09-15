@@ -287,6 +287,7 @@ export class AgentLoop {
         data: {
           errorCategory: error instanceof LlmError ? error.code : "unknown",
           reason: signal.aborted ? "aborted" : "provider_error",
+          safeMessage: signal.aborted ? "LLM request cancelled" : "LLM provider request failed",
         },
       });
       throw error;

@@ -266,7 +266,7 @@ export class NdjsonRpcServer {
   /** 开始监听并注册各类 socket 回调；返回实际绑定的地址（端口为 0 时尤其有用）。 */
   start(): CoreEndpoint {
     // 同一个实例只能有一个监听器，重复启动是编程错误。
-    if (this.#listener !== undefined) {
+    if (this.#listener !== undefined || this.#stopping) {
       throw new Error("server already started");
     }
 
@@ -324,15 +324,11 @@ export class NdjsonRpcServer {
   /** 停止接收新连接，等待已入队请求完成，并在宽限期结束后强制关闭残留连接。 */
   async stop(graceMs = DEFAULT_SHUTDOWN_GRACE_MS): Promise<void> {
     // 未启动或已经停止时没有资源需要释放。
-    if (this.#listener === undefined) {
+    if (this.#listener === undefined && !this.#stopping) {
       return;
     }
 
-    this.#stopping = true;
-    // false 表示停止监听新连接，但先不强制关闭已有连接。
-    this.#listener.stop(false);
-    // 清空引用，令之后的 start() 可重新创建监听器。
-    this.#listener = undefined;
+    this.beginShutdown();
 
     // 复制集合，避免 socket.close 回调在遍历时修改原集合。
     const sockets = [...this.#activeSockets];
@@ -362,6 +358,18 @@ export class NdjsonRpcServer {
     }
     // stop() 完成，允许实例未来再次启动。
     this.#stopping = false;
+  }
+
+  /** 第一阶段关闭：立即停止 admission，但保留已有连接供 active run 发布终态。 */
+  beginShutdown(): void {
+    if (this.#stopping) return;
+    this.#stopping = true;
+    // false 表示停止监听新连接，但先不强制关闭已有连接。
+    this.#listener?.stop(false);
+    this.#listener = undefined;
+    for (const socket of this.#activeSockets) {
+      socket.data.acceptingInput = false;
+    }
   }
 
   /** 接收 TCP 字节流、切分 LF 结尾的帧，并将完整帧放入该连接的处理队列。 */

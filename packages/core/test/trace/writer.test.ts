@@ -190,6 +190,35 @@ describe("TraceWriter", () => {
     }
   });
 
+  test("consumes a late close rejection after shutdown aborts I/O", async () => {
+    const storage = new MemoryTraceStorage();
+    storage.writeGate = new Promise<void>(() => {});
+    storage.closeError = new Error("late close failure");
+    const writer = new TraceWriter(
+      SESSION_A,
+      RUN_B,
+      { ...fullConfig, shutdownMs: 10 },
+      storage,
+      "/run",
+    );
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      writer.start();
+      writer.enqueue(makeTraceRecord(0, {}, RUN_B));
+      const report = await writer.stop();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(report.timedOut).toBe(true);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   test("restores file bytes and sequence before appending", async () => {
     const storage = new MemoryTraceStorage();
     const path = "/run/trace.jsonl";

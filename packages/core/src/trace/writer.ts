@@ -184,6 +184,8 @@ export class TraceWriter {
   /** 让 worker 可在 shutdown 时退出，即使底层 Promise 永久不完成。 */
   #raceIo<Value>(operation: Promise<Value>): Promise<Value> {
     const signal = this.#abortController.signal;
+    // 即使 signal 已 abort、竞速分支不再等待，也必须消费底层拒绝。
+    void operation.catch(() => {});
     if (signal.aborted) return Promise.reject(new Error("trace writer stopped"));
     return new Promise<Value>((resolve, reject) => {
       const onAbort = (): void => reject(new Error("trace writer stopped"));

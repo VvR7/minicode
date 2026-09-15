@@ -30,6 +30,7 @@ export class MemoryTraceStorage implements TraceStorage {
   writeDelayMs = 0;
   openError: Error | null = null;
   writeError: Error | null = null;
+  closeError: Error | null = null;
 
   async ensureDirectory(path: string, signal: AbortSignal): Promise<void> {
     signal.throwIfAborted();
@@ -62,7 +63,11 @@ export class MemoryTraceStorage implements TraceStorage {
         }
         storage.files.set(path, `${storage.files.get(path) ?? ""}${text}`);
       },
-      async close() {},
+      async close() {
+        if (storage.closeError !== null) {
+          throw storage.closeError;
+        }
+      },
     };
   }
 

@@ -39,6 +39,7 @@ const SUMMARY_SAFE_KEYS = new Set<string>([
   "finishreason",
   "errorcode",
   "errorcategory",
+  "safemessage",
   "step",
   "attempt",
   "maxattempts",
@@ -129,7 +130,10 @@ export function summarize(value: unknown): unknown {
           ? summarize(item)
           : "[summarized]";
     } else if (SUMMARY_SAFE_KEYS.has(normalized)) {
-      result[key] = item;
+      result[key] =
+        item === null || ["string", "number", "boolean"].includes(typeof item)
+          ? item
+          : "[summarized]";
     } else {
       result[key] = "[summarized]";
     }

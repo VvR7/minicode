@@ -646,7 +646,7 @@ describe("SessionManager multi-turn context and terminal ownership", () => {
     expect(journal.events.filter((event) => event.type === "run.finished")).toHaveLength(1);
   });
 
-  test("makes activation a no-op after shutdown force-commits an unstarted run", async () => {
+  test("accepts a response-gate release during shutdown and ignores later activation", async () => {
     const order: string[] = [];
     const runner = new StubRunner(async (request) => completionFor(request));
     const harness = createHarness(runner, { order, shutdownTimeoutMs: 10 });
@@ -659,9 +659,10 @@ describe("SessionManager multi-turn context and terminal ownership", () => {
       }),
     );
 
-    await harness.manager.shutdown();
+    const shuttingDown = harness.manager.shutdown();
     prepared.activate();
-    await Bun.sleep(0);
+    await shuttingDown;
+    prepared.activate();
 
     expect(runner.requests).toHaveLength(0);
     expect(order).toEqual(["session.turn_accepted", "run.finished", "session.turn_finished"]);
@@ -681,6 +682,8 @@ describe("SessionManager multi-turn context and terminal ownership", () => {
     const shuttingDown = harness.manager.shutdown();
     storage.metaWriteGate.resolve();
     const prepared = unwrapResult(await preparing);
+    // 模拟 Core 关闭 transport 时，响应已入队或连接 closed 对闸门的释放。
+    prepared.activate();
     await shuttingDown;
     expect(harness.manager.activeCount).toBe(0);
     expect(runner.requests).toHaveLength(0);

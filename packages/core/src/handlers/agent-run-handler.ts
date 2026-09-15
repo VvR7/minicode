@@ -1,5 +1,5 @@
 import type { AgentRunResult } from "@minicode/protocol";
-import { AGENT_RUN_METHOD, AgentRunParamsSchema } from "@minicode/protocol";
+import { AGENT_RUN_METHOD, AgentRunParamsSchema, JsonRpcErrorCode } from "@minicode/protocol";
 import type { IpcEventBroadcaster } from "../events/ipc-event-broadcaster.ts";
 import type { RpcInvocationContext } from "../rpc-context.ts";
 import type { SessionManager } from "../session/manager.ts";
@@ -44,9 +44,23 @@ export class AgentRunHandler extends RpcMethodHandler {
 
     const subscribed = await this.#broadcaster.subscribe(context.connection, sessionId, runId, 0);
     if (!subscribed.ok) {
-      // accepted 已持久化后即使原连接无法订阅，run 也必须继续并供其他客户端恢复。
-      prepared.value.activate();
-      throw new Error(subscribed.error.code);
+      const requestId = String(context.requestId ?? "unknown");
+      prepared.value.recordRequest(
+        context.connection.id,
+        requestId,
+        context.method ?? AGENT_RUN_METHOD,
+        params.data,
+      );
+      // accepted 已持久化；错误响应入队或连接关闭后再运行，保持 response-before-event。
+      void context.connection.closed.then(() => prepared.value.activate());
+      return {
+        kind: "error",
+        code: JsonRpcErrorCode.internalError,
+        message: "Internal error",
+        afterResponseEnqueued: prepared.value.activate,
+        afterResponseSent: (sent) =>
+          prepared.value.recordResponseSent(context.connection.id, requestId, sent),
+      };
     }
 
     try {

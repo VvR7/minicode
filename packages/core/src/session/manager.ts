@@ -337,9 +337,9 @@ export class SessionManager {
       : "not_found";
   }
 
-  /** 拒绝新消息，取消并等待所有 active run 完成确定的 terminal commit。 */
+  /** 在调用方排空响应闸门后，取消并等待所有 active run 完成确定的 terminal commit。 */
   async shutdown(): Promise<void> {
-    this.#stopping = true;
+    this.beginShutdown();
     await this.#ready;
     // accepted 临界区只含本地持久化；先排空它，保证后续 active 快照不会漏 run。
     await Promise.allSettled([...this.#admissions]);
@@ -354,6 +354,14 @@ export class SessionManager {
     await this.#waitBounded(unfinished.map((execution) => this.#forceShutdownCommit(execution)));
     await this.#waitBounded([...this.#terminalCommits]);
     await this.#traces.stopAll();
+  }
+
+  /** 同步封闭新 admission 并取消当前执行；供 Core 在关闭连接前启动两阶段停机。 */
+  beginShutdown(): void {
+    this.#stopping = true;
+    for (const execution of this.#active.values()) {
+      execution.controller.abort();
+    }
   }
 
   /** 当前尚未释放 session 执行权的 run 数量。 */
@@ -637,7 +645,7 @@ export class SessionManager {
     return commit;
   }
 
-  /** shutdown 超时后补齐未激活 run 的 session 生命周期，再提交唯一 cancelled 终态。 */
+  /** transport 已关闭且 shutdown 超时后，补齐未激活 run 的生命周期并提交唯一终态。 */
   async #forceShutdownCommit(execution: ActiveExecution): Promise<void> {
     const wasActivated = execution.activated;
     // 抢占尚未释放响应闸门的执行权，防止强制收尾与迟到 activate 重复发布 accepted。

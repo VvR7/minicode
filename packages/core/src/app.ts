@@ -117,9 +117,10 @@ export class CoreApp {
     const manager = this.#manager;
     this.#server = undefined;
 
-    // 先取消 active runs，让它们发布 run.finished(cancelled) 后再优雅关闭连接。
-    await manager?.shutdown();
+    // 先封闭 admission/发出取消，再排空 RPC 响应闸门，最后才允许强制终态提交。
+    manager?.beginShutdown();
     await server.stop();
+    await manager?.shutdown();
 
     this.#broadcaster?.close();
     this.#sessionBroadcaster?.close();

@@ -2,6 +2,7 @@ export { loadTraceConfig } from "./config.ts";
 export type { TraceConfigResult } from "./config.ts";
 export { TraceRecorder, runTraceDirectory } from "./recorder.ts";
 export type { TraceRecordArgs } from "./recorder.ts";
+export { RunTraceRegistry } from "./registry.ts";
 export { REDACTED, isCredentialKey, redact, summarize, truncateFields } from "./redact.ts";
 export { nodeTraceStorage } from "./storage.ts";
 export { TraceService } from "./service.ts";

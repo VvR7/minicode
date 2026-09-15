@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,16 +13,28 @@ import {
   isAgentEvent,
 } from "../../packages/protocol/src/index.ts";
 import type { AgentEvent } from "../../packages/protocol/src/index.ts";
-import { CoreApp, EventBus, EventStore } from "../../packages/core/src/index.ts";
+import {
+  CoreApp,
+  EventBus,
+  EventStore,
+  RunMetadataStore,
+  SessionStore,
+} from "../../packages/core/src/index.ts";
 import { NdjsonRpcConnection } from "../../packages/client/src/index.ts";
 
 const SESSION_A = "550e8400-e29b-41d4-a716-446655440020";
 const RUN_A = "6ba7b810-9dad-41d1-80b4-00c04fd43020";
+const TURN_A = "6ba7b820-9dad-41d1-80b4-00c04fd43020";
+const CLIENT_MESSAGE_A = "6ba7b830-9dad-41d1-80b4-00c04fd43020";
 
 function makeApp(homeDirectory: string): CoreApp {
   return new CoreApp(
     { host: "127.0.0.1", port: 0, logLevel: "error", homeDirectory },
-    {}, // 不含 LLM 配置，run 会以 config_error 结束。
+    {
+      // context budget 配置合法，但不含 provider 凭证，因此 run 会以 config_error 结束。
+      LLM_CONTEXT_WINDOW_TOKENS: "100000",
+      LLM_MAX_OUTPUT_TOKENS: "4096",
+    },
   );
 }
 
@@ -63,11 +75,13 @@ describe("agent.run lifecycle (integration)", () => {
 
       expect(response.result.status).toBe("accepted");
 
-      // accepted 返回时 journal 已包含 run.started，daemon 随即崩溃也可由 startup 收尾。
-      const journal = await new EventStore(home).read(
-        response.result.sessionId,
-        response.result.runId,
-      );
+      // accepted 响应严格先返回；随后 run.started 进入 durable journal 并支持恢复。
+      const eventStore = new EventStore(home);
+      await waitFor(async () => {
+        const current = await eventStore.read(response.result.sessionId, response.result.runId);
+        return current.ok && current.value.events.some((event) => event.type === "run.started");
+      });
+      const journal = await eventStore.read(response.result.sessionId, response.result.runId);
       expect(journal.ok).toBe(true);
       if (journal.ok) {
         expect(journal.value.events[0]?.type).toBe("run.started");
@@ -76,6 +90,42 @@ describe("agent.run lifecycle (integration)", () => {
       await waitFor(() => order.includes("event:run.finished"));
       // response 严格早于首个事件。
       expect(order[0]).toBe("response");
+
+      const sessions = new SessionStore(home);
+      const oneShot = await sessions.load(response.result.sessionId);
+      expect(oneShot.ok).toBe(true);
+      if (oneShot.ok) {
+        expect(oneShot.value.meta).toMatchObject({
+          mode: "one_shot",
+          workspaceRoot: "/workspace",
+        });
+      }
+      const hidden = await sessions.list({});
+      expect(hidden.ok && hidden.value.sessions).toHaveLength(0);
+      const auditable = await sessions.list({ includeOneShot: true });
+      expect(auditable.ok && auditable.value.sessions[0]?.sessionId).toBe(
+        response.result.sessionId,
+      );
+      const runMetadata = JSON.parse(
+        await readFile(
+          join(
+            home,
+            "sessions",
+            response.result.sessionId,
+            "runs",
+            response.result.runId,
+            "run.json",
+          ),
+          "utf8",
+        ),
+      ) as Record<string, unknown>;
+      expect(runMetadata).toMatchObject({
+        sessionId: response.result.sessionId,
+        runId: response.result.runId,
+        workspaceRoot: "/workspace",
+        status: "failed",
+        reason: "config_error",
+      });
 
       // 缺 LLM 配置不杀 daemon：还能响应 ping。
       const pong = await connection.request(
@@ -193,11 +243,28 @@ describe("agent.run lifecycle (integration)", () => {
   test("startup marks an incomplete journal as core_restarted", async () => {
     const home = await mkdtemp(join(tmpdir(), "minicode-run-"));
     try {
-      // 先写一个未完成的 journal（只有 run.started）。
+      // 先写一个合法 session 的 accepted history 与未完成 run journal。
+      const sessions = new SessionStore(home);
+      const session = await sessions.create({ workspaceRoot: "/workspace", mode: "chat" });
+      expect(session.ok).toBe(true);
+      if (!session.ok) return;
+      await sessions.appendAccepted(session.value.meta.sessionId, {
+        turnId: TURN_A,
+        runId: RUN_A,
+        clientMessageId: CLIENT_MESSAGE_A,
+        userMessage: "unfinished",
+      });
+      await new RunMetadataStore(home).create({
+        sessionId: session.value.meta.sessionId,
+        turnId: TURN_A,
+        runId: RUN_A,
+        workspaceRoot: "/workspace",
+        model: "",
+      });
       const store = new EventStore(home);
       const bus = new EventBus(store);
       await bus.publish({
-        sessionId: SESSION_A,
+        sessionId: session.value.meta.sessionId,
         runId: RUN_A,
         timestamp: new Date().toISOString(),
         durable: true,
@@ -210,10 +277,10 @@ describe("agent.run lifecycle (integration)", () => {
 
       try {
         await waitFor(async () => {
-          const read = await store.read(SESSION_A, RUN_A);
+          const read = await store.read(session.value.meta.sessionId, RUN_A);
           return read.ok && read.value.finished;
         });
-        const read = await store.read(SESSION_A, RUN_A);
+        const read = await store.read(session.value.meta.sessionId, RUN_A);
         expect(read.ok).toBe(true);
         if (!read.ok) return;
         const finished = read.value.events.find((e) => e.type === "run.finished");

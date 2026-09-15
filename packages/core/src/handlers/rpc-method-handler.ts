@@ -1,4 +1,5 @@
 import type { z } from "zod";
+import type { JsonRpcErrorCode } from "@minicode/protocol";
 import type { RpcInvocationContext } from "../rpc-context.ts";
 
 /** 调用方法 handler 后的结果：要么参数合法并得到业务结果，要么参数不合法。 */
@@ -9,7 +10,15 @@ export type RpcMethodInvocation =
       readonly afterResponseEnqueued?: () => void;
       readonly afterResponseSent?: (sent: boolean) => void;
     }
-  | { readonly kind: "invalid-params" };
+  | { readonly kind: "invalid-params" }
+  | {
+      readonly kind: "error";
+      readonly code: JsonRpcErrorCode;
+      readonly message: string;
+      readonly data?: unknown;
+      readonly afterResponseEnqueued?: () => void;
+      readonly afterResponseSent?: (sent: boolean) => void;
+    };
 
 /**
  * dispatcher 依赖的最小方法契约。

@@ -27,7 +27,7 @@ export interface TaskToolDependencies {
   readonly runId: RunId;
 }
 
-/** 在任务成功提交后发布 task.created/task.updated；发布失败不影响任务状态。 */
+/** 在任务成功提交后发布 task.created/task.updated；失败由 TaskManager 补偿任务图。 */
 async function publishTaskEvent(
   deps: TaskToolDependencies,
   type: "task.created" | "task.updated",
@@ -47,14 +47,14 @@ async function publishTaskEvent(
   }
 }
 
-const TaskCreateParamsSchema = z.strictObject({
+export const TaskCreateParamsSchema = z.strictObject({
   subject: z.string().min(1).max(120),
   description: z.string().min(1).max(4000),
   blockedBy: z.array(z.number().int().positive()).optional(),
 });
 type TaskCreateParams = z.infer<typeof TaskCreateParamsSchema>;
 
-const TaskUpdateParamsSchema = z
+export const TaskUpdateParamsSchema = z
   .strictObject({
     id: z.number().int().positive(),
     subject: z.string().min(1).max(120).optional(),
@@ -72,12 +72,12 @@ const TaskUpdateParamsSchema = z
   );
 type TaskUpdateParams = z.infer<typeof TaskUpdateParamsSchema>;
 
-const TaskListParamsSchema = z.strictObject({
+export const TaskListParamsSchema = z.strictObject({
   status: TaskStatusSchema.optional(),
 });
 type TaskListParams = z.infer<typeof TaskListParamsSchema>;
 
-const TaskGetParamsSchema = z.strictObject({
+export const TaskGetParamsSchema = z.strictObject({
   id: z.number().int().positive(),
 });
 type TaskGetParams = z.infer<typeof TaskGetParamsSchema>;

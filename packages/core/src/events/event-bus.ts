@@ -35,7 +35,7 @@ export interface EventBusOptions {
   readonly maxQueueEvents?: number;
   readonly maxQueueBytes?: number;
   readonly closeGraceMs?: number;
-  /** EventStore 成功后调用的 best-effort observer。 */
+  /** durable event 或 watermark 成功写入后的 best-effort observer。 */
   readonly onPersisted?: (event: AgentEvent) => void;
 }
 
@@ -81,7 +81,7 @@ class BufferedEventSubscription implements EventSubscription {
     handler: AgentEventHandler,
     onClosed: (subscription: BufferedEventSubscription) => void,
     active: boolean,
-    options: Required<Omit<EventBusOptions, "onPersisted">>,
+    options: Required<Pick<EventBusOptions, "maxQueueEvents" | "maxQueueBytes" | "closeGraceMs">>,
   ) {
     this.id = id;
     this.sessionId = sessionId;
@@ -199,7 +199,9 @@ class BufferedEventSubscription implements EventSubscription {
 export class EventBus {
   readonly #store: EventStore;
   readonly #runs = new Map<string, RunState>();
-  readonly #options: Required<Omit<EventBusOptions, "onPersisted">>;
+  readonly #options: Required<
+    Pick<EventBusOptions, "maxQueueEvents" | "maxQueueBytes" | "closeGraceMs">
+  >;
   readonly #onPersisted: ((event: AgentEvent) => void) | undefined;
 
   constructor(store: EventStore, options: EventBusOptions = {}) {
@@ -239,13 +241,13 @@ export class EventBus {
       if (!persisted.ok) {
         return this.#storeFailure(persisted.error);
       }
+
+      state.nextSequence = event.sequence + 1;
       try {
         this.#onPersisted?.(event);
       } catch {
-        // Trace 等 observer 失败不得改变 EventStore 或 run outcome。
+        // Trace/observer 失败不能改变已经持久化的领域事件。
       }
-
-      state.nextSequence = event.sequence + 1;
       for (const subscription of [...state.subscriptions]) {
         subscription.enqueue(event);
       }

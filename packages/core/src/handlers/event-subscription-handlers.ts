@@ -6,6 +6,7 @@ import {
   EventUnsubscribeParamsSchema,
 } from "@minicode/protocol";
 import type { IpcEventBroadcaster } from "../events/ipc-event-broadcaster.ts";
+import type { IpcSessionBroadcaster } from "../events/ipc-session-broadcaster.ts";
 import type { RpcInvocationContext } from "../rpc-context.ts";
 import { RpcMethodHandler, TypedRpcMethodHandler } from "./rpc-method-handler.ts";
 
@@ -48,16 +49,25 @@ export class EventUnsubscribeHandler extends TypedRpcMethodHandler<
   readonly method = EVENT_UNSUBSCRIBE_METHOD;
   readonly paramsSchema = EventUnsubscribeParamsSchema;
   readonly #broadcaster: IpcEventBroadcaster;
+  readonly #sessionBroadcaster: IpcSessionBroadcaster | undefined;
 
-  constructor(broadcaster: IpcEventBroadcaster) {
+  constructor(broadcaster: IpcEventBroadcaster, sessionBroadcaster?: IpcSessionBroadcaster) {
     super();
     this.#broadcaster = broadcaster;
+    this.#sessionBroadcaster = sessionBroadcaster;
   }
 
   protected handle(
     params: EventUnsubscribeParams,
     context: RpcInvocationContext,
   ): EventUnsubscribeResult {
+    const session = this.#sessionBroadcaster?.unsubscribe(
+      context.connection,
+      params.subscriptionId,
+    );
+    if (session?.removed) {
+      return session;
+    }
     return this.#broadcaster.unsubscribe(context.connection, params.subscriptionId);
   }
 }

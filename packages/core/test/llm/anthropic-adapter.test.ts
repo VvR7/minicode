@@ -92,6 +92,16 @@ describe("request construction", () => {
     expect(body.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hello" }] }]);
   });
 
+  test("uses the configured maximum output token count", async () => {
+    const capture: Capture = {};
+    const adapter = new AnthropicAdapter(
+      { ...config, maxOutputTokens: 2048 },
+      captureFetch(capture, sseResponse(anthropicSseEvents({ text: "ok" }))),
+    );
+    await collect(adapter.stream([userMessage]));
+    expect(requestBody(capture.init).max_tokens).toBe(2048);
+  });
+
   test("tolerates a trailing slash and non-root base URL path", async () => {
     const capture: Capture = {};
     const adapter = new AnthropicAdapter(

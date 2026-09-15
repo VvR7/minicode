@@ -7,21 +7,21 @@ export interface RunExecutor {
     request: AgentRunRequest,
     signal: AbortSignal,
     onStarted?: () => Promise<void>,
-  ): Promise<void>;
+  ): Promise<unknown>;
 }
 
 interface ActiveRun {
   readonly activate: () => void;
   readonly controller: AbortController;
-  readonly promise: Promise<void>;
+  readonly promise: Promise<unknown>;
   readonly sessionId: SessionId;
   readonly runId: RunId;
 }
 
 /**
  * 管理全部 active run 的生命周期：生成标识、启动后台 task、
- * 幂等取消与 shutdown 时的统一取消。任何 run 的失败都已由
- * AgentRunner 收敛为 run.finished，这里只负责资源回收。
+ * 幂等取消与 shutdown 时的统一取消。该兼容类只负责执行器资源回收；
+ * Core 的持久会话与终态提交统一由 SessionManager 管理。
  */
 export class RunManager {
   readonly #runner: RunExecutor;

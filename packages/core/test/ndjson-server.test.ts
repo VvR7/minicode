@@ -274,6 +274,24 @@ describe("NDJSON RPC server", () => {
     expect(() => second.start()).toThrow();
   });
 
+  test("rejects restart until an in-flight stop has fully closed connections", async () => {
+    const { server, endpoint } = startServer();
+    const socket = createConnection({ host: endpoint.host, port: endpoint.port });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+
+    const stopping = server.stop(100);
+    expect(server.stop(100)).toBe(stopping);
+    expect(() => server.start()).toThrow("server already started");
+    await stopping;
+
+    const restarted = server.start();
+    expect(restarted.port).toBeGreaterThan(0);
+    socket.destroy();
+  });
+
   test("bounded shutdown closes an idle active connection", async () => {
     const { server, endpoint } = startServer();
     const socket = createConnection({ host: endpoint.host, port: endpoint.port });

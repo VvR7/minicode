@@ -8,6 +8,14 @@ export {
   SessionStore,
 } from "./session-store.ts";
 export { NoteStore, parseSessionNotes, SessionNoteRecordSchema } from "./notes.ts";
+export { SessionManager } from "./manager.ts";
+export type {
+  PreparedSessionRun,
+  SessionManagerFailure,
+  SessionManagerFailureCode,
+  SessionManagerOptions,
+  SessionManagerResult,
+} from "./manager.ts";
 export type { NoteIdentity, SessionNoteRecord } from "./notes.ts";
 export { nodeSessionStorage } from "./storage.ts";
 export type { SessionStorage } from "./storage.ts";
@@ -46,6 +54,7 @@ export type {
   CreateSessionOptions,
   HistoryRecord,
   PendingInterruption,
+  PersistedRunResult,
   SessionListOptions,
   SessionListPage,
   SessionMeta,

@@ -7,6 +7,8 @@ export const LlmConfigSchema = z.strictObject({
   apiKey: z.string().min(1),
   baseUrl: z.string().url(),
   model: z.string().min(1).max(256),
+  /** 单次 provider 输出上限；省略时 adapter 使用兼容默认值。 */
+  maxOutputTokens: z.number().int().positive().optional(),
 });
 export type LlmConfig = z.infer<typeof LlmConfigSchema>;
 
@@ -36,6 +38,9 @@ export function loadLlmConfig(environment: Environment): LlmConfigResult {
     apiKey: environment[ENV_KEYS[0]],
     baseUrl: environment[ENV_KEYS[1]],
     model: environment[ENV_KEYS[2]],
+    ...(environment.LLM_MAX_OUTPUT_TOKENS === undefined || environment.LLM_MAX_OUTPUT_TOKENS === ""
+      ? {}
+      : { maxOutputTokens: Number(environment.LLM_MAX_OUTPUT_TOKENS) }),
   });
   if (!parsed.success) {
     return {

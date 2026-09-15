@@ -27,6 +27,28 @@ describe("loadLlmConfig", () => {
     });
   });
 
+  test("passes a configured output-token limit to the provider config", () => {
+    const result = loadLlmConfig(
+      env({
+        LLM_API_KEY: "key",
+        LLM_BASE_URL: "https://api.anthropic.com",
+        LLM_MODEL: "model",
+        LLM_MAX_OUTPUT_TOKENS: "2048",
+      }),
+    );
+    expect(result).toMatchObject({ ok: true, value: { maxOutputTokens: 2048 } });
+    expect(
+      loadLlmConfig(
+        env({
+          LLM_API_KEY: "key",
+          LLM_BASE_URL: "https://api.anthropic.com",
+          LLM_MODEL: "model",
+          LLM_MAX_OUTPUT_TOKENS: "invalid",
+        }),
+      ).ok,
+    ).toBe(false);
+  });
+
   test("returns config_error listing missing keys", () => {
     const result = loadLlmConfig(env({ LLM_API_KEY: "key" }));
     expect(result.ok).toBe(false);

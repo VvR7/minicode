@@ -18,6 +18,7 @@ import {
   HistoryMessageSchema,
   HistoryTurnReasonSchema,
   MAX_SESSION_MESSAGE_CHARS,
+  RunFinishedPayloadSchema,
   RunIdSchema,
   SessionEventSchema,
   SessionIdSchema,
@@ -78,8 +79,11 @@ export const TurnCompletedRecordSchema = z
     reason: HistoryTurnReasonSchema.optional(),
     messages: z.array(HistoryMessageSchema).min(1),
     includedInContext: z.boolean(),
-    model: z.string().min(1).max(256),
+    // config_error 可能发生在选定模型之前，此时允许空字符串作为“未选择”审计值。
+    model: z.string().max(256),
     taskGraph: TaskGraphSnapshotSchema.optional(),
+    /** run.finished 写失败时用于按原 outcome 精确补偿的私有快照。 */
+    runResult: RunFinishedPayloadSchema.optional(),
   })
   .superRefine((record, ctx) => {
     for (const [index, message] of record.messages.entries()) {
@@ -106,8 +110,20 @@ export const TurnCompletedRecordSchema = z
         path: ["includedInContext"],
       });
     }
+    if (record.runResult !== undefined) {
+      const resultStatus =
+        record.runResult.reason === "core_restarted" ? "interrupted" : record.runResult.status;
+      if (resultStatus !== record.status || record.runResult.reason !== record.reason) {
+        ctx.addIssue({
+          code: "custom",
+          message: "persisted run result must match the history outcome",
+          path: ["runResult"],
+        });
+      }
+    }
   });
 export type TurnCompletedRecord = z.infer<typeof TurnCompletedRecordSchema>;
+export type PersistedRunResult = NonNullable<TurnCompletedRecord["runResult"]>;
 
 export const HistoryRecordSchema = z.discriminatedUnion("kind", [
   TurnAcceptedRecordSchema,
@@ -144,6 +160,8 @@ export interface SessionSnapshot {
   /** 以合法 journal 为准计算的展示更新时间。 */
   readonly updatedAt: string;
   readonly turns: readonly HistoryTurn[];
+  /** 已完成 run 的原始终态载荷，不通过 session.getHistory 暴露。 */
+  readonly runResults: Readonly<Record<string, PersistedRunResult>>;
   readonly pendingInterruptions: readonly PendingInterruption[];
   /** 完整 session journal，供订阅回放与恢复使用。 */
   readonly sessionEvents: readonly SessionEvent[];
@@ -217,6 +235,7 @@ export interface CompleteTurnInput {
   readonly messages: readonly HistoryMessage[];
   readonly model: string;
   readonly taskGraph?: TaskGraphSnapshot;
+  readonly runResult?: PersistedRunResult;
 }
 
 export {

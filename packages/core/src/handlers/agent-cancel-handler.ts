@@ -1,6 +1,6 @@
 import type { AgentCancelParams, AgentCancelResult } from "@minicode/protocol";
 import { AGENT_CANCEL_METHOD, AgentCancelParamsSchema } from "@minicode/protocol";
-import type { RunManager } from "../run/manager.ts";
+import type { SessionManager } from "../session/manager.ts";
 import { TypedRpcMethodHandler } from "./rpc-method-handler.ts";
 
 /** agent.cancel：幂等取消一个 run。 */
@@ -10,14 +10,14 @@ export class AgentCancelHandler extends TypedRpcMethodHandler<
 > {
   readonly method = AGENT_CANCEL_METHOD;
   readonly paramsSchema = AgentCancelParamsSchema;
-  readonly #manager: RunManager;
+  readonly #manager: SessionManager;
 
-  constructor(manager: RunManager) {
+  constructor(manager: SessionManager) {
     super();
     this.#manager = manager;
   }
 
-  protected handle(params: AgentCancelParams): AgentCancelResult {
-    return { outcome: this.#manager.cancel(params.sessionId, params.runId) };
+  protected async handle(params: AgentCancelParams): Promise<AgentCancelResult> {
+    return { outcome: await this.#manager.cancel(params.sessionId, params.runId) };
   }
 }

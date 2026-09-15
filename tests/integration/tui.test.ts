@@ -46,6 +46,8 @@ interface CoreEnv {
   LLM_API_KEY: string;
   LLM_BASE_URL: string;
   LLM_MODEL: string;
+  LLM_CONTEXT_WINDOW_TOKENS: string;
+  LLM_MAX_OUTPUT_TOKENS: string;
   [name: string]: string | undefined;
 }
 
@@ -59,6 +61,8 @@ function spawnCore(port: number, homeDirectory: string, llmBaseUrl?: string): Su
     LLM_API_KEY: "",
     LLM_BASE_URL: "",
     LLM_MODEL: "",
+    LLM_CONTEXT_WINDOW_TOKENS: "100000",
+    LLM_MAX_OUTPUT_TOKENS: "4096",
   };
   if (llmBaseUrl !== undefined) {
     env.LLM_API_KEY = "test-key";

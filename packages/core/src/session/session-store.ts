@@ -26,6 +26,7 @@ import {
   type CompleteTurnInput,
   type CreateSessionOptions,
   type HistoryRecord,
+  MAX_NOTES_BYTES,
   type PendingInterruption,
   type SessionListOptions,
   type SessionListPage,
@@ -120,20 +121,15 @@ export function deriveTitle(userMessage: string): string {
 
 /** 取两个 ISO 时间戳中较晚的一个。 */
 function latestTimestamp(left: string, right: string): string {
-  return Date.parse(left) >= Date.parse(right) ? left : right;
+  return left >= right ? left : right;
 }
 
 /** 校验 tool_use 与 tool_result 是否按 ID 完整配对（含尾部未配对检测）。 */
 function hasCompleteToolPairing(messages: readonly HistoryTurn["messages"][number][]): boolean {
   const pending = new Set<string>();
-  const seenToolUses = new Set<string>();
   for (const message of messages) {
     for (const block of message.content) {
       if (block.type === "tool_use") {
-        if (seenToolUses.has(block.id)) {
-          return false;
-        }
-        seenToolUses.add(block.id);
         pending.add(block.id);
       } else if (block.type === "tool_result" && !pending.delete(block.toolUseId)) {
         return false;
@@ -278,6 +274,7 @@ export class SessionStore {
         latestSessionSequence: 0,
         updatedAt: timestamp,
         turns: [],
+        runResults: {},
         pendingInterruptions: [],
         sessionEvents: [],
         notes: "",
@@ -348,9 +345,8 @@ export class SessionStore {
     }
 
     summaries.sort((left, right) => {
-      const timestampOrder = Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
-      if (timestampOrder !== 0) {
-        return timestampOrder;
+      if (left.updatedAt !== right.updatedAt) {
+        return left.updatedAt < right.updatedAt ? 1 : -1;
       }
       return left.sessionId < right.sessionId ? -1 : 1;
     });
@@ -364,9 +360,8 @@ export class SessionStore {
         ? 0
         : summaries.findIndex(
             (summary) =>
-              Date.parse(summary.updatedAt) < Date.parse(cursor.updatedAt) ||
-              (Date.parse(summary.updatedAt) === Date.parse(cursor.updatedAt) &&
-                summary.sessionId > cursor.sessionId),
+              summary.updatedAt < cursor.updatedAt ||
+              (summary.updatedAt === cursor.updatedAt && summary.sessionId > cursor.sessionId),
           );
     const effectiveStart = startIndex === -1 ? summaries.length : startIndex;
     const page = summaries.slice(effectiveStart, effectiveStart + limit);
@@ -518,12 +513,16 @@ export class SessionStore {
         includedInContext: input.status === "succeeded",
         model: input.model,
         ...(input.taskGraph === undefined ? {} : { taskGraph: input.taskGraph }),
+        ...(input.runResult === undefined ? {} : { runResult: input.runResult }),
       });
       if (
         !record.success ||
         (record.data.includedInContext && !hasCompleteToolPairing(record.data.messages))
       ) {
-        return { ok: false, error: { code: "invalid_input", message: "completion is invalid" } };
+        return {
+          ok: false,
+          error: { code: "invalid_input", message: "completion input is invalid" },
+        };
       }
       try {
         await this.#storage.appendLine(
@@ -556,23 +555,6 @@ export class SessionStore {
       }
       if (event.sessionId !== sessionId) {
         return { ok: false, error: { code: "invalid_input", message: "event scope mismatch" } };
-      }
-      const turn = loaded.value.snapshot.turns.find(
-        (candidate) =>
-          candidate.turnId === event.payload.turnId && candidate.runId === event.payload.runId,
-      );
-      if (turn === undefined) {
-        return { ok: false, error: { code: "invalid_input", message: "event turn is unknown" } };
-      }
-      if (event.type === "session.turn_accepted") {
-        if (
-          event.payload.clientMessageId !== turn.clientMessageId ||
-          event.payload.userMessage !== userMessageOf(turn)
-        ) {
-          return { ok: false, error: { code: "invalid_input", message: "event turn mismatch" } };
-        }
-      } else if (event.payload.status !== turn.status || event.payload.reason !== turn.reason) {
-        return { ok: false, error: { code: "invalid_input", message: "event result mismatch" } };
       }
       const expected = loaded.value.snapshot.latestSessionSequence + 1;
       if (event.sessionSequence !== expected) {
@@ -683,7 +665,7 @@ export class SessionStore {
       const noteRecords = rawNotes === undefined ? undefined : parseSessionNotes(rawNotes);
       if (
         rawNotes === undefined ||
-        new TextEncoder().encode(rawNotes).byteLength > 256 * 1024 ||
+        new TextEncoder().encode(rawNotes).byteLength > MAX_NOTES_BYTES ||
         noteRecords === undefined ||
         noteRecords.some((record) => record.sessionId !== sessionId)
       ) {
@@ -761,12 +743,13 @@ export class SessionStore {
       }
     }
 
-    const seenClientMessages = new Set<string>();
+    const seenClientMessages = new Map<string, string>();
     for (const record of accepted.values()) {
-      if (seenClientMessages.has(record.clientMessageId)) {
-        return this.#corrupt("duplicate clientMessageId record");
+      const existingTurn = seenClientMessages.get(record.clientMessageId);
+      if (existingTurn !== undefined && existingTurn !== record.turnId) {
+        return this.#corrupt("clientMessageId reused across turns");
       }
-      seenClientMessages.add(record.clientMessageId);
+      seenClientMessages.set(record.clientMessageId, record.turnId);
     }
 
     const completedByKey = new Map<string, Extract<HistoryRecord, { kind: "turn.completed" }>>();
@@ -782,6 +765,7 @@ export class SessionStore {
     }
 
     const turns: HistoryTurn[] = [];
+    const runResults: Record<string, NonNullable<CompleteTurnInput["runResult"]>> = {};
     const pendingInterruptions: PendingInterruption[] = [];
     let activeRun: ActiveRun | undefined;
     for (const key of order) {
@@ -791,6 +775,9 @@ export class SessionStore {
       }
       const completion = completedByKey.get(key);
       if (completion === undefined) {
+        if (activeRun !== undefined) {
+          return this.#corrupt("multiple unfinished turns");
+        }
         turns.push({
           turnId: record.turnId,
           runId: record.runId,
@@ -820,6 +807,9 @@ export class SessionStore {
         continue;
       }
       updatedAt = latestTimestamp(updatedAt, completion.timestamp);
+      if (completion.runResult !== undefined) {
+        runResults[record.runId] = completion.runResult;
+      }
       turns.push({
         turnId: record.turnId,
         runId: record.runId,
@@ -891,6 +881,7 @@ export class SessionStore {
         latestSessionSequence,
         updatedAt,
         turns,
+        runResults,
         pendingInterruptions,
         sessionEvents: events,
         notes,

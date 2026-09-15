@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { AgentEvent } from "@minicode/protocol";
 import { ExecutionContext } from "../../src/agent/context.ts";
 import { AgentLoop } from "../../src/agent/loop.ts";
+import type { RunCompletion } from "../../src/run/completion.ts";
 import { ToolInvoker } from "../../src/tools/invoker.ts";
 import { ToolRegistry } from "../../src/tools/registry.ts";
 import type { Tool } from "../../src/tools/types.ts";
@@ -75,11 +76,13 @@ async function runAndDrain(
   loop: AgentLoop,
   context: ExecutionContext,
   bus: ReturnType<typeof createBus>,
-): Promise<AgentEvent[]> {
+): Promise<{ events: AgentEvent[]; completion: RunCompletion }> {
   const { events, subscription } = await collectEvents(bus, context.sessionId, context.runId);
-  await loop.run(context, new AbortController().signal);
-  await subscription.closed;
-  return events;
+  const completion = await loop.run(context, new AbortController().signal);
+  // AgentLoop 不再发布终态，因此等待已排队的非终态事件 drain 后主动释放订阅。
+  await Bun.sleep(0);
+  subscription.dispose();
+  return { events, completion };
 }
 
 describe("AgentLoop", () => {
@@ -90,7 +93,7 @@ describe("AgentLoop", () => {
         { deltas: ["Hello", " world"], response: textResponse("Hello world") },
       ]);
       const context = makeContext(workspace);
-      const events = await runAndDrain(loop, context, bus);
+      const { events, completion } = await runAndDrain(loop, context, bus);
 
       expect(context.status).toBe("succeeded");
       expect(context.finalText).toBe("Hello world");
@@ -104,8 +107,8 @@ describe("AgentLoop", () => {
       expect(stepsOf(events, "step.started")).toEqual([1]);
       expect(stepsOf(events, "step.finished")).toEqual([1]);
 
-      const finished = events.find((e) => e.type === "run.finished");
-      expect(finished?.payload).toEqual({
+      expect(events.some((event) => event.type === "run.finished")).toBe(false);
+      expect(completion).toMatchObject({
         status: "succeeded",
         reason: "completed",
         finalText: "Hello world",
@@ -131,7 +134,7 @@ describe("AgentLoop", () => {
         { response: textResponse("file read done") },
       ]);
       const context = makeContext(workspace);
-      const events = await runAndDrain(loop, context, bus);
+      const { events } = await runAndDrain(loop, context, bus);
 
       expect(context.status).toBe("succeeded");
       expect(provider.calls).toHaveLength(2);
@@ -180,7 +183,7 @@ describe("AgentLoop", () => {
         { response: textResponse("both read") },
       ]);
       const context = makeContext(workspace);
-      const events = await runAndDrain(loop, context, bus);
+      const { events } = await runAndDrain(loop, context, bus);
 
       expect(context.status).toBe("succeeded");
 
@@ -212,7 +215,7 @@ describe("AgentLoop", () => {
         { response: textResponse("recovered") },
       ]);
       const context = makeContext(workspace);
-      const events = await runAndDrain(loop, context, bus);
+      const { events } = await runAndDrain(loop, context, bus);
 
       expect(context.status).toBe("succeeded");
 
@@ -242,13 +245,13 @@ describe("AgentLoop", () => {
         { response: toolResponse([toolCall("c1", "read_file", { path: "a.txt" })]) },
       ]);
       const context = makeContext(workspace, 1);
-      const events = await runAndDrain(loop, context, bus);
+      const { events, completion } = await runAndDrain(loop, context, bus);
 
       expect(context.status).toBe("failed");
       expect(context.reason).toBe("max_steps");
 
-      const finished = events.find((e) => e.type === "run.finished");
-      expect(finished?.payload).toMatchObject({ status: "failed", reason: "max_steps", steps: 1 });
+      expect(completion).toMatchObject({ status: "failed", reason: "max_steps", steps: 1 });
+      expect(events.some((event) => event.type === "run.finished")).toBe(false);
       expect(stepsOf(events, "step.started")).toEqual([1]);
       expect(stepsOf(events, "step.finished")).toEqual([1]);
     } finally {
@@ -278,13 +281,13 @@ describe("AgentLoop", () => {
     try {
       const { loop, bus } = buildHarness([{ error: new LlmError("config_error", "bad key") }]);
       const context = makeContext(workspace);
-      const events = await runAndDrain(loop, context, bus);
+      const { events, completion } = await runAndDrain(loop, context, bus);
 
       expect(context.status).toBe("failed");
       expect(context.reason).toBe("config_error");
 
-      const finished = events.find((e) => e.type === "run.finished");
-      expect(finished?.payload).toMatchObject({ status: "failed", reason: "config_error" });
+      expect(completion).toMatchObject({ status: "failed", reason: "config_error" });
+      expect(events.some((event) => event.type === "run.finished")).toBe(false);
     } finally {
       await cleanupTempWorkspace(workspace);
     }
@@ -299,12 +302,13 @@ describe("AgentLoop", () => {
 
       const controller = new AbortController();
       controller.abort();
-      await loop.run(context, controller.signal);
-      await subscription.closed;
+      const completion = await loop.run(context, controller.signal);
+      await Bun.sleep(0);
+      subscription.dispose();
 
       expect(context.status).toBe("cancelled");
-      const finished = events.find((e) => e.type === "run.finished");
-      expect(finished?.payload).toMatchObject({ status: "cancelled", reason: "cancelled" });
+      expect(completion).toMatchObject({ status: "cancelled", reason: "cancelled" });
+      expect(events.some((event) => event.type === "run.finished")).toBe(false);
     } finally {
       await cleanupTempWorkspace(workspace);
     }

@@ -4,6 +4,8 @@ import type { CoreConfig } from "./config.ts";
 import { EventBus } from "./events/event-bus.ts";
 import { EventStore } from "./events/event-store.ts";
 import { IpcEventBroadcaster } from "./events/ipc-event-broadcaster.ts";
+import { IpcSessionBroadcaster } from "./events/ipc-session-broadcaster.ts";
+import { SessionEventBus } from "./events/session-event-bus.ts";
 import { AgentCancelHandler } from "./handlers/agent-cancel-handler.ts";
 import { AgentRunHandler } from "./handlers/agent-run-handler.ts";
 import {
@@ -11,19 +13,22 @@ import {
   EventUnsubscribeHandler,
 } from "./handlers/event-subscription-handlers.ts";
 import { PingHandler } from "./handlers/ping-handler.ts";
+import {
+  SessionCreateHandler,
+  SessionGetHandler,
+  SessionGetHistoryHandler,
+  SessionListHandler,
+  SessionSendMessageHandler,
+  SessionSubscribeHandler,
+} from "./handlers/session-handlers.ts";
 import { createLogger } from "./logger.ts";
 import { createRpcDispatcher } from "./rpc-dispatcher.ts";
-import { RunManager } from "./run/manager.ts";
-import { markIncompleteRunsRestarted } from "./run/restart.ts";
+import { RunMetadataStore } from "./run/metadata.ts";
 import { AgentRunner } from "./run/runner.ts";
+import { SessionManager } from "./session/manager.ts";
+import { SessionStore } from "./session/session-store.ts";
+import { RunTraceRegistry } from "./trace/registry.ts";
 import { NdjsonRpcServer } from "./transport/ndjson-server.ts";
-import {
-  TRACE_MAX_BYTES_DEFAULT,
-  TRACE_QUEUE_EVENTS_DEFAULT,
-  TRACE_SHUTDOWN_MS_DEFAULT,
-  TraceService,
-  loadTraceConfig,
-} from "./trace/index.ts";
 
 export class CoreApp {
   readonly #config: CoreConfig;
@@ -32,64 +37,66 @@ export class CoreApp {
   #server: NdjsonRpcServer | undefined;
   #eventBus: EventBus | undefined;
   #broadcaster: IpcEventBroadcaster | undefined;
-  #manager: RunManager | undefined;
-  #traceService: TraceService | undefined;
+  #sessionBroadcaster: IpcSessionBroadcaster | undefined;
+  #manager: SessionManager | undefined;
+  #traces: RunTraceRegistry | undefined;
   #startedAt = 0;
+  #stopping = false;
+  #stopPromise: Promise<void> | undefined;
 
+  /** 保存 Core 配置、环境与日志依赖。 */
   constructor(config: CoreConfig, environment: Environment = Bun.env) {
     this.#config = config;
     this.#environment = environment;
     this.#logger = createLogger(config.logLevel);
   }
 
+  /** 组装 Session/Run/Trace/IPC 服务并开始监听。 */
   start(): CoreEndpoint {
-    if (this.#server !== undefined) {
+    if (this.#server !== undefined || this.#stopping) {
       throw new Error("core already started");
     }
 
     this.#startedAt = performance.now();
-    const traceConfig = loadTraceConfig(this.#environment);
-    if (!traceConfig.ok) {
-      this.#logger.warn(`trace disabled: ${traceConfig.message}`);
-    }
-    const traceService = new TraceService(
-      this.#config.homeDirectory,
-      traceConfig.ok
-        ? traceConfig.value
-        : {
-            enabled: false,
-            payload: "summary",
-            queueEvents: TRACE_QUEUE_EVENTS_DEFAULT,
-            maxBytes: TRACE_MAX_BYTES_DEFAULT,
-            shutdownMs: TRACE_SHUTDOWN_MS_DEFAULT,
-          },
-      undefined,
-      ({ sessionId, runId, report }) => {
-        this.#logger.warn(
-          `trace incomplete session=${sessionId} run=${runId} pending=${report.pendingRecords} dropped=${report.droppedRecords} timedOut=${report.timedOut} writeFailed=${report.writeFailed}`,
-        );
-      },
-    );
     const eventStore = new EventStore(this.#config.homeDirectory);
+    const traces = new RunTraceRegistry(this.#config.homeDirectory, this.#environment);
     const eventBus = new EventBus(eventStore, {
-      onPersisted: (event) => traceService.recordEvent(event),
+      onPersisted: (event) => traces.recordAgentEvent(event),
     });
-    const broadcaster = new IpcEventBroadcaster(eventBus);
-    const manager = new RunManager(
-      new AgentRunner({
-        environment: this.#environment,
-        bus: eventBus,
-        homeDirectory: this.#config.homeDirectory,
-        traceService,
-      }),
-    );
+    const sessionStore = new SessionStore(this.#config.homeDirectory);
+    const sessionEvents = new SessionEventBus(sessionStore, {
+      onPersisted: (event) => traces.recordSessionEvent(event),
+    });
+    const broadcaster = new IpcEventBroadcaster(eventBus, traces);
+    const sessionBroadcaster = new IpcSessionBroadcaster(sessionEvents, traces);
+    const runner = new AgentRunner({
+      environment: this.#environment,
+      bus: eventBus,
+      homeDirectory: this.#config.homeDirectory,
+    });
+    const manager = new SessionManager({
+      store: sessionStore,
+      runner,
+      eventBus,
+      eventStore,
+      sessionEvents,
+      metadata: new RunMetadataStore(this.#config.homeDirectory),
+      traces,
+      environment: this.#environment,
+    });
     const dispatcher = createRpcDispatcher({
       handlers: [
         new PingHandler({ uptimeMs: () => performance.now() - this.#startedAt }),
         new EventSubscribeHandler(broadcaster),
-        new EventUnsubscribeHandler(broadcaster),
-        new AgentRunHandler({ manager, broadcaster, traceService }),
+        new EventUnsubscribeHandler(broadcaster, sessionBroadcaster),
+        new AgentRunHandler({ manager, broadcaster }),
         new AgentCancelHandler(manager),
+        new SessionCreateHandler(manager),
+        new SessionGetHandler(manager),
+        new SessionListHandler(manager),
+        new SessionGetHistoryHandler(manager),
+        new SessionSendMessageHandler(manager),
+        new SessionSubscribeHandler(manager, sessionBroadcaster),
       ],
     });
     const server = new NdjsonRpcServer(this.#config, dispatcher, this.#logger);
@@ -97,43 +104,60 @@ export class CoreApp {
     this.#server = server;
     this.#eventBus = eventBus;
     this.#broadcaster = broadcaster;
+    this.#sessionBroadcaster = sessionBroadcaster;
     this.#manager = manager;
-    this.#traceService = traceService;
-
-    // startup 把未完成 journal 补记为 core_restarted；异步执行，不阻塞监听。
-    void markIncompleteRunsRestarted(eventBus, eventStore, this.#config.homeDirectory).catch(
-      (error: unknown) => {
-        this.#logger.warn(`mark incomplete runs failed: ${String(error)}`);
-      },
-    );
+    this.#traces = traces;
 
     this.#logger.info(`mc-core ${MINICODE_VERSION} listening address=${formatEndpoint(endpoint)}`);
     return endpoint;
   }
 
-  async stop(): Promise<void> {
-    if (this.#server === undefined) {
-      return;
+  /** 幂等停止 Core；并发调用共享同一个完成 Promise。 */
+  stop(): Promise<void> {
+    if (this.#stopPromise !== undefined) {
+      return this.#stopPromise;
     }
-    this.#logger.info("mc-core shutting down");
-    const server = this.#server;
-    const manager = this.#manager;
-    const traceService = this.#traceService;
-    this.#server = undefined;
-
-    // 先关闭 admission，再取消快照内全部 run，最后排空连接，避免 shutdown 插入新 run。
-    server.beginShutdown();
-    await manager?.shutdown();
-    await server.stop();
-    await traceService?.shutdown();
-
-    this.#broadcaster?.close();
-    this.#broadcaster = undefined;
-    this.#eventBus = undefined;
-    this.#manager = undefined;
-    this.#traceService = undefined;
+    if (this.#server === undefined) {
+      return Promise.resolve();
+    }
+    const stopping = this.#stopCurrent(this.#server, this.#manager);
+    this.#stopPromise = stopping;
+    void stopping.then(
+      () => {
+        if (this.#stopPromise === stopping) this.#stopPromise = undefined;
+      },
+      () => {
+        if (this.#stopPromise === stopping) this.#stopPromise = undefined;
+      },
+    );
+    return stopping;
   }
 
+  /** 执行一次完整停机；所有并发 stop 调用共享外层登记的同一个 Promise。 */
+  async #stopCurrent(server: NdjsonRpcServer, manager: SessionManager | undefined): Promise<void> {
+    this.#logger.info("mc-core shutting down");
+    this.#stopping = true;
+    this.#server = undefined;
+    try {
+      // 先封闭 admission/发出取消，再排空 RPC 响应闸门，最后才允许强制终态提交。
+      manager?.beginShutdown();
+      await server.stop();
+      await manager?.shutdown();
+
+      this.#broadcaster?.close();
+      this.#sessionBroadcaster?.close();
+      this.#broadcaster = undefined;
+      this.#sessionBroadcaster = undefined;
+      this.#eventBus = undefined;
+      this.#manager = undefined;
+      await this.#traces?.stopAll();
+      this.#traces = undefined;
+    } finally {
+      this.#stopping = false;
+    }
+  }
+
+  /** 返回运行中的 run EventBus；未启动时拒绝访问。 */
   get eventBus(): EventBus {
     if (this.#eventBus === undefined) {
       throw new Error("core is not started");

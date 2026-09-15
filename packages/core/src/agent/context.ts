@@ -29,6 +29,8 @@ export interface ExecutionContextOptions {
   readonly runId: RunId;
   readonly workspaceRoot: string;
   readonly goal: string;
+  /** 已成功历史构成的 provider-neutral 消息；本轮用户消息会追加在其后。 */
+  readonly prefillMessages?: readonly LlmMessage[];
   readonly maxSteps?: number;
 }
 
@@ -43,10 +45,13 @@ export class ExecutionContext {
   readonly goal: string;
   readonly maxSteps: number;
   readonly messages: LlmMessage[] = [];
+  readonly #runMessageStart: number;
   step = 0;
   status: RunStatus = "running";
   reason: FailedReason | undefined;
   finalText = "";
+  /** 该 run 实际使用的模型标识，由 AgentLoop 在选中模型时写入。 */
+  model = "";
   usage: LlmUsage = {
     inputTokens: 0,
     outputTokens: 0,
@@ -60,14 +65,23 @@ export class ExecutionContext {
     this.workspaceRoot = options.workspaceRoot;
     this.goal = options.goal;
     this.maxSteps = options.maxSteps ?? DEFAULT_MAX_STEPS;
-    // goal 作为首条 user 消息。
+    for (const message of options.prefillMessages ?? []) {
+      this.messages.push({
+        role: message.role,
+        content: message.content.map((part) => ({ ...part })),
+      });
+    }
+    this.#runMessageStart = this.messages.length;
+    // goal 是本轮第一条消息，历史消息不会重复写入本轮 completion。
     this.messages.push({ role: "user", content: [{ type: "text", text: this.goal }] });
   }
 
+  /** 当前状态是否已经进入终态。 */
   isDone(): boolean {
     return this.status !== "running";
   }
 
+  /** 追加本轮 Assistant 消息；空内容不进入上下文。 */
   addAssistantMessage(content: readonly LlmContentPart[]): void {
     if (content.length === 0) {
       return;
@@ -91,6 +105,7 @@ export class ExecutionContext {
     });
   }
 
+  /** 累加一次 provider 调用的 token 用量。 */
   accumulateUsage(usage: LlmUsage): void {
     this.usage = {
       inputTokens: this.usage.inputTokens + usage.inputTokens,
@@ -101,19 +116,27 @@ export class ExecutionContext {
     };
   }
 
+  /** 将 run 标记为成功并保存最终文本。 */
   markSucceeded(finalText: string): void {
     this.status = "succeeded";
     this.reason = undefined;
     this.finalText = finalText;
   }
 
+  /** 将 run 标记为指定原因的失败。 */
   markFailed(reason: FailedReason): void {
     this.status = "failed";
     this.reason = reason;
   }
 
+  /** 将 run 标记为用户取消。 */
   markCancelled(): void {
     this.status = "cancelled";
     this.reason = undefined;
+  }
+
+  /** 返回仅属于本轮的新消息，供审计历史提交使用。 */
+  runMessages(): readonly LlmMessage[] {
+    return this.messages.slice(this.#runMessageStart);
   }
 }

@@ -6,6 +6,8 @@ export interface MockAnthropicServer {
   readonly url: string;
   readonly port: number;
   readonly callCount: number;
+  /** 依次记录收到的原始 request body，供多轮上下文集成断言。 */
+  readonly requestBodies: readonly unknown[];
   stop(): Promise<void>;
 }
 
@@ -142,6 +144,7 @@ function finalTextEvents(text: string): unknown[] {
  */
 export function startAnthropicMock(options: MockAnthropicOptions = {}): MockAnthropicServer {
   let callCount = 0;
+  const requestBodies: unknown[] = [];
   const finalText = options.finalText ?? ((results) => `SUMMARY:${results.join("|")}`);
   const gate = options.gate === true;
   let server: Server<undefined>;
@@ -155,6 +158,7 @@ export function startAnthropicMock(options: MockAnthropicOptions = {}): MockAnth
         return new Response("not found", { status: 404 });
       }
       const body = await request.json();
+      requestBodies.push(body);
       callCount += 1;
       const toolResults = extractToolResults(body);
       if (options.delayMs !== undefined) {
@@ -180,6 +184,9 @@ export function startAnthropicMock(options: MockAnthropicOptions = {}): MockAnth
     port,
     get callCount() {
       return callCount;
+    },
+    get requestBodies() {
+      return requestBodies;
     },
     stop: async () => {
       await server.stop(true);

@@ -47,27 +47,6 @@ async function publishTaskEvent(
   }
 }
 
-/** 发布失败时补偿 tasks.json；无论补偿结果如何都以安全工具错误结束。 */
-async function publishOrRollback(
-  deps: TaskToolDependencies,
-  type: "task.created" | "task.updated",
-  revision: number,
-  task: TaskSnapshot,
-): Promise<void> {
-  try {
-    await publishTaskEvent(deps, type, revision, task);
-    deps.manager.confirmMutation(revision);
-  } catch {
-    const rolledBack = await deps.manager.rollbackMutation(revision);
-    throw new ToolError(
-      "io_error",
-      rolledBack.ok
-        ? "failed to persist task event"
-        : "failed to persist task event and roll back task state",
-    );
-  }
-}
-
 const TaskCreateParamsSchema = z.strictObject({
   subject: z.string().min(1).max(120),
   description: z.string().min(1).max(4000),
@@ -116,11 +95,12 @@ function taskCreateTool(deps: TaskToolDependencies): Tool<TaskCreateParams> {
         description: params.description,
         ...(params.blockedBy === undefined ? {} : { blockedBy: params.blockedBy }),
       };
-      const result = await deps.manager.create(input);
+      const result = await deps.manager.create(input, (value) =>
+        publishTaskEvent(deps, "task.created", value.revision, value.task),
+      );
       if (!result.ok) {
         throw toToolError(result.error);
       }
-      await publishOrRollback(deps, "task.created", result.value.revision, result.value.task);
       return { content: JSON.stringify(result.value) };
     },
   };
@@ -141,11 +121,12 @@ function taskUpdateTool(deps: TaskToolDependencies): Tool<TaskUpdateParams> {
         ...(params.status === undefined ? {} : { status: params.status }),
         ...(params.blockedBy === undefined ? {} : { blockedBy: params.blockedBy }),
       };
-      const result = await deps.manager.update(input);
+      const result = await deps.manager.update(input, (value) =>
+        publishTaskEvent(deps, "task.updated", value.revision, value.task),
+      );
       if (!result.ok) {
         throw toToolError(result.error);
       }
-      await publishOrRollback(deps, "task.updated", result.value.revision, result.value.task);
       return { content: JSON.stringify(result.value) };
     },
   };

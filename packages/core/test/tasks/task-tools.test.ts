@@ -163,7 +163,7 @@ describe("task planning tools", () => {
     );
 
     expect(result.result.isError).toBe(true);
-    expect(result.result.content).toBe("failed to persist task event");
+    expect(result.result.content).toBe("io_error: failed to persist task event");
     expect(JSON.parse(storage.files.get("/home/sessions/a/runs/b/tasks.json") ?? "null")).toEqual({
       schemaVersion: 1,
       revision: 0,

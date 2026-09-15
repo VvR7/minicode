@@ -188,6 +188,51 @@ describe("TaskManager", () => {
     expect(okOf(await manager.list()).tasks.map((task) => task.subject)).toEqual(["A", "B"]);
   });
 
+  test("serializes the first concurrent write across managers sharing one path", async () => {
+    const storage = new MemoryTaskStorage();
+    const first = new TaskManager(storage, "/x/tasks.json");
+    const second = new TaskManager(storage, "/x/tasks.json");
+
+    const [firstResult, secondResult] = await Promise.all([
+      first.create({ subject: "A", description: "a" }),
+      second.create({ subject: "B", description: "b" }),
+    ]);
+
+    expect(okOf(firstResult)).toMatchObject({ revision: 1, task: { id: 1 } });
+    expect(okOf(secondResult)).toMatchObject({ revision: 2, task: { id: 2 } });
+    expect(JSON.parse(storage.files.get("/x/tasks.json") ?? "null").tasks).toHaveLength(2);
+  });
+
+  test("holds the shared lock through event commit and rollback", async () => {
+    const storage = new MemoryTaskStorage();
+    const first = new TaskManager(storage, "/x/tasks.json");
+    const second = new TaskManager(storage, "/x/tasks.json");
+    let announceHook = (): void => {};
+    const hookEntered = new Promise<void>((resolve) => {
+      announceHook = resolve;
+    });
+    let rejectHook = (_error: Error): void => {};
+    const hookGate = new Promise<void>((_resolve, reject) => {
+      rejectHook = reject;
+    });
+
+    const firstMutation = first.create({ subject: "A", description: "a" }, async () => {
+      announceHook();
+      await hookGate;
+    });
+    await hookEntered;
+    const secondMutation = second.create({ subject: "B", description: "b" }, async () => {});
+    rejectHook(new Error("event write failed"));
+
+    expect(errorCodeOf(await firstMutation)).toBe("io_error");
+    expect(okOf(await secondMutation)).toMatchObject({ revision: 1, task: { id: 1 } });
+    expect(JSON.parse(storage.files.get("/x/tasks.json") ?? "null")).toMatchObject({
+      revision: 1,
+      nextId: 2,
+      tasks: [{ id: 1, subject: "B" }],
+    });
+  });
+
   test("does not overwrite a schema-valid graph that became structurally corrupted", async () => {
     const { manager, storage } = createTaskManager("/x/tasks.json");
     okOf(await manager.create({ subject: "A", description: "a" }));
@@ -199,6 +244,21 @@ describe("TaskManager", () => {
       "task_store_corrupted",
     );
     expect(JSON.parse(storage.files.get("/x/tasks.json") ?? "null").tasks).toHaveLength(1);
+  });
+
+  test("detects a schema-valid same-revision content replacement", async () => {
+    const { manager, storage } = createTaskManager("/x/tasks.json");
+    okOf(await manager.create({ subject: "A", description: "a" }));
+    const graph = JSON.parse(storage.files.get("/x/tasks.json") ?? "null");
+    graph.tasks[0].subject = "externally replaced";
+    storage.files.set("/x/tasks.json", JSON.stringify(graph));
+
+    expect(errorCodeOf(await manager.create({ subject: "B", description: "b" }))).toBe(
+      "stale_revision",
+    );
+    expect(JSON.parse(storage.files.get("/x/tasks.json") ?? "null").tasks[0].subject).toBe(
+      "externally replaced",
+    );
   });
 
   test("write failure does not advance in-memory revision or graph", async () => {

@@ -21,6 +21,11 @@ import {
   type UpdateTaskInput,
 } from "./types.ts";
 
+type TaskMutationValue = { readonly revision: number; readonly task: TaskSnapshot };
+
+/** 同一进程内按 tasks.json 路径共享写锁，覆盖多个 TaskManager 实例。 */
+const mutationTails = new Map<string, Promise<void>>();
+
 /** 计算某个 run 的 tasks.json 绝对路径，与 SessionStore 的路径规则一致。 */
 export function tasksPath(homeDirectory: string, sessionId: SessionId, runId: RunId): string {
   return join(
@@ -105,7 +110,6 @@ export class TaskManager {
   readonly #path: string;
   readonly #now: () => string;
   #graph: TaskGraphFile | null = null;
-  #mutationTail: Promise<void> = Promise.resolve();
   #rollback: { readonly revision: number; readonly graph: TaskGraphFile } | null = null;
 
   /** 绑定单个 run 的存储路径，并允许测试注入确定性时钟。 */
@@ -161,14 +165,15 @@ export class TaskManager {
   /** 创建新任务；ID 取 nextId 且只增不复用。 */
   async create(
     input: CreateTaskInput,
-  ): Promise<TaskStoreResult<{ revision: number; task: TaskSnapshot }>> {
-    return this.#withMutationLock(() => this.#create(input));
+    afterCommit?: (value: TaskMutationValue) => Promise<void>,
+  ): Promise<TaskStoreResult<TaskMutationValue>> {
+    return this.#withMutationLock(async () =>
+      this.#finishMutation(await this.#create(input), afterCommit),
+    );
   }
 
   /** 在 mutation lock 内执行创建并提交新图。 */
-  async #create(
-    input: CreateTaskInput,
-  ): Promise<TaskStoreResult<{ revision: number; task: TaskSnapshot }>> {
+  async #create(input: CreateTaskInput): Promise<TaskStoreResult<TaskMutationValue>> {
     const loaded = await this.#ensureLoaded();
     if (!loaded.ok) {
       return loaded;
@@ -220,14 +225,15 @@ export class TaskManager {
   /** 更新任务；校验状态转换、blocked 约束、依赖引用与环，completed 不可变。 */
   async update(
     input: UpdateTaskInput,
-  ): Promise<TaskStoreResult<{ revision: number; task: TaskSnapshot }>> {
-    return this.#withMutationLock(() => this.#update(input));
+    afterCommit?: (value: TaskMutationValue) => Promise<void>,
+  ): Promise<TaskStoreResult<TaskMutationValue>> {
+    return this.#withMutationLock(async () =>
+      this.#finishMutation(await this.#update(input), afterCommit),
+    );
   }
 
   /** 在 mutation lock 内执行更新、整图校验与提交。 */
-  async #update(
-    input: UpdateTaskInput,
-  ): Promise<TaskStoreResult<{ revision: number; task: TaskSnapshot }>> {
+  async #update(input: UpdateTaskInput): Promise<TaskStoreResult<TaskMutationValue>> {
     const loaded = await this.#ensureLoaded();
     if (!loaded.ok) {
       return loaded;
@@ -345,43 +351,57 @@ export class TaskManager {
     };
   }
 
-  /** 确认指定 revision 的事件已持久化，不再保留其补偿快照。 */
-  confirmMutation(revision: number): void {
-    if (this.#rollback?.revision === revision) {
+  /** 在共享写锁内执行提交后回调；失败时先补偿任务图再返回稳定错误。 */
+  async #finishMutation(
+    result: TaskStoreResult<TaskMutationValue>,
+    afterCommit: ((value: TaskMutationValue) => Promise<void>) | undefined,
+  ): Promise<TaskStoreResult<TaskMutationValue>> {
+    if (!result.ok) {
+      return result;
+    }
+    if (afterCommit === undefined) {
       this.#rollback = null;
+      return result;
+    }
+    try {
+      await afterCommit(result.value);
+      this.#rollback = null;
+      return result;
+    } catch {
+      const rolledBack = await this.#rollbackMutation(result.value.revision);
+      return this.#fail(
+        "io_error",
+        rolledBack.ok
+          ? "failed to persist task event"
+          : "failed to persist task event and roll back task state",
+      );
     }
   }
 
-  /** durable event 失败时原子恢复上一图；若已有后续变更则拒绝覆盖。 */
-  async rollbackMutation(revision: number): Promise<TaskStoreResult<void>> {
-    return this.#withMutationLock<void>(async () => {
-      const rollback = this.#rollback;
-      if (
-        rollback === null ||
-        rollback.revision !== revision ||
-        this.#graph?.revision !== revision
-      ) {
-        return this.#fail("stale_revision", "task mutation can no longer be rolled back");
-      }
-      const disk = await this.#readDiskGraph();
-      if (!disk.ok) {
-        return disk;
-      }
-      if (disk.value === undefined || !this.#sameGraph(disk.value, this.#graph)) {
-        return this.#fail("stale_revision", "tasks.json changed before rollback");
-      }
-      try {
-        await this.#storage.writeFileAtomic(
-          this.#path,
-          `${JSON.stringify(rollback.graph, null, 2)}\n`,
-        );
-      } catch {
-        return this.#fail("io_error", "failed to roll back tasks.json");
-      }
-      this.#graph = rollback.graph;
-      this.#rollback = null;
-      return { ok: true, value: undefined };
-    });
+  /** durable event 失败时恢复上一图；调用方必须已持有共享写锁。 */
+  async #rollbackMutation(revision: number): Promise<TaskStoreResult<void>> {
+    const rollback = this.#rollback;
+    if (rollback === null || rollback.revision !== revision || this.#graph?.revision !== revision) {
+      return this.#fail("stale_revision", "task mutation can no longer be rolled back");
+    }
+    const disk = await this.#readDiskGraph();
+    if (!disk.ok) {
+      return disk;
+    }
+    if (disk.value === undefined || !this.#sameGraph(disk.value, this.#graph)) {
+      return this.#fail("stale_revision", "tasks.json changed before rollback");
+    }
+    try {
+      await this.#storage.writeFileAtomic(
+        this.#path,
+        `${JSON.stringify(rollback.graph, null, 2)}\n`,
+      );
+    } catch {
+      return this.#fail("io_error", "failed to roll back tasks.json");
+    }
+    this.#graph = rollback.graph;
+    this.#rollback = null;
+    return { ok: true, value: undefined };
   }
 
   /** 懒加载图，保证 create/update/list/get 首次调用前已校验落盘状态。 */
@@ -502,20 +522,24 @@ export class TaskManager {
     return JSON.stringify(left) === JSON.stringify(right);
   }
 
-  /** 串行化同一 manager 的变更，避免并发 create/update 丢失更新。 */
+  /** 按文件路径串行化所有 manager 的变更与提交后回调，避免交错覆盖。 */
   async #withMutationLock<Value>(
     operation: () => Promise<TaskStoreResult<Value>>,
   ): Promise<TaskStoreResult<Value>> {
-    const previous = this.#mutationTail;
+    const previous = mutationTails.get(this.#path) ?? Promise.resolve();
     let release = (): void => {};
-    this.#mutationTail = new Promise<void>((resolve) => {
+    const current = new Promise<void>((resolve) => {
       release = resolve;
     });
+    mutationTails.set(this.#path, current);
     await previous;
     try {
       return await operation();
     } finally {
       release();
+      if (mutationTails.get(this.#path) === current) {
+        mutationTails.delete(this.#path);
+      }
     }
   }
 

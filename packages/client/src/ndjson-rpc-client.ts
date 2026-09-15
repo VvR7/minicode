@@ -1,4 +1,9 @@
-import type { CoreEndpoint, JsonRpcId, JsonRpcNotificationEnvelope } from "@minicode/protocol";
+import type {
+  CoreEndpoint,
+  JsonRpcErrorObject,
+  JsonRpcId,
+  JsonRpcNotificationEnvelope,
+} from "@minicode/protocol";
 import {
   JSON_RPC_VERSION,
   JsonRpcNotificationEnvelopeSchema,
@@ -56,6 +61,19 @@ export type NotificationListener = (notification: JsonRpcNotificationEnvelope) =
 
 export class RpcClientError extends Error {
   override readonly name = "RpcClientError";
+
+  /** JSON-RPC application error code；传输层错误不携带该字段。 */
+  readonly code: number | undefined;
+
+  /** Core 返回的已通过协议校验的安全错误数据。 */
+  readonly data: unknown;
+
+  /** 创建传输错误或携带结构化 JSON-RPC application error 的客户端错误。 */
+  constructor(message: string, error?: Pick<JsonRpcErrorObject, "code" | "data">) {
+    super(message);
+    this.code = error?.code;
+    this.data = error?.data;
+  }
 }
 
 function concatenate(left: Uint8Array, right: Uint8Array): Uint8Array {
@@ -139,7 +157,10 @@ function completeResponse(state: ClientState, raw: unknown): boolean {
 
   if ("error" in envelope.data) {
     pending.reject(
-      asClientError(`core error ${envelope.data.error.code}: ${envelope.data.error.message}`),
+      new RpcClientError(
+        `core error ${envelope.data.error.code}: ${envelope.data.error.message}`,
+        envelope.data.error,
+      ),
     );
     return true;
   }

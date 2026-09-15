@@ -1,7 +1,12 @@
 import { z } from "zod";
 
 import { RunIdSchema, SessionIdSchema, SubscriptionIdSchema } from "./agent.ts";
-import { JSON_RPC_VERSION, JsonRpcIdSchema, jsonRpcSuccessSchema } from "./json-rpc.ts";
+import {
+  JSON_RPC_VERSION,
+  JsonRpcIdSchema,
+  JsonRpcSessionErrorDataSchema,
+  jsonRpcSuccessSchema,
+} from "./json-rpc.ts";
 
 /** Stage2 session 相关 RPC 方法名，集中定义避免各处硬编码字符串。 */
 export const SESSION_CREATE_METHOD = "session.create" as const;
@@ -320,7 +325,7 @@ const SessionEventBaseShape = {
   sessionId: SessionIdSchema,
   sessionSequence: z.number().int().positive(),
   timestamp: z.iso.datetime({ offset: true }),
-  durable: z.boolean(),
+  durable: z.literal(true),
 };
 
 function sessionEventSchema<const Type extends string, PayloadSchema extends z.ZodType>(
@@ -415,11 +420,7 @@ export const SessionSubscribeSuccessResponseSchema = jsonRpcSuccessSchema(
  * session 类错误的 data 只允许安全、类型化的诊断字段，
  * 不允许出现路径、prompt 或底层异常信息。
  */
-export const SessionErrorDataSchema = z.strictObject({
-  sessionId: SessionIdSchema.optional(),
-  turnId: TurnIdSchema.optional(),
-  runId: RunIdSchema.optional(),
-});
+export const SessionErrorDataSchema = JsonRpcSessionErrorDataSchema;
 export type SessionErrorData = z.infer<typeof SessionErrorDataSchema>;
 
 /** 供 Core handler 复用的 session 错误码名称。 */

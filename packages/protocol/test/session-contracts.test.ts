@@ -7,6 +7,7 @@ import {
   EVENT_UNSUBSCRIBE_METHOD,
   HistoryTurnSchema,
   JsonRpcErrorCode,
+  JsonRpcErrorResponseSchema,
   MAX_HISTORY_TEXT_CHARS,
   MAX_SESSION_LIST_LIMIT,
   SessionCreateRequestSchema,
@@ -236,6 +237,7 @@ describe("session events and push scope", () => {
     expect(SessionEventSchema.safeParse(withoutSession).success).toBe(false);
     expect(SessionEventSchema.safeParse({ ...base, sequence: 1 }).success).toBe(false);
     expect(SessionEventSchema.safeParse({ ...base, sessionSequence: 0 }).success).toBe(false);
+    expect(SessionEventSchema.safeParse({ ...base, durable: false }).success).toBe(false);
     expect(
       SessionEventSchema.safeParse({ ...base, payload: { ...base.payload, extra: 1 } }).success,
     ).toBe(false);
@@ -610,6 +612,28 @@ describe("session error contracts", () => {
     expect(
       SessionErrorDataSchema.safeParse({ sessionId, workspaceRoot: "/secret", prompt: "x" })
         .success,
+    ).toBe(false);
+    expect(
+      JsonRpcErrorResponseSchema.safeParse({
+        jsonrpc: "2.0",
+        id: "request-1",
+        error: {
+          code: JsonRpcErrorCode.sessionNotFound,
+          message: "session not found",
+          data: { sessionId },
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      JsonRpcErrorResponseSchema.safeParse({
+        jsonrpc: "2.0",
+        id: "request-1",
+        error: {
+          code: JsonRpcErrorCode.sessionNotFound,
+          message: "session not found",
+          data: { sessionId, workspaceRoot: "/secret", prompt: "x" },
+        },
+      }).success,
     ).toBe(false);
   });
 

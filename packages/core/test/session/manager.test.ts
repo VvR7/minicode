@@ -96,6 +96,21 @@ class BlockingRunMetadataStorage extends MemorySessionStorage {
   }
 }
 
+/** 阻塞 one_shot 的 meta 写入，用于制造 create 完成前的 shutdown 竞态。 */
+class BlockingOneShotCreateStorage extends MemorySessionStorage {
+  readonly metaWriteStarted = Promise.withResolvers<void>();
+  readonly metaWriteGate = Promise.withResolvers<void>();
+
+  /** 仅阻塞 one_shot session 的初始 meta，避免影响后续 run.json。 */
+  override async writeFileAtomic(path: string, content: string): Promise<void> {
+    if (path.endsWith("/meta.json") && content.includes('"mode": "one_shot"')) {
+      this.metaWriteStarted.resolve();
+      await this.metaWriteGate.promise;
+    }
+    await super.writeFileAtomic(path, content);
+  }
+}
+
 /** 阻塞 run.finished journal append，用于验证 shutdown 会等待已清 active 的终态提交。 */
 class BlockingTerminalJournalStorage extends MemoryJournalStorage {
   readonly terminalStarted = Promise.withResolvers<void>();
@@ -320,6 +335,35 @@ describe("SessionManager accepted state machine", () => {
     expect(runner.requests).toHaveLength(1);
   });
 
+  test("keeps idempotent retries behind the original accepted response gate", async () => {
+    const runner = new StubRunner(async (request) => completionFor(request));
+    const harness = createHarness(runner);
+    const session = unwrapResult(await harness.manager.create("/workspace"));
+    const first = unwrapResult(
+      await harness.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "hello",
+      }),
+    );
+    const retry = unwrapResult(
+      await harness.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "hello",
+      }),
+    );
+
+    retry.activate();
+    await Bun.sleep(0);
+    expect(runner.requests).toHaveLength(0);
+    expect(unwrapResult(await harness.store.load(session.sessionId)).sessionEvents).toEqual([]);
+
+    first.activate();
+    await waitForIdle(harness.manager);
+    expect(runner.requests).toHaveLength(1);
+  });
+
   test("publishes accepted and terminal events only after response activation and history commit", async () => {
     const order: string[] = [];
     let eventBus: EventBus;
@@ -409,6 +453,35 @@ describe("SessionManager accepted state machine", () => {
     prepared.activate();
     await waitForIdle(harness.manager);
     expect(order[0]).toBe("response.enqueued");
+    expect(unwrapResult(await harness.manager.getHistory(session.sessionId)).turns[0]?.status).toBe(
+      "cancelled",
+    );
+    expect(runner.requests).toHaveLength(0);
+  });
+
+  test("keeps cancellation authoritative when an active executor ignores AbortSignal", async () => {
+    const release = Promise.withResolvers<void>();
+    const runner = new StubRunner(async (request) => {
+      await release.promise;
+      return completionFor(request, "succeeded");
+    });
+    const harness = createHarness(runner);
+    const session = unwrapResult(await harness.manager.create("/workspace"));
+    const prepared = unwrapResult(
+      await harness.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "ignore cancellation",
+      }),
+    );
+    prepared.activate();
+    await waitFor(() => runner.requests.length === 1);
+
+    expect(await harness.manager.cancel(session.sessionId, prepared.result.runId)).toBe(
+      "cancellation_requested",
+    );
+    release.resolve();
+    await waitForIdle(harness.manager);
     expect(unwrapResult(await harness.manager.getHistory(session.sessionId)).turns[0]?.status).toBe(
       "cancelled",
     );
@@ -571,6 +644,49 @@ describe("SessionManager multi-turn context and terminal ownership", () => {
       await harness.eventStore.read(session.sessionId, prepared.result.runId),
     );
     expect(journal.events.filter((event) => event.type === "run.finished")).toHaveLength(1);
+  });
+
+  test("makes activation a no-op after shutdown force-commits an unstarted run", async () => {
+    const order: string[] = [];
+    const runner = new StubRunner(async (request) => completionFor(request));
+    const harness = createHarness(runner, { order, shutdownTimeoutMs: 10 });
+    const session = unwrapResult(await harness.manager.create("/workspace"));
+    const prepared = unwrapResult(
+      await harness.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "late activation",
+      }),
+    );
+
+    await harness.manager.shutdown();
+    prepared.activate();
+    await Bun.sleep(0);
+
+    expect(runner.requests).toHaveLength(0);
+    expect(order).toEqual(["run.finished"]);
+    expect(unwrapResult(await harness.manager.get(session.sessionId)).status).not.toBe("corrupted");
+    expect(unwrapResult(await harness.manager.getHistory(session.sessionId)).turns[0]?.status).toBe(
+      "cancelled",
+    );
+  });
+
+  test("rejects one-shot admission when shutdown starts during session creation", async () => {
+    const storage = new BlockingOneShotCreateStorage();
+    const runner = new StubRunner(async (request) => completionFor(request));
+    const harness = createHarness(runner, { storage, shutdownTimeoutMs: 100 });
+    const preparing = harness.manager.prepareOneShot("/workspace", "racing one-shot");
+    await storage.metaWriteStarted.promise;
+
+    const shuttingDown = harness.manager.shutdown();
+    storage.metaWriteGate.resolve();
+    expect(await preparing).toMatchObject({
+      ok: false,
+      error: { code: "internal_error", message: "core is shutting down" },
+    });
+    await shuttingDown;
+    expect(harness.manager.activeCount).toBe(0);
+    expect(runner.requests).toHaveLength(0);
   });
 
   test("waits for an admission that passed the stopping check before taking the active snapshot", async () => {

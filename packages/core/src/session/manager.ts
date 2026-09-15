@@ -312,6 +312,9 @@ export class SessionManager {
     }
     const sessionId = created.value.sessionId;
     return this.#withSessionLock(sessionId, async () => {
+      if (this.#stopping) {
+        return this.#internal("core is shutting down");
+      }
       const loaded = await this.#store.load(sessionId);
       if (!loaded.ok) {
         return this.#fromStore(loaded.error.code, sessionId);
@@ -325,6 +328,9 @@ export class SessionManager {
     await this.#ready;
     const active = this.#active.get(this.#runKey(sessionId, runId));
     if (active !== undefined) {
+      if (active.commit !== undefined) {
+        return "already_finished";
+      }
       active.controller.abort();
       return "cancellation_requested";
     }
@@ -528,7 +534,8 @@ export class SessionManager {
             },
           });
         }
-        if (active !== undefined) {
+        // 幂等重试只能复用 accepted 身份，不能越过首次请求的响应闸门抢先启动。
+        if (active !== undefined && !idempotent) {
           this.#activate(active);
         }
       },
@@ -547,7 +554,13 @@ export class SessionManager {
 
   /** 幂等激活 prepared run；后台异常被收敛后仍完成 settled。 */
   #activate(execution: ActiveExecution): void {
-    if (execution.activated) {
+    // shutdown 一旦开始或 run 已进入终态提交，迟到的响应/断连回调只能空操作。
+    if (
+      execution.activated ||
+      this.#stopping ||
+      execution.commit !== undefined ||
+      !this.#active.has(this.#runKey(execution.sessionId, execution.runId))
+    ) {
       return;
     }
     execution.activated = true;
@@ -565,6 +578,8 @@ export class SessionManager {
         outcome = {
           completion: this.#failedCompletion(execution.userMessage, "session_store_error"),
         };
+      } else if (execution.controller.signal.aborted) {
+        outcome = { completion: this.#cancelledCompletion(execution.userMessage) };
       } else {
         const request: AgentRunRequest = {
           sessionId: execution.sessionId,
@@ -576,11 +591,15 @@ export class SessionManager {
           trace: execution.trace,
         };
         outcome = await this.#runner.run(request, execution.controller.signal);
+        // provider/executor 即使忽略 AbortSignal，编排层仍以已接受的取消为权威结果。
+        if (execution.controller.signal.aborted) {
+          outcome = { completion: this.#cancelledCompletion(execution.userMessage) };
+        }
       }
     } catch {
-      outcome = {
-        completion: this.#failedCompletion(execution.userMessage, "internal_error"),
-      };
+      outcome = execution.controller.signal.aborted
+        ? { completion: this.#cancelledCompletion(execution.userMessage) }
+        : { completion: this.#failedCompletion(execution.userMessage, "internal_error") };
     }
     await this.#commitOnce(execution, outcome);
   }
@@ -620,7 +639,10 @@ export class SessionManager {
 
   /** 严格按 history、active、run event、session event 的顺序提交 completion。 */
   async #commit(execution: ActiveExecution, outcome: AgentRunOutcome): Promise<void> {
-    let completion = outcome.completion;
+    // commit 创建前接受的取消优先于 executor 返回值；创建后 cancel 会返回 already_finished。
+    let completion = execution.controller.signal.aborted
+      ? this.#cancelledCompletion(execution.userMessage)
+      : outcome.completion;
     const messages = toHistoryMessages(
       completion.messages,
       execution.turnId,

@@ -265,8 +265,8 @@ export class NdjsonRpcServer {
 
   /** 开始监听并注册各类 socket 回调；返回实际绑定的地址（端口为 0 时尤其有用）。 */
   start(): CoreEndpoint {
-    // 同一个实例只能有一个监听器，重复启动是编程错误。
-    if (this.#listener !== undefined) {
+    // 同一个实例只能有一个监听器；旧 stop 未完成时也不能重入启动。
+    if (this.#listener !== undefined || this.#stopping) {
       throw new Error("server already started");
     }
 

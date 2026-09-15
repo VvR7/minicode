@@ -41,6 +41,7 @@ export class CoreApp {
   #manager: SessionManager | undefined;
   #traces: RunTraceRegistry | undefined;
   #startedAt = 0;
+  #stopping = false;
 
   constructor(config: CoreConfig, environment: Environment = Bun.env) {
     this.#config = config;
@@ -49,7 +50,7 @@ export class CoreApp {
   }
 
   start(): CoreEndpoint {
-    if (this.#server !== undefined) {
+    if (this.#server !== undefined || this.#stopping) {
       throw new Error("core already started");
     }
 
@@ -115,6 +116,7 @@ export class CoreApp {
     this.#logger.info("mc-core shutting down");
     const server = this.#server;
     const manager = this.#manager;
+    this.#stopping = true;
     this.#server = undefined;
 
     // 先封闭 admission/发出取消，再排空 RPC 响应闸门，最后才允许强制终态提交。
@@ -130,6 +132,7 @@ export class CoreApp {
     this.#manager = undefined;
     await this.#traces?.stopAll();
     this.#traces = undefined;
+    this.#stopping = false;
   }
 
   get eventBus(): EventBus {

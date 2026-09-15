@@ -32,11 +32,11 @@ core 重启产生的 interrupted turn 仍在 history 中可审计，但不进入
 预算在分配 turnId/runId 之前检查：
 
 ```text
-estimated input + LLM_MAX_OUTPUT_TOKENS <= LLM_CONTEXT_WINDOW_TOKENS
+estimated input + LLM_MAX_OUTPUT_TOKENS <= floor(LLM_CONTEXT_WINDOW_TOKENS * 0.9)
 ```
 
-超限返回 `-32013 context_limit_exceeded`，不会调用 provider，也不会创建 turn、run 或 run 目录。
-当前没有自动压缩。
+Core 只使用上下文窗口的 90% 作为安全预算。超限返回 `-32013 context_limit_exceeded`，不会调用
+provider，也不会创建 turn、run 或 run 目录。当前没有自动压缩。
 
 ## 持久化与恢复
 

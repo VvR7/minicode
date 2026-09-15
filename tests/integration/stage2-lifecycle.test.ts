@@ -12,13 +12,21 @@ import {
   SessionListResultSchema,
   SessionSendMessageResultSchema,
   type ClientMessageId,
+  type RunId,
+  type TurnId,
 } from "../../packages/protocol/src/index.ts";
 import {
   NdjsonRpcConnection,
   SessionController,
   type SessionControllerEvent,
 } from "../../packages/client/src/index.ts";
-import { CoreApp } from "../../packages/core/src/index.ts";
+import {
+  CoreApp,
+  EventBus,
+  EventStore,
+  RunMetadataStore,
+  SessionStore,
+} from "../../packages/core/src/index.ts";
 import { TuiModel } from "../../packages/tui/src/model.ts";
 import {
   createBarrier,
@@ -39,6 +47,12 @@ function environment(baseUrl: string, tracePayload: "summary" | "full" = "full")
     MINICODE_TRACE_ENABLED: "true",
     MINICODE_TRACE_PAYLOAD: tracePayload,
   } as const;
+}
+
+/** 解包测试准备阶段必须成功的领域结果。 */
+function must<Value>(result: { ok: true; value: Value } | { ok: false }): Value {
+  if (!result.ok) throw new Error("expected test setup to succeed");
+  return result.value;
 }
 
 /** 等待指定 controller 的下一条 turn.committed，不使用轮询或墙钟等待。 */
@@ -83,6 +97,7 @@ describe("Stage2 complete lifecycle", () => {
     const workspace = await mkdtemp(join(tmpdir(), "minicode-stage2-workspace-"));
     await writeFile(join(workspace, "README.md"), "isolated workspace\n", "utf8");
     const streamBarrier = createBarrier();
+    const lostResponseBarrier = createBarrier();
     const busyBarrier = createBarrier();
     const replies = new Map<number, ScriptedReply>([
       [
@@ -120,7 +135,15 @@ describe("Stage2 complete lifecycle", () => {
       ],
       [4, { kind: "tools", calls: [{ id: "list-1", name: "task_list", input: {} }] }],
       [5, { kind: "text", chunks: ["second answer"] }],
-      [6, { kind: "text", chunks: ["idempotent answer"] }],
+      [
+        6,
+        {
+          kind: "text",
+          chunks: ["idempotent answer"],
+          barrier: lostResponseBarrier,
+          afterChunks: 1,
+        },
+      ],
       [7, { kind: "text", chunks: ["busy ", "winner"], barrier: busyBarrier, afterChunks: 1 }],
     ]);
     const mock = startScriptedAnthropicMock((_body, call) => {
@@ -154,6 +177,8 @@ describe("Stage2 complete lifecycle", () => {
       },
     });
     const audit = await NdjsonRpcConnection.connect(endpoint);
+    let slow: SessionController | undefined;
+    let releaseSlow = (): void => {};
 
     try {
       const session = await first.create(workspace);
@@ -184,6 +209,27 @@ describe("Stage2 complete lifecycle", () => {
           ),
         ).toHaveLength(1);
       }
+      expect(
+        secondEvents
+          .filter((event) => event.type === "run.event" && event.event.runId === accepted.runId)
+          .map((event) => (event.type === "run.event" ? event.event : undefined)),
+      ).toEqual(
+        firstEvents
+          .filter((event) => event.type === "run.event" && event.event.runId === accepted.runId)
+          .map((event) => (event.type === "run.event" ? event.event : undefined)),
+      );
+      const firstAcceptedEvent = firstEvents.find(
+        (event) => event.type === "turn.accepted" && event.runId === accepted.runId,
+      );
+      const secondSnapshot = secondEvents.find(
+        (event) => event.type === "turn.snapshot" && event.turn.runId === accepted.runId,
+      );
+      expect(firstAcceptedEvent).toMatchObject({
+        clientMessageId:
+          secondSnapshot?.type === "turn.snapshot" ? secondSnapshot.turn.clientMessageId : "",
+        turnId: secondSnapshot?.type === "turn.snapshot" ? secondSnapshot.turn.turnId : "",
+        runId: secondSnapshot?.type === "turn.snapshot" ? secondSnapshot.turn.runId : "",
+      });
 
       firstCommit = nextCommit(firstEvents);
       secondCommit = nextCommit(secondEvents);
@@ -205,11 +251,21 @@ describe("Stage2 complete lifecycle", () => {
         clientMessageId: duplicateId,
         content: "retry exactly once",
       };
-      const [original, retry] = await Promise.all([
-        audit.request(SESSION_SEND_MESSAGE_METHOD, duplicateParams, SessionSendMessageResultSchema),
-        audit.request(SESSION_SEND_MESSAGE_METHOD, duplicateParams, SessionSendMessageResultSchema),
-      ]);
-      expect(retry.result).toEqual(original.result);
+      const lostConnection = await NdjsonRpcConnection.connect(endpoint);
+      const droppedResponse = lostConnection.request(
+        SESSION_SEND_MESSAGE_METHOD,
+        duplicateParams,
+        SessionSendMessageResultSchema,
+      );
+      lostConnection.close();
+      void droppedResponse.catch(() => {});
+      await lostResponseBarrier.reached;
+      const retry = await audit.request(
+        SESSION_SEND_MESSAGE_METHOD,
+        duplicateParams,
+        SessionSendMessageResultSchema,
+      );
+      lostResponseBarrier.release();
       await Promise.all([firstCommit.promise, secondCommit.promise]);
       expect(mock.callCount).toBe(6);
       expect((await readdir(join(home, "sessions", session.sessionId, "runs"))).length).toBe(
@@ -218,6 +274,25 @@ describe("Stage2 complete lifecycle", () => {
 
       firstCommit = nextCommit(firstEvents);
       secondCommit = nextCommit(secondEvents);
+      const slowReached = Promise.withResolvers<void>();
+      const slowRelease = Promise.withResolvers<void>();
+      releaseSlow = slowRelease.resolve;
+      const slowCommitted =
+        Promise.withResolvers<Extract<SessionControllerEvent, { type: "turn.committed" }>>();
+      const slowModel = new TuiModel();
+      slow = new SessionController({
+        endpoint,
+        /** 故意阻塞一个 delta consumer，验证它不会拖住其他同 session 客户端。 */
+        onEvent: async (event) => {
+          slowModel.apply(event);
+          if (event.type === "run.event" && event.event.type === "llm.text_delta") {
+            slowReached.resolve();
+            await slowRelease.promise;
+          }
+          if (event.type === "turn.committed") slowCommitted.resolve(event);
+        },
+      });
+      await slow.attach(session.sessionId);
       const winning = audit.request(
         SESSION_SEND_MESSAGE_METHOD,
         {
@@ -228,6 +303,7 @@ describe("Stage2 complete lifecycle", () => {
         SessionSendMessageResultSchema,
       );
       await busyBarrier.reached;
+      await slowReached.promise;
       await expect(
         audit.request(
           SESSION_SEND_MESSAGE_METHOD,
@@ -242,6 +318,15 @@ describe("Stage2 complete lifecycle", () => {
       busyBarrier.release();
       await winning;
       await Promise.all([firstCommit.promise, secondCommit.promise]);
+      slowRelease.resolve();
+      const slowTerminal = await slowCommitted.promise;
+      expect(slowTerminal.status).toBe("succeeded");
+      expect(
+        slowModel
+          .snapshot()
+          .lines.filter((line) => line.kind === "assistant")
+          .at(-1)?.text,
+      ).toBe("[ASSISTANT] busy winner");
 
       const history = await audit.request(
         SESSION_GET_HISTORY_METHOD,
@@ -252,6 +337,9 @@ describe("Stage2 complete lifecycle", () => {
       expect(
         history.result.turns.filter((turn) => turn.clientMessageId === duplicateId),
       ).toHaveLength(1);
+      expect(
+        history.result.turns.find((turn) => turn.clientMessageId === duplicateId),
+      ).toMatchObject({ turnId: retry.result.turnId, runId: retry.result.runId });
       expect(history.result.turns[0]?.taskGraph).toMatchObject({
         revision: 3,
         tasks: [{ id: 1, status: "completed" }],
@@ -281,8 +369,12 @@ describe("Stage2 complete lifecycle", () => {
       expect(trace).toContain("llm.response");
       expect(trace).not.toContain(SECRET);
     } finally {
+      streamBarrier.release();
+      lostResponseBarrier.release();
+      busyBarrier.release();
+      releaseSlow();
       audit.close();
-      await Promise.all([first.dispose(), second.dispose()]);
+      await Promise.all([first.dispose(), second.dispose(), slow?.dispose()]);
       await app.stop();
       await mock.stop();
       await Promise.all([
@@ -312,7 +404,20 @@ describe("Stage2 complete lifecycle", () => {
         contextCheckRequest = body;
         return { kind: "text", chunks: ["clean context"] };
       }
-      return { kind: "text", chunks: ["other session succeeds"] };
+      if (serialized.includes("other workspace question"))
+        return serialized.includes('"type":"tool_result"')
+          ? { kind: "text", chunks: ["other session succeeds"] }
+          : {
+              kind: "tools",
+              calls: [
+                {
+                  id: "task-b",
+                  name: "task_create",
+                  input: { subject: "Session B", description: "Must stay in session B" },
+                },
+              ],
+            };
+      throw new Error("unexpected scripted request");
     });
     const app = new CoreApp(
       { host: "127.0.0.1", port: 0, logLevel: "error", homeDirectory: home },
@@ -362,10 +467,46 @@ describe("Stage2 complete lifecycle", () => {
           (event) => "sessionId" in event && event.sessionId === firstSession.sessionId,
         ),
       ).toBe(false);
+      const firstHistory = await first.list({ workspaceRoot: firstWorkspace });
+      const secondHistory = await second.list({
+        workspaceRoot: secondWorkspace,
+      });
+      expect(firstHistory.sessions.map((session) => session.sessionId)).toEqual([
+        firstSession.sessionId,
+      ]);
+      expect(secondHistory.sessions.map((session) => session.sessionId)).toEqual([
+        secondSession.sessionId,
+      ]);
+
+      const firstRunDirectory = join(
+        home,
+        "sessions",
+        firstSession.sessionId,
+        "runs",
+        cancelledAccepted.runId,
+      );
+      const secondRunDirectory = join(
+        home,
+        "sessions",
+        secondSession.sessionId,
+        "runs",
+        successfulSend.runId,
+      );
+      expect(await Bun.file(join(firstRunDirectory, "tasks.json")).exists()).toBe(false);
+      expect(
+        JSON.parse(await readFile(join(secondRunDirectory, "tasks.json"), "utf8")),
+      ).toMatchObject({ revision: 1, tasks: [{ subject: "Session B" }] });
+      expect(await readFile(join(firstRunDirectory, "trace.jsonl"), "utf8")).not.toContain(
+        secondSession.sessionId,
+      );
+      expect(await readFile(join(secondRunDirectory, "trace.jsonl"), "utf8")).not.toContain(
+        firstSession.sessionId,
+      );
 
       firstCommit = nextCommit(firstEvents);
       await first.sendMessage("failed turn");
-      expect(await firstCommit.promise).toMatchObject({ status: "failed" });
+      const failedTerminal = await firstCommit.promise;
+      expect(failedTerminal).toMatchObject({ status: "failed" });
 
       firstCommit = nextCommit(firstEvents);
       await first.sendMessage("context check");
@@ -387,6 +528,19 @@ describe("Stage2 complete lifecycle", () => {
       );
       expect(cancelledTrace).toContain("llm.cancelled");
       expect(cancelledTrace).not.toContain(SECRET);
+      expect(
+        await readFile(
+          join(
+            home,
+            "sessions",
+            firstSession.sessionId,
+            "runs",
+            failedTerminal.runId,
+            "trace.jsonl",
+          ),
+          "utf8",
+        ),
+      ).toContain("llm.error");
       expect(await readdir(join(home, "sessions", secondSession.sessionId, "runs"))).toEqual([
         successfulSend.runId,
       ]);
@@ -399,6 +553,317 @@ describe("Stage2 complete lifecycle", () => {
         rm(home, { recursive: true, force: true }),
         rm(firstWorkspace, { recursive: true, force: true }),
         rm(secondWorkspace, { recursive: true, force: true }),
+      ]);
+    }
+  }, 20_000);
+
+  test("reconciles crash cuts deterministically and isolates a conflicting session", async () => {
+    const home = await mkdtemp(join(tmpdir(), "minicode-stage2-recovery-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "minicode-stage2-recovery-workspace-"));
+    const sessions = new SessionStore(home);
+    const metadata = new RunMetadataStore(home);
+    const eventStore = new EventStore(home);
+    const eventBus = new EventBus(eventStore);
+
+    /** 在真实磁盘写入 accepted 状态，模拟 Core 在后续终态切点前崩溃。 */
+    const seedAccepted = async (goal: string) => {
+      const session = must(await sessions.create({ workspaceRoot: workspace, mode: "chat" }));
+      const turnId = crypto.randomUUID() as TurnId;
+      const runId = crypto.randomUUID() as RunId;
+      await sessions.appendAccepted(session.meta.sessionId, {
+        turnId,
+        runId,
+        clientMessageId: crypto.randomUUID() as ClientMessageId,
+        userMessage: goal,
+      });
+      await metadata.create({
+        sessionId: session.meta.sessionId,
+        turnId,
+        runId,
+        workspaceRoot: workspace,
+        model: "stage2-test-model",
+      });
+      return { sessionId: session.meta.sessionId, turnId, runId };
+    };
+
+    const interrupted = await seedAccepted("unfinished crash turn");
+    await eventBus.publish({
+      sessionId: interrupted.sessionId,
+      runId: interrupted.runId,
+      timestamp: new Date().toISOString(),
+      durable: true,
+      type: "run.started",
+      payload: {},
+    });
+
+    const historyCompleted = await seedAccepted("history committed before crash");
+    await sessions.appendCompleted(historyCompleted.sessionId, {
+      turnId: historyCompleted.turnId,
+      runId: historyCompleted.runId,
+      status: "succeeded",
+      reason: "completed",
+      messages: [
+        {
+          messageId: crypto.randomUUID(),
+          turnId: historyCompleted.turnId,
+          runId: historyCompleted.runId,
+          role: "user",
+          timestamp: new Date().toISOString(),
+          content: [{ type: "text", text: "history committed before crash" }],
+        },
+        {
+          messageId: crypto.randomUUID(),
+          turnId: historyCompleted.turnId,
+          runId: historyCompleted.runId,
+          role: "assistant",
+          timestamp: new Date().toISOString(),
+          content: [{ type: "text", text: "durable answer" }],
+        },
+      ],
+      model: "stage2-test-model",
+      runResult: {
+        status: "succeeded",
+        reason: "completed",
+        finalText: "durable answer",
+        steps: 1,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+    });
+
+    const conflicting = await seedAccepted("conflicting terminal");
+    await sessions.appendCompleted(conflicting.sessionId, {
+      turnId: conflicting.turnId,
+      runId: conflicting.runId,
+      status: "succeeded",
+      reason: "completed",
+      messages: [
+        {
+          messageId: crypto.randomUUID(),
+          turnId: conflicting.turnId,
+          runId: conflicting.runId,
+          role: "user",
+          timestamp: new Date().toISOString(),
+          content: [{ type: "text", text: "conflicting terminal" }],
+        },
+        {
+          messageId: crypto.randomUUID(),
+          turnId: conflicting.turnId,
+          runId: conflicting.runId,
+          role: "assistant",
+          timestamp: new Date().toISOString(),
+          content: [{ type: "text", text: "expected answer" }],
+        },
+      ],
+      model: "stage2-test-model",
+      runResult: {
+        status: "succeeded",
+        reason: "completed",
+        finalText: "expected answer",
+        steps: 1,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+      },
+    });
+    await eventBus.publish({
+      sessionId: conflicting.sessionId,
+      runId: conflicting.runId,
+      timestamp: new Date().toISOString(),
+      durable: true,
+      type: "run.finished",
+      payload: {
+        status: "failed",
+        reason: "llm_error",
+        finalText: "",
+        steps: 1,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+        },
+        error: { code: "llm_error", message: "run failed (llm_error)" },
+      },
+    });
+
+    let followUpRequest: unknown;
+    const mock = startScriptedAnthropicMock((body) => {
+      followUpRequest = body;
+      return { kind: "text", chunks: ["recovered cleanly"] };
+    });
+    const app = new CoreApp(
+      { host: "127.0.0.1", port: 0, logLevel: "error", homeDirectory: home },
+      environment(mock.url, "summary"),
+    );
+    const endpoint = app.start();
+    const model = new TuiModel();
+    const controllerEvents: SessionControllerEvent[] = [];
+    let committed = nextCommit(controllerEvents);
+    const controller = new SessionController({
+      endpoint,
+      onEvent: (event) => {
+        model.apply(event);
+        committed.accept(event);
+      },
+    });
+    const audit = await NdjsonRpcConnection.connect(endpoint);
+
+    try {
+      await controller.attach(interrupted.sessionId);
+      expect(model.snapshot().lines.some((line) => line.text.includes("interrupted"))).toBe(true);
+      committed = nextCommit(controllerEvents);
+      await controller.sendMessage("after recovery");
+      await committed.promise;
+      expect(JSON.stringify(messagesOf(followUpRequest))).not.toContain("unfinished crash turn");
+
+      const interruptedHistory = await audit.request(
+        SESSION_GET_HISTORY_METHOD,
+        { sessionId: interrupted.sessionId },
+        SessionGetHistoryResultSchema,
+      );
+      expect(interruptedHistory.result.turns.map((turn) => turn.status)).toEqual([
+        "interrupted",
+        "succeeded",
+      ]);
+      expect(interruptedHistory.result.turns[0]?.includedInContext).toBe(false);
+      const interruptedJournal = must(
+        await eventStore.read(interrupted.sessionId, interrupted.runId),
+      );
+      expect(
+        interruptedJournal.events.filter((event) => event.type === "run.finished"),
+      ).toHaveLength(1);
+
+      const repairedHistory = await audit.request(
+        SESSION_GET_HISTORY_METHOD,
+        { sessionId: historyCompleted.sessionId },
+        SessionGetHistoryResultSchema,
+      );
+      expect(repairedHistory.result.turns).toHaveLength(1);
+      expect(
+        must(
+          await eventStore.read(historyCompleted.sessionId, historyCompleted.runId),
+        ).events.filter((event) => event.type === "run.finished"),
+      ).toHaveLength(1);
+
+      const listed = await controller.list({ workspaceRoot: workspace });
+      expect(
+        listed.sessions.find((session) => session.sessionId === conflicting.sessionId)?.status,
+      ).toBe("corrupted");
+      expect(
+        listed.sessions.find((session) => session.sessionId === interrupted.sessionId)?.status,
+      ).toBe("idle");
+
+      const summaryTrace = await readFile(
+        join(
+          home,
+          "sessions",
+          interrupted.sessionId,
+          "runs",
+          interruptedHistory.result.turns[1]?.runId ?? "missing",
+          "trace.jsonl",
+        ),
+        "utf8",
+      );
+      expect(summaryTrace).toContain("[summarized]");
+      expect(summaryTrace).not.toContain("after recovery");
+      expect(summaryTrace).not.toContain(SECRET);
+    } finally {
+      audit.close();
+      await controller.dispose();
+      await app.stop();
+      await mock.stop();
+      await Promise.all([
+        rm(home, { recursive: true, force: true }),
+        rm(workspace, { recursive: true, force: true }),
+      ]);
+    }
+  }, 20_000);
+
+  test("daemon shutdown commits one cancelled terminal that a restarted Core can audit", async () => {
+    const home = await mkdtemp(join(tmpdir(), "minicode-stage2-shutdown-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "minicode-stage2-shutdown-workspace-"));
+    const shutdownBarrier = createBarrier();
+    const firstMock = startScriptedAnthropicMock(() => ({
+      kind: "text",
+      chunks: ["before shutdown", "ignored completion"],
+      barrier: shutdownBarrier,
+      afterChunks: 1,
+    }));
+    const firstApp = new CoreApp(
+      { host: "127.0.0.1", port: 0, logLevel: "error", homeDirectory: home },
+      environment(firstMock.url),
+    );
+    const firstEndpoint = firstApp.start();
+    const firstController = new SessionController({ endpoint: firstEndpoint, onEvent: () => {} });
+
+    try {
+      const session = await firstController.create(workspace);
+      const accepted = await firstController.sendMessage("shutdown active run");
+      await shutdownBarrier.reached;
+      await firstController.dispose();
+      const stopping = firstApp.stop();
+      shutdownBarrier.release();
+      await stopping;
+      await firstMock.stop();
+
+      const secondMock = startScriptedAnthropicMock(() => ({
+        kind: "text",
+        chunks: ["unused"],
+      }));
+      const secondApp = new CoreApp(
+        { host: "127.0.0.1", port: 0, logLevel: "error", homeDirectory: home },
+        environment(secondMock.url),
+      );
+      const secondEndpoint = secondApp.start();
+      const model = new TuiModel();
+      const secondController = new SessionController({
+        endpoint: secondEndpoint,
+        onEvent: (event) => {
+          model.apply(event);
+        },
+      });
+      const audit = await NdjsonRpcConnection.connect(secondEndpoint);
+      try {
+        await secondController.attach(session.sessionId);
+        const history = await audit.request(
+          SESSION_GET_HISTORY_METHOD,
+          { sessionId: session.sessionId },
+          SessionGetHistoryResultSchema,
+        );
+        expect(history.result.turns).toHaveLength(1);
+        expect(history.result.turns[0]).toMatchObject({
+          runId: accepted.runId,
+          status: "cancelled",
+          includedInContext: false,
+        });
+        expect(model.snapshot().lines.some((line) => line.text.includes("cancelled"))).toBe(true);
+        expect(
+          must(await new EventStore(home).read(session.sessionId, accepted.runId)).events.filter(
+            (event) => event.type === "run.finished",
+          ),
+        ).toHaveLength(1);
+      } finally {
+        audit.close();
+        await secondController.dispose();
+        await secondApp.stop();
+        await secondMock.stop();
+      }
+    } finally {
+      shutdownBarrier.release();
+      await firstController.dispose();
+      await firstApp.stop();
+      await firstMock.stop();
+      await Promise.all([
+        rm(home, { recursive: true, force: true }),
+        rm(workspace, { recursive: true, force: true }),
       ]);
     }
   }, 20_000);

@@ -7,8 +7,8 @@ export {
   NEW_SESSION_TITLE,
   SessionStore,
 } from "./session-store.ts";
-export { NoteStore } from "./notes.ts";
-export type { NoteIdentity } from "./notes.ts";
+export { NoteStore, parseSessionNotes, SessionNoteRecordSchema } from "./notes.ts";
+export type { NoteIdentity, SessionNoteRecord } from "./notes.ts";
 export { nodeSessionStorage } from "./storage.ts";
 export type { SessionStorage } from "./storage.ts";
 export {

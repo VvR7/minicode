@@ -96,7 +96,7 @@ export function renderWireProtocol(): string {
 - JSON-RPC version \`2.0\` with one request, response, or server notification object per frame.
 - Request IDs are non-empty strings or safe integers and are echoed unchanged.
 - Client-to-server notifications and batch arrays are not supported and return \`-32600\`.
-- Server-to-client \`event.push\` notifications have no request ID and carry one typed agent event.
+- Server-to-client \`event.push\` notifications have no request ID and carry one typed run or session event.
 - Objects are strict: unknown fields are rejected.
 
 ## Agent and event stream

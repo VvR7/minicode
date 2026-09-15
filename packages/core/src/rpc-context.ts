@@ -10,4 +10,6 @@ export interface RpcConnection {
 
 export interface RpcInvocationContext {
   readonly connection: RpcConnection;
+  /** 已通过 envelope 校验的请求 ID，供 run-scoped Trace 关联 IPC 边界。 */
+  readonly requestId?: string;
 }

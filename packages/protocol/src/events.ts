@@ -1,7 +1,12 @@
 import { z } from "zod";
 import { RunIdSchema, SessionIdSchema, SubscriptionIdSchema } from "./agent.ts";
 import { jsonRpcNotificationSchema } from "./json-rpc.ts";
-import { SessionEventSchema, TaskSnapshotSchema, type SessionEvent } from "./session.ts";
+import {
+  SessionTurnAcceptedEventSchema,
+  SessionTurnFinishedEventSchema,
+  TaskSnapshotSchema,
+  type SessionEvent,
+} from "./session.ts";
 
 export const EVENT_PUSH_METHOD = "event.push" as const;
 
@@ -21,11 +26,16 @@ const EventBaseShape = {
   durable: z.boolean(),
 };
 
-function eventSchema<const Type extends string, PayloadSchema extends z.ZodType>(
+function eventSchema<
+  const Type extends string,
+  PayloadSchema extends z.ZodType,
+  DurableSchema extends z.ZodType = z.ZodBoolean,
+>(
   type: Type,
   payload: PayloadSchema,
+  durable: DurableSchema = z.boolean() as unknown as DurableSchema,
 ) {
-  return z.strictObject({ ...EventBaseShape, type: z.literal(type), payload });
+  return z.strictObject({ ...EventBaseShape, durable, type: z.literal(type), payload });
 }
 
 const ToolIdentityShape = {
@@ -53,6 +63,7 @@ export const LlmTextDeltaEventSchema = eventSchema(
       .min(1)
       .max(16 * 1024),
   }),
+  z.literal(true),
 );
 export const LlmRetryingEventSchema = eventSchema(
   "llm.retrying",
@@ -62,6 +73,7 @@ export const LlmRetryingEventSchema = eventSchema(
     delayMs: z.number().int().nonnegative(),
     reason: z.enum(["network", "rate_limit", "unavailable"]),
   }),
+  z.literal(true),
 );
 export const LlmUsageEventSchema = eventSchema("llm.usage", LlmUsageSchema);
 export const ToolStartedEventSchema = eventSchema(
@@ -80,6 +92,7 @@ export const ToolRetryingEventSchema = eventSchema(
     delayMs: z.number().int().nonnegative(),
     errorCode: z.string().min(1).max(128),
   }),
+  z.literal(true),
 );
 export const ToolFinishedEventSchema = eventSchema(
   "tool.finished",
@@ -167,15 +180,32 @@ export const AgentEventSchema = z.discriminatedUnion("type", [
 ]);
 export type AgentEvent = z.infer<typeof AgentEventSchema>;
 
+/** event.push 顶层按 type 一次判别，避免嵌套 union 产生含糊分支。 */
+export const PushedEventSchema = z.discriminatedUnion("type", [
+  RunStartedEventSchema,
+  StepStartedEventSchema,
+  LlmModelSelectedEventSchema,
+  LlmTextDeltaEventSchema,
+  LlmRetryingEventSchema,
+  LlmUsageEventSchema,
+  ToolStartedEventSchema,
+  ToolRetryingEventSchema,
+  ToolFinishedEventSchema,
+  StepFinishedEventSchema,
+  TaskCreatedEventSchema,
+  TaskUpdatedEventSchema,
+  RunFinishedEventSchema,
+  SessionTurnAcceptedEventSchema,
+  SessionTurnFinishedEventSchema,
+]);
+export type PushedEvent = z.infer<typeof PushedEventSchema>;
+
 export const EventPushParamsSchema = z.strictObject({
   subscriptionId: SubscriptionIdSchema,
   // event.push 同时承载 run 事件与 session 事件，二者都按 type 严格判别。
-  event: z.union([AgentEventSchema, SessionEventSchema]),
+  event: PushedEventSchema,
 });
 export type EventPushParams = z.infer<typeof EventPushParamsSchema>;
-
-/** event.push 载荷中的两种事件域。 */
-export type PushedEvent = AgentEvent | SessionEvent;
 
 /** 判别当前 push 事件是否为 run 级 AgentEvent（携带 runId 与 run sequence）。 */
 export function isAgentEvent(event: PushedEvent): event is AgentEvent {

@@ -119,6 +119,9 @@ describe("checkContextBudget", () => {
       () => 2,
     );
     expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.code).toBe("context_limit_exceeded");
+    }
     expect(result.usage.estimatedInputTokens + result.usage.maxOutputTokens).toBeGreaterThan(
       safeBudget,
     );

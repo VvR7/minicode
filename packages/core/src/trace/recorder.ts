@@ -1,5 +1,6 @@
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { RunId, SessionId } from "@minicode/protocol";
+import { RunIdSchema, SessionIdSchema } from "@minicode/protocol";
 import { redact, summarize, truncateFields } from "./redact.ts";
 import {
   TRACE_SCHEMA_VERSION,
@@ -31,7 +32,18 @@ export function runTraceDirectory(
   sessionId: SessionId,
   runId: RunId,
 ): string {
-  return join(homeDirectory, "sessions", sessionId, "runs", runId);
+  if (!isAbsolute(homeDirectory)) {
+    throw new Error("trace home directory must be absolute");
+  }
+  const safeSessionId = SessionIdSchema.parse(sessionId);
+  const safeRunId = RunIdSchema.parse(runId);
+  const home = resolve(homeDirectory);
+  const directory = join(home, "sessions", safeSessionId, "runs", safeRunId);
+  const suffix = relative(home, directory);
+  if (suffix.startsWith("..") || isAbsolute(suffix)) {
+    throw new Error("trace directory escapes configured home");
+  }
+  return directory;
 }
 
 /**
@@ -50,18 +62,27 @@ export class TraceRecorder {
     runId: RunId,
     config: TraceConfig,
     storage: TraceStorage,
-    directory: string,
+    homeDirectory: string,
     now: () => string = () => new Date().toISOString(),
   ) {
     this.#sessionId = sessionId;
     this.#runId = runId;
     this.#config = config;
-    this.#writer = new TraceWriter(sessionId, runId, config, storage, directory);
+    this.#writer = new TraceWriter(
+      sessionId,
+      runId,
+      config,
+      storage,
+      runTraceDirectory(homeDirectory, sessionId, runId),
+    );
     this.#now = now;
   }
 
   /** 幂等启动后台 writer。 */
   start(): void {
+    if (!this.#config.enabled) {
+      return;
+    }
     this.#writer.start();
   }
 
@@ -70,32 +91,30 @@ export class TraceRecorder {
     if (!this.#config.enabled) {
       return;
     }
-    let data: unknown = args.data;
     try {
-      data = this.#config.payload === "summary" ? summarize(args.data) : args.data;
+      let data: unknown = this.#config.payload === "summary" ? summarize(args.data) : args.data;
       data = redact(data);
       data = truncateFields(data);
+      const record: TraceRecordInput = {
+        schemaVersion: TRACE_SCHEMA_VERSION,
+        observedAt: this.#now(),
+        source: args.source,
+        target: args.target,
+        kind: args.kind,
+        sessionId: this.#sessionId,
+        runId: this.#runId,
+        ...(args.step === undefined ? {} : { step: args.step }),
+        ...(args.connectionId === undefined ? {} : { connectionId: args.connectionId }),
+        ...(args.requestId === undefined ? {} : { requestId: args.requestId }),
+        ...(args.durationMs === undefined ? {} : { durationMs: args.durationMs }),
+        ...(data !== null && typeof data === "object" && !Array.isArray(data)
+          ? { data: data as Record<string, unknown> }
+          : {}),
+      };
+      this.#writer.enqueue(record);
     } catch {
-      return;
+      // 时钟、payload 处理或入队异常都不能影响真实 run。
     }
-
-    const record: TraceRecordInput = {
-      schemaVersion: TRACE_SCHEMA_VERSION,
-      observedAt: this.#now(),
-      source: args.source,
-      target: args.target,
-      kind: args.kind,
-      sessionId: this.#sessionId,
-      runId: this.#runId,
-      ...(args.step === undefined ? {} : { step: args.step }),
-      ...(args.connectionId === undefined ? {} : { connectionId: args.connectionId }),
-      ...(args.requestId === undefined ? {} : { requestId: args.requestId }),
-      ...(args.durationMs === undefined ? {} : { durationMs: args.durationMs }),
-      ...(data !== null && typeof data === "object" && !Array.isArray(data)
-        ? { data: data as Record<string, unknown> }
-        : {}),
-    };
-    this.#writer.enqueue(record);
   }
 
   /** 幂等停止并返回诊断报告。 */

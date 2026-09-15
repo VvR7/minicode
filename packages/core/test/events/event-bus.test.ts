@@ -129,7 +129,21 @@ describe("EventBus", () => {
     const storage = new MemoryJournalStorage();
     const firstBus = new EventBus(new EventStore("/memory", storage));
     expect((await firstBus.publish(startedInput())).ok).toBe(true);
-    expect((await firstBus.publish(deltaInput("ephemeral secret"))).ok).toBe(true);
+    expect(
+      (
+        await firstBus.publish({
+          ...startedInput(),
+          durable: false,
+          type: "llm.usage",
+          payload: {
+            inputTokens: 99,
+            outputTokens: 0,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+        })
+      ).ok,
+    ).toBe(true);
 
     const restartedBus = new EventBus(new EventStore("/memory", storage));
     const next = await restartedBus.publish({
@@ -151,7 +165,7 @@ describe("EventBus", () => {
     await Promise.resolve();
     expect(replayed).toEqual([3]);
     const journal = storage.files.get(new EventStore("/memory", storage).pathFor(SESSION_A, RUN_A));
-    expect(journal).not.toContain("ephemeral secret");
+    expect(journal).not.toContain('"inputTokens":99');
   });
 
   test("disconnects a slow subscriber without blocking another run", async () => {

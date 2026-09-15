@@ -289,6 +289,27 @@ describe("NDJSON RPC server", () => {
     expect(socket.destroyed).toBe(true);
   });
 
+  test("beginShutdown closes admission until the second shutdown phase finishes", async () => {
+    const { server, endpoint } = startServer();
+    const socket = createConnection({ host: endpoint.host, port: endpoint.port });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+
+    server.beginShutdown();
+    expect(() => server.start()).toThrow("server already started");
+
+    socket.write(pingFrame("too-late"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(socket.readableLength).toBe(0);
+
+    const closed = new Promise<void>((resolve) => socket.once("close", resolve));
+    await server.stop(100);
+    await closed;
+    expect(socket.destroyed).toBe(true);
+  });
+
   test("disconnects a stopped-reading event client without delaying a healthy client", async () => {
     const bus = new EventBus(new EventStore("/memory", new MemoryJournalStorage()));
     const broadcaster = new IpcEventBroadcaster(bus);

@@ -99,12 +99,14 @@ export interface TraceShutdownReport {
 /** Trace 写入的最小存储契约，测试可注入内存/故障实现。 */
 export interface TraceStorage {
   /** 递归创建目录并收紧 0700。 */
-  ensureDirectory(path: string): Promise<void>;
+  ensureDirectory(path: string, signal: AbortSignal): Promise<void>;
+  /** 读取已有 trace；文件不存在返回 undefined，用于恢复大小与 sequence。 */
+  readFile(path: string, signal: AbortSignal): Promise<string | undefined>;
   /** 以追加模式打开 trace 文件并收紧 0600。 */
-  openAppend(path: string): Promise<TraceStorageHandle>;
+  openAppend(path: string, signal: AbortSignal): Promise<TraceStorageHandle>;
 }
 
 export interface TraceStorageHandle {
-  write(text: string): Promise<void>;
+  write(text: string, signal: AbortSignal): Promise<void>;
   close(): Promise<void>;
 }

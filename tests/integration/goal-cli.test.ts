@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,14 +59,35 @@ async function waitUntilListening(port: number, timeoutMs = 3_000): Promise<void
   throw new Error(`core did not start listening on port ${port}`);
 }
 
-async function waitFor(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+async function waitFor(
+  condition: () => boolean | Promise<boolean>,
+  timeoutMs = 5_000,
+): Promise<void> {
   const deadline = performance.now() + timeoutMs;
-  while (!condition()) {
+  while (!(await condition())) {
     if (performance.now() > deadline) {
       throw new Error("waitFor timed out");
     }
     await Bun.sleep(10);
   }
+}
+
+/** 找到单次测试 run 的 trace.jsonl；文件尚未出现时返回 undefined。 */
+async function findOnlyTrace(homeDirectory: string): Promise<string | undefined> {
+  try {
+    const sessions = await readdir(join(homeDirectory, "sessions"));
+    for (const sessionId of sessions) {
+      const runs = await readdir(join(homeDirectory, "sessions", sessionId, "runs"));
+      for (const runId of runs) {
+        const path = join(homeDirectory, "sessions", sessionId, "runs", runId, "trace.jsonl");
+        const content = await readFile(path, "utf8");
+        if (content.includes('"kind":"llm.response"')) return content;
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 interface CoreSpawnEnv {
@@ -195,6 +216,32 @@ describe("mc --goal process-level E2E", () => {
     expect(result.stderr).toContain("run succeeded (completed)");
     // 两次 LLM 调用：首次 tool_use，第二次含 tool_result 后给出最终回答。
     expect(mock.callCount).toBe(2);
+
+    let trace: string | undefined;
+    await waitFor(async () => {
+      trace = await findOnlyTrace(homeDirectory);
+      return trace !== undefined;
+    });
+    const records = (trace ?? "")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { kind: string; sequence: number });
+    const kinds = records.map((record) => record.kind);
+    for (const kind of [
+      "ipc.request_received",
+      "ipc.response_queued",
+      "ipc.response_sent",
+      "core.event_persisted",
+      "llm.request",
+      "llm.stream_delta",
+      "llm.response",
+    ]) {
+      expect(kinds).toContain(kind);
+    }
+    expect(records.map((record) => record.sequence)).toEqual(records.map((_, index) => index + 1));
+    expect(trace).not.toContain("summarize the README");
+    expect(trace).not.toContain("content-alpha");
+    expect(trace).not.toContain("test-key");
   });
 
   test("two concurrent CLI runs read different workspaces without cross-talk", async () => {

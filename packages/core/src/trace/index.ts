@@ -4,6 +4,8 @@ export { TraceRecorder, runTraceDirectory } from "./recorder.ts";
 export type { TraceRecordArgs } from "./recorder.ts";
 export { REDACTED, isCredentialKey, redact, summarize, truncateFields } from "./redact.ts";
 export { nodeTraceStorage } from "./storage.ts";
+export { TraceService } from "./service.ts";
+export type { TraceDiagnostic } from "./service.ts";
 export {
   TRACE_FIELD_MAX_BYTES,
   TRACE_MAX_BYTES_DEFAULT,
@@ -35,4 +37,3 @@ export type {
   TraceStorageHandle,
   TraceTarget,
 } from "./types.ts";
-export { TraceWriter } from "./writer.ts";

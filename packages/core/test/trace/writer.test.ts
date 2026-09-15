@@ -186,6 +186,7 @@ describe("TraceWriter", () => {
       const report = await writer.stop();
       expect(performance.now() - started).toBeLessThan(150);
       expect(report.timedOut).toBe(true);
+      expect(report.pendingRecords).toBe(1);
     }
   });
 

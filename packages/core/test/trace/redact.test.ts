@@ -163,6 +163,11 @@ describe("summarize", () => {
     const output = summarize({ userMessage: "secret", toolInput: "secret", random: "secret" });
     expect(JSON.stringify(output)).not.toContain("secret");
   });
+
+  test("does not trust malformed safe-container values", () => {
+    const output = summarize({ messages: ["SECRET"], tools: "SECRET", usage: "SECRET" });
+    expect(JSON.stringify(output)).not.toContain("SECRET");
+  });
 });
 
 describe("truncateFields", () => {

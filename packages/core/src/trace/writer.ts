@@ -45,6 +45,9 @@ export class TraceWriter {
   #stopPromise: Promise<TraceShutdownReport> | null = null;
   #report: TraceShutdownReport | null = null;
   #abandoned = false;
+  #inFlightRecords = 0;
+  #timedOutPendingRecords = 0;
+  readonly #abortController = new AbortController();
 
   constructor(
     sessionId: SessionId,
@@ -103,6 +106,8 @@ export class TraceWriter {
       const timeout = setTimeout(() => {
         this.#timedOut = true;
         this.#abandoned = true;
+        this.#timedOutPendingRecords = this.#queue.length + this.#inFlightRecords;
+        this.#abortController.abort();
         this.#wake();
         void this.#handle?.close().catch(() => {});
         this.#report ??= this.#buildReport();
@@ -120,16 +125,23 @@ export class TraceWriter {
   /** 后台 worker：打开文件后循环刷盘，直到停止且队列清空或超时。 */
   async #runWorker(): Promise<void> {
     try {
-      await this.#storage.ensureDirectory(dirname(this.#path));
+      const signal = this.#abortController.signal;
+      await this.#raceIo(this.#storage.ensureDirectory(dirname(this.#path), signal));
       if (this.#abandoned) return;
-      const existing = await this.#storage.readFile(this.#path);
+      const existing = await this.#raceIo(this.#storage.readFile(this.#path, signal));
       if (this.#abandoned) return;
       if (!this.#restoreExisting(existing)) {
         this.#writeFailed = true;
         this.#stopped = true;
         return;
       }
-      this.#handle = await this.#storage.openAppend(this.#path);
+      const opening = this.#storage.openAppend(this.#path, signal);
+      void opening
+        .then((handle) => {
+          if (this.#abandoned) void handle.close().catch(() => {});
+        })
+        .catch(() => {});
+      this.#handle = await this.#raceIo(opening);
       if (this.#abandoned) {
         await this.#handle.close().catch(() => {});
         return;
@@ -156,12 +168,30 @@ export class TraceWriter {
         break;
       }
       const record = this.#queue.shift() as TraceRecordInput;
-      await this.#writeRecord(record);
+      this.#inFlightRecords += 1;
+      try {
+        await this.#writeRecord(record);
+      } finally {
+        this.#inFlightRecords -= 1;
+      }
       if (this.#writeFailed) {
         break;
       }
     }
-    await this.#handle.close().catch(() => {});
+    await this.#raceIo(this.#handle.close()).catch(() => {});
+  }
+
+  /** 让 worker 可在 shutdown 时退出，即使底层 Promise 永久不完成。 */
+  #raceIo<Value>(operation: Promise<Value>): Promise<Value> {
+    const signal = this.#abortController.signal;
+    if (signal.aborted) return Promise.reject(new Error("trace writer stopped"));
+    return new Promise<Value>((resolve, reject) => {
+      const onAbort = (): void => reject(new Error("trace writer stopped"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      void operation
+        .then(resolve, reject)
+        .finally(() => signal.removeEventListener("abort", onAbort));
+    });
   }
 
   /** 校验已有 JSONL，并从最后一条记录恢复文件大小与下一 sequence。 */
@@ -243,7 +273,8 @@ export class TraceWriter {
     }
 
     try {
-      await this.#handle?.write(line);
+      if (this.#handle === null) throw new Error("trace handle is unavailable");
+      await this.#raceIo(this.#handle.write(line, this.#abortController.signal));
       if (this.#abandoned) return;
       this.#bytesWritten += lineBytes;
       this.#recordsWritten += 1;
@@ -277,7 +308,8 @@ export class TraceWriter {
       return;
     }
     try {
-      await this.#handle?.write(line);
+      if (this.#handle === null) throw new Error("trace handle is unavailable");
+      await this.#raceIo(this.#handle.write(line, this.#abortController.signal));
       if (this.#abandoned) return;
       this.#bytesWritten += lineBytes;
       this.#recordsWritten += 1;
@@ -328,7 +360,9 @@ export class TraceWriter {
     return {
       bytesWritten: this.#bytesWritten,
       recordsWritten: this.#recordsWritten,
-      pendingRecords: this.#queue.length,
+      pendingRecords: this.#timedOut
+        ? this.#timedOutPendingRecords
+        : this.#queue.length + this.#inFlightRecords,
       droppedRecords: this.#droppedRecords,
       droppedBytes: this.#droppedBytes,
       timedOut: this.#timedOut,

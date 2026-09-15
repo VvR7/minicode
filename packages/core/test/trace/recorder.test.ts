@@ -127,6 +127,24 @@ describe("TraceRecorder", () => {
     expect(report.droppedRecords).toBe(1);
   });
 
+  test("swallows a throwing clock", () => {
+    const storage = new MemoryTraceStorage();
+    const recorder = new TraceRecorder(
+      SESSION_A,
+      RUN_A,
+      { enabled: true, payload: "full", queueEvents: 100, maxBytes: 1_000_000, shutdownMs: 100 },
+      storage,
+      "/home",
+      () => {
+        throw new Error("clock failed");
+      },
+    );
+    recorder.start();
+    expect(() =>
+      recorder.record({ source: "CORE", target: "CORE", kind: "ipc.error" }),
+    ).not.toThrow();
+  });
+
   test("records a complete ipc/core/llm timeline with paired terminal records", async () => {
     const storage = new MemoryTraceStorage();
     const recorder = makeRecorder(storage, "full");

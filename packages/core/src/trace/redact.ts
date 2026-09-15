@@ -115,8 +115,19 @@ export function summarize(value: unknown): unknown {
   const result: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
     const normalized = normalizeKey(key);
-    if (SUMMARY_SAFE_CONTAINERS.has(normalized)) {
-      result[key] = summarize(item);
+    if (normalized === "messages" || normalized === "tools") {
+      result[key] = Array.isArray(item)
+        ? item.map((entry) =>
+            entry !== null && typeof entry === "object" && !Array.isArray(entry)
+              ? summarize(entry)
+              : "[summarized]",
+          )
+        : "[summarized]";
+    } else if (SUMMARY_SAFE_CONTAINERS.has(normalized)) {
+      result[key] =
+        item !== null && typeof item === "object" && !Array.isArray(item)
+          ? summarize(item)
+          : "[summarized]";
     } else if (SUMMARY_SAFE_KEYS.has(normalized)) {
       result[key] = item;
     } else {

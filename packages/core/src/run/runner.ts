@@ -61,7 +61,7 @@ export class AgentRunner {
     } catch {
       // 所有失败已在 #run 内收敛为 run.finished；此处兜底防止 daemon 崩溃。
     } finally {
-      await this.#traceService?.stopRun(request.sessionId, request.runId);
+      await this.#traceService?.finishRun(request.sessionId, request.runId);
     }
   }
 

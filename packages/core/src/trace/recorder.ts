@@ -91,32 +91,30 @@ export class TraceRecorder {
     if (!this.#config.enabled) {
       return;
     }
-    let data: unknown = args.data;
     try {
-      data = this.#config.payload === "summary" ? summarize(args.data) : args.data;
+      let data: unknown = this.#config.payload === "summary" ? summarize(args.data) : args.data;
       data = redact(data);
       data = truncateFields(data);
+      const record: TraceRecordInput = {
+        schemaVersion: TRACE_SCHEMA_VERSION,
+        observedAt: this.#now(),
+        source: args.source,
+        target: args.target,
+        kind: args.kind,
+        sessionId: this.#sessionId,
+        runId: this.#runId,
+        ...(args.step === undefined ? {} : { step: args.step }),
+        ...(args.connectionId === undefined ? {} : { connectionId: args.connectionId }),
+        ...(args.requestId === undefined ? {} : { requestId: args.requestId }),
+        ...(args.durationMs === undefined ? {} : { durationMs: args.durationMs }),
+        ...(data !== null && typeof data === "object" && !Array.isArray(data)
+          ? { data: data as Record<string, unknown> }
+          : {}),
+      };
+      this.#writer.enqueue(record);
     } catch {
-      return;
+      // 时钟、payload 处理或入队异常都不能影响真实 run。
     }
-
-    const record: TraceRecordInput = {
-      schemaVersion: TRACE_SCHEMA_VERSION,
-      observedAt: this.#now(),
-      source: args.source,
-      target: args.target,
-      kind: args.kind,
-      sessionId: this.#sessionId,
-      runId: this.#runId,
-      ...(args.step === undefined ? {} : { step: args.step }),
-      ...(args.connectionId === undefined ? {} : { connectionId: args.connectionId }),
-      ...(args.requestId === undefined ? {} : { requestId: args.requestId }),
-      ...(args.durationMs === undefined ? {} : { durationMs: args.durationMs }),
-      ...(data !== null && typeof data === "object" && !Array.isArray(data)
-        ? { data: data as Record<string, unknown> }
-        : {}),
-    };
-    this.#writer.enqueue(record);
   }
 
   /** 幂等停止并返回诊断报告。 */

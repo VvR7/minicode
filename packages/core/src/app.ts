@@ -63,6 +63,12 @@ export class CoreApp {
             maxBytes: TRACE_MAX_BYTES_DEFAULT,
             shutdownMs: TRACE_SHUTDOWN_MS_DEFAULT,
           },
+      undefined,
+      ({ sessionId, runId, report }) => {
+        this.#logger.warn(
+          `trace incomplete session=${sessionId} run=${runId} pending=${report.pendingRecords} dropped=${report.droppedRecords} timedOut=${report.timedOut} writeFailed=${report.writeFailed}`,
+        );
+      },
     );
     const eventStore = new EventStore(this.#config.homeDirectory);
     const eventBus = new EventBus(eventStore, {

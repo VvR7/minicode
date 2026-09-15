@@ -38,7 +38,7 @@ export class AgentRunHandler extends RpcMethodHandler {
 
     const sessionId = this.#manager.newSessionId();
     const runId = this.#manager.newRunId();
-    const recorder = this.#traceService?.startRun(sessionId, runId);
+    const recorder = this.#traceService?.startRun(sessionId, runId, true);
     recorder?.record({
       source: "CLIENT",
       target: "CORE",
@@ -107,6 +107,7 @@ export class AgentRunHandler extends RpcMethodHandler {
             ...(context.requestId === undefined ? {} : { requestId: context.requestId }),
             data: sent ? { status: "sent" } : { errorCode: "connection_closed" },
           });
+          void this.#traceService?.finishResponse(sessionId, runId);
         },
       };
     } catch (error) {

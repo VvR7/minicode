@@ -353,6 +353,7 @@ describe("SessionManager accepted state machine", () => {
         content: "hello",
       }),
     );
+    const recorder = harness.traces.get(session.sessionId, first.result.runId);
 
     retry.activate();
     await Bun.sleep(0);
@@ -362,6 +363,13 @@ describe("SessionManager accepted state machine", () => {
     first.activate();
     await waitForIdle(harness.manager);
     expect(runner.requests).toHaveLength(1);
+    expect(harness.traces.get(session.sessionId, first.result.runId)).toBe(recorder);
+
+    // 后到的幂等重试即使先完成响应，也不能替代首次请求释放 Trace response 门闩。
+    retry.recordResponseSent("retry-connection", "retry-request", true);
+    expect(harness.traces.get(session.sessionId, first.result.runId)).toBe(recorder);
+    first.recordResponseSent("original-connection", "original-request", true);
+    expect(harness.traces.get(session.sessionId, first.result.runId)).toBeUndefined();
   });
 
   test("publishes accepted and terminal events only after response activation and history commit", async () => {

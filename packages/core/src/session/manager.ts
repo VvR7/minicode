@@ -550,7 +550,10 @@ export class SessionManager {
           requestId,
           data: { status: sent ? "sent" : "connection_closed" },
         });
-        void traces.finishResponse(sessionId, runId);
+        // 只有首次 accepted 请求拥有关闭 response 门闩的资格；幂等重试不能抢先结束 Trace。
+        if (!idempotent) {
+          void traces.finishResponse(sessionId, runId);
+        }
       },
     };
   }

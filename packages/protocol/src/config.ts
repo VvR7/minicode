@@ -15,6 +15,10 @@ export interface Environment {
   readonly MINICODE_CORE_PORT?: string;
   readonly MINICODE_HOME?: string;
   readonly MINICODE_LOG_LEVEL?: string;
+  /** 模型 context window 的 token 上限；Stage2 起必填。 */
+  readonly LLM_CONTEXT_WINDOW_TOKENS?: string;
+  /** 单次输出 token 上限；可选，默认 8192。 */
+  readonly LLM_MAX_OUTPUT_TOKENS?: string;
   readonly [name: string]: string | undefined;
 }
 

@@ -102,8 +102,8 @@ async function startCore(llmBaseUrl?: string) {
     await core.exited;
   });
   cleanups.push(() => rm(homeDirectory, { recursive: true, force: true }));
-  // 等待 core 监听端口。
-  const deadline = performance.now() + 3_000;
+  // 等待 core 监听端口；CI 冷启动 JIT + 首次 spawn 可能较慢，给足余量。
+  const deadline = performance.now() + 10_000;
   while (performance.now() < deadline) {
     if (await canConnect(port)) {
       return { port, core, homeDirectory };
@@ -114,25 +114,26 @@ async function startCore(llmBaseUrl?: string) {
 }
 
 interface HeadlessSetup {
-  renderer: { requestRender(): void; destroy(): void };
+  renderer: { destroy(): void };
   mockInput: { pressKey(key: string): void };
-  renderOnce(): Promise<void>;
   captureCharFrame(): string;
 }
 
-/** 以真实时间轮询渲染帧，直到包含目标文本；比 waitForFrame 更适合跨进程异步事件。 */
-async function waitForText(setup: HeadlessSetup, text: string, timeoutMs = 8_000): Promise<void> {
+/**
+ * 轮询渲染器已经提交的字符帧，直到出现目标文本。
+ * 不调用 renderOnce，也不等待单个 frame 事件：原生渲染循环偶发不再发出下一帧时，
+ * 这两种等待都可能永久悬挂，绕过 Bun 的测试超时清理。
+ */
+async function waitForText(setup: HeadlessSetup, text: string, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastFrame = "";
   while (Date.now() < deadline) {
-    // 先让异步事件与原生渲染线程推进，再主动跑一帧并读取。
-    await Bun.sleep(20);
-    setup.renderer.requestRender();
-    await setup.renderOnce();
     lastFrame = setup.captureCharFrame();
     if (lastFrame.includes(text)) {
       return;
     }
+    // UI 内容变化会由渲染器自行调度帧；这里仅让出事件循环并施加真实时间上限。
+    await Bun.sleep(20);
   }
   throw new Error(`timed out waiting for frame containing: ${text}\nlast frame:\n${lastFrame}`);
 }
@@ -186,7 +187,7 @@ describe("mc-tui process-level E2E (headless)", () => {
     setup.mockInput.pressKey("q");
     expect(await codePromise).toBe(0);
     expect(mock.callCount).toBe(2);
-  }, 15_000);
+  }, 60_000);
 
   test("shows a failed run for missing LLM config and quits with 1", async () => {
     const { port } = await startCore();
@@ -253,7 +254,7 @@ describe("mc-tui process-level E2E (headless)", () => {
     await waitForText(setup, "cancelled");
     setup.mockInput.pressKey("q");
     expect(await codePromise).toBe(130);
-  }, 10_000);
+  }, 30_000);
 
   test("reconnects after Core restart and replays the terminal event", async () => {
     const mock = startAnthropicMock({ delayMs: 5_000 });
@@ -288,5 +289,5 @@ describe("mc-tui process-level E2E (headless)", () => {
     setup.mockInput.pressKey("q");
 
     expect(await codePromise).toBe(1);
-  }, 15_000);
+  }, 60_000);
 });

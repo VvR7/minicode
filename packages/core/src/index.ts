@@ -7,5 +7,6 @@ export * from "./llm/index.ts";
 export * from "./rpc-context.ts";
 export * from "./rpc-dispatcher.ts";
 export * from "./run/index.ts";
+export * from "./session/index.ts";
 export * from "./tools/index.ts";
 export * from "./transport/ndjson-server.ts";

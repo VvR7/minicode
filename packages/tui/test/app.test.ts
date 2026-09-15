@@ -1,250 +1,347 @@
 import { afterEach, describe, expect, test } from "bun:test";
-
-import type { AgentEvent, JsonRpcNotificationEnvelope } from "@minicode/protocol";
-import type { NdjsonRpcConnection } from "@minicode/client";
+import type { SessionControllerEvent } from "@minicode/client";
+import type { SessionSummary } from "@minicode/protocol";
 import { createTestRenderer } from "@opentui/core/testing";
-
-import { TuiApp } from "../src/app.ts";
+import { TuiApp, type TuiSessionController } from "../src/app.ts";
+import type { TuiLaunchMode } from "../src/options.ts";
 
 const sessionId = "550e8400-e29b-41d4-a716-446655440000";
 const runId = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
-const subscriptionId = "750e8400-e29b-41d4-a716-446655440001";
+const turnId = "750e8400-e29b-41d4-a716-446655440001";
+const summary: SessionSummary = {
+  sessionId,
+  mode: "chat",
+  status: "idle",
+  title: "Chat",
+  workspaceRoot: "/work",
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-01T00:00:00.000Z",
+  latestSessionSequence: 0,
+};
 
-function event(
-  type: AgentEvent["type"],
-  payload: AgentEvent["payload"],
-  sequence: number,
-): AgentEvent {
-  return {
-    sessionId,
-    runId,
-    sequence,
-    timestamp: "2026-09-13T08:00:00.000Z",
-    durable: true,
-    type,
-    payload,
-  } as AgentEvent;
-}
-
-function pushNotification(evt: AgentEvent): JsonRpcNotificationEnvelope {
-  return {
-    jsonrpc: "2.0",
-    method: "event.push",
-    params: { subscriptionId, event: evt },
-  };
-}
-
-function finished(status: "succeeded" | "failed" | "cancelled", finalText = "done"): AgentEvent {
-  const usage = {
-    inputTokens: 1,
-    outputTokens: 1,
-    cacheReadInputTokens: 0,
-    cacheCreationInputTokens: 0,
-  };
-  const base = { finalText, steps: 1, usage };
-  if (status === "succeeded") {
-    return event("run.finished", { ...base, status: "succeeded", reason: "completed" }, 99);
+/** 可编程 controller，用于只测试 TUI 状态机而不重复测试 IPC。 */
+class FakeController implements TuiSessionController {
+  readonly sent: string[] = [];
+  cancelCalls = 0;
+  disposeCalls = 0;
+  createCalls = 0;
+  sessions: SessionSummary[];
+  #consume: (event: SessionControllerEvent) => void;
+  constructor(consume: (event: SessionControllerEvent) => void, sessions: SessionSummary[]) {
+    this.#consume = consume;
+    this.sessions = sessions;
   }
-  if (status === "cancelled") {
-    return event("run.finished", { ...base, status: "cancelled", reason: "cancelled" }, 99);
+  /** 创建并附着默认会话。 */
+  async create(): Promise<SessionSummary> {
+    this.createCalls += 1;
+    const created =
+      this.createCalls === 1
+        ? summary
+        : { ...summary, sessionId: "950e8400-e29b-41d4-a716-446655440004" };
+    this.#consume({ type: "controller.status", status: "connected" });
+    this.#consume({ type: "session.attached", session: created });
+    return created;
   }
-  return event("run.finished", { ...base, status: "failed", reason: "llm_error" }, 99);
-}
-
-/** 可编程 fake 连接：注册 listener 并手动推送事件。 */
-class FakeConnection {
-  #listeners = new Set<(n: JsonRpcNotificationEnvelope) => void>();
-  #listening = Promise.withResolvers<void>();
-  #closed = Promise.withResolvers<void>();
-  agentRunError = false;
-  closeCalls = 0;
-
-  get listening(): Promise<void> {
-    return this.#listening.promise;
+  /** 附着列表中的会话。 */
+  async attach(id: string): Promise<void> {
+    const session = this.sessions.find((item) => item.sessionId === id);
+    if (session === undefined) throw new Error("missing");
+    this.#consume({ type: "session.attached", session });
   }
-
-  /** 当前 listener 数，用于验证 TUI 退出后的显式回收。 */
-  get listenerCount(): number {
-    return this.#listeners.size;
+  /** 按 workspace 和 mode 模拟服务端过滤。 */
+  async list(options: { workspaceRoot?: string; includeOneShot?: boolean } = {}) {
+    return {
+      sessions: this.sessions.filter(
+        (item) =>
+          (options.workspaceRoot === undefined || item.workspaceRoot === options.workspaceRoot) &&
+          (options.includeOneShot === true || item.mode !== "one_shot"),
+      ),
+    };
   }
-
-  request(method: string): Promise<unknown> {
-    if (method === "agent.run") {
-      if (this.agentRunError) {
-        return Promise.reject(new Error("response lost"));
-      }
-      return Promise.resolve({ result: { status: "accepted", sessionId, runId, subscriptionId } });
-    }
-    if (method === "event.subscribe") {
-      return Promise.resolve({ result: { subscriptionId, sessionId, runId } });
-    }
-    if (method === "agent.cancel") {
-      return Promise.resolve({ result: { outcome: "cancellation_requested" } });
-    }
-    return Promise.reject(new Error(`unexpected method: ${method}`));
+  /** 记录提交，不生成乐观事件。 */
+  async sendMessage(content: string): Promise<void> {
+    this.sent.push(content);
   }
-
-  onNotification(listener: (n: JsonRpcNotificationEnvelope) => void): () => void {
-    this.#listeners.add(listener);
-    this.#listening.resolve();
-    return () => this.#listeners.delete(listener);
+  /** 记录取消次数。 */
+  async cancelActiveRun(): Promise<void> {
+    this.cancelCalls += 1;
   }
-
-  waitUntilClosed(): Promise<void> {
-    return this.#closed.promise;
+  /** 记录资源释放。 */
+  async dispose(): Promise<void> {
+    this.disposeCalls += 1;
   }
-
-  close(): void {
-    this.closeCalls += 1;
-    this.#closed.resolve();
-  }
-
-  emit(notification: JsonRpcNotificationEnvelope): void {
-    for (const listener of this.#listeners) {
-      listener(notification);
-    }
+  /** 向应用广播权威事件。 */
+  emit(event: SessionControllerEvent): void {
+    this.#consume(event);
   }
 }
 
 const renderers: { destroy(): void }[] = [];
-
 afterEach(() => {
-  for (const renderer of renderers.splice(0)) {
-    renderer.destroy();
-  }
+  for (const renderer of renderers.splice(0)) renderer.destroy();
 });
 
-async function startApp(connection: FakeConnection) {
-  const setup = await createTestRenderer({ width: 60, height: 10, exitOnCtrlC: false });
+/** 启动 headless TUI 并暴露真实 OpenTUI mock input。 */
+async function start(
+  mode: TuiLaunchMode = { kind: "new" },
+  sessions: SessionSummary[] = [summary],
+) {
+  const setup = await createTestRenderer({
+    width: 90,
+    height: 14,
+    exitOnCtrlC: false,
+    kittyKeyboard: true,
+  });
   renderers.push(setup.renderer);
-  const app = new TuiApp();
-  const codePromise = app.run({
-    goal: "summarize",
-    workspaceRoot: "/workspace",
+  let fake: FakeController | undefined;
+  const code = new TuiApp().run({
+    mode,
+    workspaceRoot: "/work",
     endpoint: { host: "127.0.0.1", port: 7437 },
     createRenderer: async () => setup.renderer,
-    connect: async () => connection as unknown as NdjsonRpcConnection,
-    reconnectDelayMs: 0,
+    createController: (consume) => {
+      fake = new FakeController(consume, sessions);
+      return fake;
+    },
   });
-  return { setup, codePromise };
+  await setup.waitForFrame((frame) =>
+    frame.includes(
+      mode.kind === "sessions"
+        ? "[SESSIONS]"
+        : mode.kind === "session" || mode.kind === "continue"
+          ? "session"
+          : "32768 remaining",
+    ),
+  );
+  if (fake === undefined) throw new Error("controller was not created");
+  return { setup, controller: fake, code };
 }
 
-describe("TuiApp", () => {
-  test("renders streamed events and quits with 0 after a successful run", async () => {
-    const connection = new FakeConnection();
-    const { setup, codePromise } = await startApp(connection);
-    await connection.listening;
+/** 通过真实 Textarea key event 输入本地退出命令。 */
+async function exit(setup: Awaited<ReturnType<typeof createTestRenderer>>): Promise<void> {
+  await setup.mockInput.typeText("/exit");
+  setup.mockInput.pressEnter();
+}
 
-    connection.emit(pushNotification(event("run.started", {}, 1)));
-    connection.emit(pushNotification(event("llm.text_delta", { text: "Hello" }, 2)));
-    connection.emit(pushNotification(finished("succeeded", "Hello")));
-
-    await setup.waitForFrame((frame) => frame.includes("Hello"));
-    setup.mockInput.pressKey("q");
-
-    expect(await codePromise).toBe(0);
+describe("TuiApp multi-turn interaction", () => {
+  test("Enter sends while Ctrl+Enter inserts a newline at the OpenTUI key layer", async () => {
+    const { setup, controller, code } = await start();
+    await setup.mockInput.typeText("hello");
+    setup.mockInput.pressEnter({ ctrl: true });
+    await setup.mockInput.typeText("world");
+    setup.mockInput.pressEnter();
+    await setup.waitFor(() => controller.sent.length === 1);
+    expect(controller.sent).toEqual(["hello\nworld"]);
+    expect(setup.captureCharFrame()).not.toContain("[YOU] hello");
+    controller.emit({
+      type: "turn.accepted",
+      sessionId,
+      sessionSequence: 1,
+      turnId,
+      runId,
+      clientMessageId: "850e8400-e29b-41d4-a716-446655440002",
+      userMessage: "hello\nworld",
+    });
+    await setup.waitForFrame((frame) => frame.includes("[YOU] hello"));
+    controller.emit({
+      type: "turn.committed",
+      sessionId,
+      sessionSequence: 2,
+      turnId,
+      runId,
+      status: "succeeded",
+      reason: "completed",
+    });
+    await exit(setup);
+    expect(await code).toBe(0);
   });
-
-  test("returns 1 when the run fails", async () => {
-    const connection = new FakeConnection();
-    const { setup, codePromise } = await startApp(connection);
-    await connection.listening;
-
-    connection.emit(pushNotification(finished("failed", "")));
-    await setup.waitForFrame((frame) => frame.includes("failed"));
-    setup.mockInput.pressKey("q");
-
-    expect(await codePromise).toBe(1);
-  });
-
-  test("first q cancels, second q forces exit 130", async () => {
-    const connection = new FakeConnection();
-    const { setup, codePromise } = await startApp(connection);
-    await connection.listening;
-
-    connection.emit(pushNotification(event("run.started", {}, 1)));
-    await setup.waitForFrame((frame) => frame.includes("running"));
-
-    setup.mockInput.pressKey("q");
-    await setup.waitForFrame((frame) => frame.includes("cancelling"));
-
-    setup.mockInput.pressKey("q");
-    expect(await codePromise).toBe(130);
-  });
-
-  test("Ctrl-C during a run requests cancel, then q exits 130", async () => {
-    const connection = new FakeConnection();
-    const { setup, codePromise } = await startApp(connection);
-    await connection.listening;
-
-    connection.emit(pushNotification(event("run.started", {}, 1)));
-    await setup.waitForFrame((frame) => frame.includes("running"));
-
+  test("q is ordinary input and Ctrl+C clears a draft without cancelling", async () => {
+    const { setup, controller, code } = await start();
+    await setup.mockInput.typeText("q draft");
+    await setup.waitForFrame((frame) => frame.includes("q draft"));
     setup.mockInput.pressCtrlC();
-    await setup.waitForFrame((frame) => frame.includes("cancelling"));
-
-    setup.mockInput.pressKey("q");
-    expect(await codePromise).toBe(130);
+    await setup.waitForFrame((frame) => frame.includes("draft cleared"));
+    expect(controller.cancelCalls).toBe(0);
+    await exit(setup);
+    expect(await code).toBe(0);
   });
-
-  test("shows an ambiguous acceptance error and exits with 2", async () => {
-    const connection = new FakeConnection();
-    connection.agentRunError = true;
-    const { setup, codePromise } = await startApp(connection);
-
-    await setup.waitForFrame((frame) => frame.includes("acceptance-uncertain"));
-    setup.mockInput.pressKey("q");
-
-    expect(await codePromise).toBe(2);
-    expect(connection.closeCalls).toBe(1);
-  });
-
-  test("force exit releases socket, listener and renderer exactly once", async () => {
-    const connection = new FakeConnection();
-    const { setup, codePromise } = await startApp(connection);
-    await connection.listening;
-    let destroyCalls = 0;
-    const originalDestroy = setup.renderer.destroy.bind(setup.renderer);
-    setup.renderer.destroy = () => {
-      destroyCalls += 1;
-      originalDestroy();
-    };
-
-    connection.emit(pushNotification(event("run.started", {}, 1)));
+  test("busy state blocks submit; Ctrl+C cancels once and /exit does not force exit", async () => {
+    const { setup, controller, code } = await start();
+    await setup.mockInput.typeText("/exit");
+    controller.emit({
+      type: "turn.accepted",
+      sessionId,
+      sessionSequence: 1,
+      turnId,
+      runId,
+      clientMessageId: "850e8400-e29b-41d4-a716-446655440002",
+      userMessage: "remote",
+    });
     await setup.waitForFrame((frame) => frame.includes("running"));
-    setup.mockInput.pressKey("q");
-    setup.mockInput.pressKey("q");
-
-    expect(await codePromise).toBe(130);
-    expect(connection.closeCalls).toBe(1);
-    expect(connection.listenerCount).toBe(0);
-    expect(destroyCalls).toBe(1);
+    setup.mockInput.pressEnter();
+    await setup.waitForFrame(
+      (frame) => frame.includes("run is active") && frame.includes("Ctrl+C"),
+    );
+    expect(controller.sent).toHaveLength(0);
+    expect(controller.disposeCalls).toBe(0);
+    // 第一次清除竞争期间保留的本地草稿，第二次才取消；后续按键不得重复 RPC。
+    setup.mockInput.pressCtrlC();
+    setup.mockInput.pressCtrlC();
+    setup.mockInput.pressCtrlC();
+    await setup.waitFor(() => controller.cancelCalls === 1);
+    controller.emit({
+      type: "turn.committed",
+      sessionId,
+      sessionSequence: 2,
+      turnId,
+      runId,
+      status: "cancelled",
+      reason: "cancelled",
+    });
+    await exit(setup);
+    expect(await code).toBe(0);
   });
+  test("rejects an over-limit draft and shows the over-limit counter", async () => {
+    const { setup, controller, code } = await start();
+    await setup.mockInput.pasteBracketedText("x".repeat(32769));
+    await setup.waitForFrame((frame) => frame.includes("1 over limit"));
+    setup.mockInput.pressEnter();
+    expect(controller.sent).toHaveLength(0);
+    setup.mockInput.pressCtrlC();
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
+  test("/new switches only this controller and clears the old transcript", async () => {
+    const { setup, controller, code } = await start();
+    controller.emit({
+      type: "turn.snapshot",
+      turn: {
+        turnId,
+        runId,
+        clientMessageId: "850e8400-e29b-41d4-a716-446655440002",
+        status: "succeeded",
+        reason: "completed",
+        acceptedAt: "2026-01-01T00:00:00.000Z",
+        finishedAt: "2026-01-01T00:01:00.000Z",
+        includedInContext: true,
+        messages: [
+          {
+            messageId: "u",
+            turnId,
+            runId,
+            role: "user",
+            timestamp: "2026-01-01T00:00:00.000Z",
+            content: [{ type: "text", text: "old message" }],
+          },
+        ],
+      },
+    });
+    await setup.waitForFrame((frame) => frame.includes("old message"));
+    await setup.mockInput.typeText("/new");
+    setup.mockInput.pressEnter();
+    await setup.waitFor(() => controller.createCalls === 2);
+    await setup.waitForFrame((frame) => frame.includes("session 950e8400"));
+    expect(setup.captureCharFrame()).not.toContain("old message");
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
+  test("--goal submits after attach and one-shot resumes read-only", async () => {
+    const goal = await start({ kind: "new", goal: "first question" });
+    await goal.setup.waitFor(() => goal.controller.sent.length === 1);
+    expect(goal.controller.sent).toEqual(["first question"]);
+    await exit(goal.setup);
+    await goal.code;
+    const audit = { ...summary, mode: "one_shot" as const };
+    const resumed = await start({ kind: "session", sessionId }, [audit]);
+    await resumed.setup.waitForFrame((frame) => frame.includes("read-only audit"));
+    expect(resumed.controller.sent).toHaveLength(0);
+    await resumed.setup.mockInput.typeText("not allowed");
+    resumed.setup.mockInput.pressEnter();
+    await resumed.setup.waitForFrame((frame) => frame.includes("read-only"));
+    expect(resumed.controller.sent).toHaveLength(0);
+    resumed.setup.mockInput.pressCtrlC();
+    await resumed.setup.mockInput.typeText("/new");
+    resumed.setup.mockInput.pressEnter();
+    await resumed.setup.waitForFrame((frame) => frame.includes("this session is read-only"));
+    expect(resumed.controller.createCalls).toBe(0);
+    resumed.setup.mockInput.pressCtrlC();
+    await exit(resumed.setup);
+    expect(await resumed.code).toBe(0);
+  });
+});
 
-  test("supports scrolling keys and keeps layout after resize", async () => {
-    const connection = new FakeConnection();
-    const { setup, codePromise } = await startApp(connection);
-    await connection.listening;
-    connection.emit(pushNotification(event("run.started", {}, 1)));
-    for (let index = 0; index < 20; index += 1) {
-      connection.emit(
-        pushNotification(
-          event(
-            "tool.started",
-            { toolCallId: `t${index}`, name: `tool_${index}`, attempt: 1 },
-            index + 2,
-          ),
-        ),
-      );
-    }
+describe("TuiApp multi-window projection", () => {
+  test("two TUIs consuming one session event stream show the same server transcript", async () => {
+    const first = await start();
+    const second = await start();
+    const accepted = {
+      type: "turn.accepted" as const,
+      sessionId,
+      sessionSequence: 1,
+      turnId,
+      runId,
+      clientMessageId: "850e8400-e29b-41d4-a716-446655440002",
+      userMessage: "shared message",
+    };
+    first.controller.emit(accepted);
+    second.controller.emit(accepted);
+    await first.setup.waitForFrame((frame) => frame.includes("[YOU] shared message"));
+    await second.setup.waitForFrame((frame) => frame.includes("[YOU] shared message"));
+    first.controller.emit({
+      type: "turn.committed",
+      sessionId,
+      sessionSequence: 2,
+      turnId,
+      runId,
+      status: "succeeded",
+      reason: "completed",
+    });
+    second.controller.emit({
+      type: "turn.committed",
+      sessionId,
+      sessionSequence: 2,
+      turnId,
+      runId,
+      status: "succeeded",
+      reason: "completed",
+    });
+    await exit(first.setup);
+    await exit(second.setup);
+    expect(await first.code).toBe(0);
+    expect(await second.code).toBe(0);
+  });
+});
 
-    await setup.waitForFrame((frame) => frame.includes("tool_19"));
-    setup.mockInput.pressKey("HOME");
-    await setup.waitForFrame((frame) => frame.includes("tool_0"));
-    setup.resize(72, 12);
-    await setup.waitForFrame((frame) => frame.includes("running") && frame.includes("Ctrl-C"));
-    setup.mockInput.pressKey("q");
-    setup.mockInput.pressKey("q");
-    expect(await codePromise).toBe(130);
+describe("TuiApp launch and selector", () => {
+  test("--continue selects newest resumable session and explicit mismatch is an error", async () => {
+    const newer = {
+      ...summary,
+      sessionId: "650e8400-e29b-41d4-a716-446655440000",
+      updatedAt: "2026-02-01T00:00:00.000Z",
+    };
+    const resumed = await start({ kind: "continue" }, [summary, newer]);
+    await resumed.setup.waitForFrame((frame) => frame.includes("650e8400"));
+    await exit(resumed.setup);
+    expect(await resumed.code).toBe(0);
+    const wrong = { ...summary, workspaceRoot: "/other" };
+    const mismatch = await start({ kind: "session", sessionId }, [wrong]);
+    await mismatch.setup.waitForFrame((frame) => frame.includes("start mc-tui from"));
+    await exit(mismatch.setup);
+    expect(await mismatch.code).toBe(2);
+  });
+  test("no continue target is explicit, while selector keys toggle filters and reject corrupted", async () => {
+    const missing = await start({ kind: "continue" }, []);
+    await missing.setup.waitForFrame((frame) => frame.includes("no resumable session"));
+    await exit(missing.setup);
+    expect(await missing.code).toBe(2);
+    const corrupted = { ...summary, status: "corrupted" as const };
+    const selected = await start({ kind: "sessions" }, [corrupted]);
+    selected.setup.mockInput.pressKey("o");
+    selected.setup.mockInput.pressTab();
+    selected.setup.mockInput.pressArrow("down");
+    selected.setup.mockInput.pressEnter();
+    await selected.setup.waitForFrame((frame) => frame.includes("corrupted"));
+    selected.setup.mockInput.pressEscape();
+    expect(await selected.code).toBe(0);
   });
 });

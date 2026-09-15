@@ -8,7 +8,8 @@ describe("TUI public exports", () => {
     expect(tui.TuiModel).toBeDefined();
     expect(tui.parseTuiArgs).toBeDefined();
     expect(tui.EventLog).toBeDefined();
-    expect(tui.HELP_BAR_TEXT).toBeDefined();
+    expect(tui.formatChatHelp).toBeDefined();
+    expect(tui.createSelectorState).toBeDefined();
     expect(tui.formatStatus).toBeDefined();
   });
 });

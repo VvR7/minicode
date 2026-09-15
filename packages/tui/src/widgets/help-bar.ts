@@ -1,2 +1,11 @@
-/** 底部快捷键提示，静态文本。 */
-export const HELP_BAR_TEXT = " q 退出 · Ctrl-C 取消 · ↑/↓ 滚动 · PgUp/PgDn 翻页 · Home/End 首尾";
+import type { RunState } from "../model.ts";
+
+/** 根据聊天状态只展示当前可用操作。 */
+export function formatChatHelp(run: RunState, readOnly: boolean): string {
+  if (readOnly) return "read-only audit  /exit exit  PgUp/PgDn scroll";
+  if (run === "running" || run === "cancelling") return "Ctrl+C cancel  PgUp/PgDn scroll";
+  return "Enter send  Ctrl+Enter newline  /new new chat  /exit exit";
+}
+
+/** 选择页固定帮助栏。 */
+export const SELECTOR_HELP = "↑/↓ or j/k select  Enter open  Tab scope  O one_shot  Esc exit";

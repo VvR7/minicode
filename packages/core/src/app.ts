@@ -42,6 +42,7 @@ export class CoreApp {
   #traces: RunTraceRegistry | undefined;
   #startedAt = 0;
   #stopping = false;
+  #stopPromise: Promise<void> | undefined;
 
   constructor(config: CoreConfig, environment: Environment = Bun.env) {
     this.#config = config;
@@ -109,30 +110,48 @@ export class CoreApp {
     return endpoint;
   }
 
-  async stop(): Promise<void> {
-    if (this.#server === undefined) {
-      return;
+  stop(): Promise<void> {
+    if (this.#stopPromise !== undefined) {
+      return this.#stopPromise;
     }
+    if (this.#server === undefined) {
+      return Promise.resolve();
+    }
+    const stopping = this.#stopCurrent(this.#server, this.#manager);
+    this.#stopPromise = stopping;
+    void stopping.then(
+      () => {
+        if (this.#stopPromise === stopping) this.#stopPromise = undefined;
+      },
+      () => {
+        if (this.#stopPromise === stopping) this.#stopPromise = undefined;
+      },
+    );
+    return stopping;
+  }
+
+  /** 执行一次完整停机；所有并发 stop 调用共享外层登记的同一个 Promise。 */
+  async #stopCurrent(server: NdjsonRpcServer, manager: SessionManager | undefined): Promise<void> {
     this.#logger.info("mc-core shutting down");
-    const server = this.#server;
-    const manager = this.#manager;
     this.#stopping = true;
     this.#server = undefined;
+    try {
+      // 先封闭 admission/发出取消，再排空 RPC 响应闸门，最后才允许强制终态提交。
+      manager?.beginShutdown();
+      await server.stop();
+      await manager?.shutdown();
 
-    // 先封闭 admission/发出取消，再排空 RPC 响应闸门，最后才允许强制终态提交。
-    manager?.beginShutdown();
-    await server.stop();
-    await manager?.shutdown();
-
-    this.#broadcaster?.close();
-    this.#sessionBroadcaster?.close();
-    this.#broadcaster = undefined;
-    this.#sessionBroadcaster = undefined;
-    this.#eventBus = undefined;
-    this.#manager = undefined;
-    await this.#traces?.stopAll();
-    this.#traces = undefined;
-    this.#stopping = false;
+      this.#broadcaster?.close();
+      this.#sessionBroadcaster?.close();
+      this.#broadcaster = undefined;
+      this.#sessionBroadcaster = undefined;
+      this.#eventBus = undefined;
+      this.#manager = undefined;
+      await this.#traces?.stopAll();
+      this.#traces = undefined;
+    } finally {
+      this.#stopping = false;
+    }
   }
 
   get eventBus(): EventBus {

@@ -252,6 +252,8 @@ export class NdjsonRpcServer {
   #listener: Bun.TCPSocketListener | undefined;
   // stop() 期间为 true，用来拒绝新的输入。
   #stopping = false;
+  // 并发 stop 调用共享同一完成屏障，避免后调用者过早返回。
+  #stopPromise: Promise<void> | undefined;
 
   /** 保存监听地址、RPC 分发函数和生命周期日志记录器。 */
   constructor(endpoint: CoreEndpoint, handler: RpcFrameHandler, logger: Logger) {
@@ -327,52 +329,72 @@ export class NdjsonRpcServer {
   }
 
   /** 停止接收新连接，等待已入队请求完成，并在宽限期结束后强制关闭残留连接。 */
-  async stop(graceMs = DEFAULT_SHUTDOWN_GRACE_MS): Promise<void> {
+  stop(graceMs = DEFAULT_SHUTDOWN_GRACE_MS): Promise<void> {
+    if (this.#stopPromise !== undefined) {
+      return this.#stopPromise;
+    }
     // 未启动或已经停止时没有资源需要释放。
     if (this.#listener === undefined) {
-      return;
+      return Promise.resolve();
     }
+    const stopping = this.#stopCurrent(graceMs);
+    this.#stopPromise = stopping;
+    void stopping.then(
+      () => {
+        if (this.#stopPromise === stopping) this.#stopPromise = undefined;
+      },
+      () => {
+        if (this.#stopPromise === stopping) this.#stopPromise = undefined;
+      },
+    );
+    return stopping;
+  }
 
+  /** 执行单次 transport 停机；调用方通过 stop 复用本次完成屏障。 */
+  async #stopCurrent(graceMs: number): Promise<void> {
     this.#stopping = true;
-    // false 表示停止监听新连接，但先不强制关闭已有连接。
-    this.#listener.stop(false);
-    // 清空引用，令之后的 start() 可重新创建监听器。
-    this.#listener = undefined;
-    // 让 listener.stop 前已被内核接受的 open 回调完成登记，再拍活动连接快照。
-    await Bun.sleep(0);
+    try {
+      // false 表示停止监听新连接，但先不强制关闭已有连接。
+      this.#listener?.stop(false);
+      // 清空引用，令本次 stop 完成后 start 可重新创建监听器。
+      this.#listener = undefined;
+      // 让 listener.stop 前已被内核接受的 open 回调完成登记，再拍活动连接快照。
+      await Bun.sleep(0);
 
-    // 复制集合，避免 socket.close 回调在遍历时修改原集合。
-    const sockets = [...this.#activeSockets];
-    for (const socket of sockets) {
-      // 从现在起不再把新的 data 回调加入处理队列。
-      socket.data.acceptingInput = false;
-      // 已入队的请求仍要得到响应；处理完才半关闭连接，避免中途丢失响应。
-      void socket.data.processing.finally(() => {
-        socket.data.closeAfterWrites = true;
-        flushWrites(socket);
+      // 复制集合，避免 socket.close 回调在遍历时修改原集合。
+      const sockets = [...this.#activeSockets];
+      for (const socket of sockets) {
+        // 从现在起不再把新的 data 回调加入处理队列。
+        socket.data.acceptingInput = false;
+        // 已入队的请求仍要得到响应；处理完才半关闭连接，避免中途丢失响应。
+        void socket.data.processing.finally(() => {
+          socket.data.closeAfterWrites = true;
+          flushWrites(socket);
+        });
+      }
+
+      await new Promise<void>((resolve) => {
+        // 宽限期到期时继续执行，保证业务处理等待有上限。
+        const timeout = setTimeout(resolve, graceMs);
+        // 所有连接提前关闭时取消定时器并尽早完成。
+        void Promise.all(sockets.map((socket) => socket.data.closed)).then(() => {
+          clearTimeout(timeout);
+          resolve();
+        });
       });
-    }
 
-    await new Promise<void>((resolve) => {
-      // 宽限期到期时继续执行，保证 shutdown 始终有上限。
-      const timeout = setTimeout(resolve, graceMs);
-      // 所有连接提前关闭时取消定时器并尽早完成。
-      void Promise.all(sockets.map((socket) => socket.data.closed)).then(() => {
-        clearTimeout(timeout);
-        resolve();
-      });
-    });
-
-    const remaining = [...this.#activeSockets];
-    for (const socket of remaining) {
-      // 宽限期后仍存在的连接强制释放，不再等待其业务处理或写队列。
-      socket.data.acceptingInput = false;
-      socket.terminate();
+      const remaining = [...this.#activeSockets];
+      for (const socket of remaining) {
+        // 宽限期后仍存在的连接强制释放，不再等待其业务处理或写队列。
+        socket.data.acceptingInput = false;
+        socket.terminate();
+      }
+      // terminate 与 Bun close 回调之间仍有异步窗口；真实 close 后才能安全发布强制终态。
+      await Promise.all(remaining.map((socket) => socket.data.closed));
+    } finally {
+      // stop() 完成或失败后释放重入标志；失败不会伪装成成功完成。
+      this.#stopping = false;
     }
-    // terminate 与 Bun close 回调之间仍有异步窗口；真实 close 后才能安全发布强制终态。
-    await Promise.all(remaining.map((socket) => socket.data.closed));
-    // stop() 完成，允许实例未来再次启动。
-    this.#stopping = false;
   }
 
   /** 接收 TCP 字节流、切分 LF 结尾的帧，并将完整帧放入该连接的处理队列。 */

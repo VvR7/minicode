@@ -283,6 +283,7 @@ describe("NDJSON RPC server", () => {
     });
 
     const stopping = server.stop(100);
+    expect(server.stop(100)).toBe(stopping);
     expect(() => server.start()).toThrow("server already started");
     await stopping;
 

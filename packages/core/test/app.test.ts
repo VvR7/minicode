@@ -18,6 +18,7 @@ describe("CoreApp", () => {
     expect(() => app.start()).toThrow("core already started");
 
     const stopping = app.stop();
+    expect(app.stop()).toBe(stopping);
     expect(() => app.start()).toThrow("core already started");
     await stopping;
     await app.stop();

@@ -664,29 +664,35 @@ describe("SessionManager multi-turn context and terminal ownership", () => {
     await Bun.sleep(0);
 
     expect(runner.requests).toHaveLength(0);
-    expect(order).toEqual(["run.finished"]);
+    expect(order).toEqual(["session.turn_accepted", "run.finished", "session.turn_finished"]);
     expect(unwrapResult(await harness.manager.get(session.sessionId)).status).not.toBe("corrupted");
     expect(unwrapResult(await harness.manager.getHistory(session.sessionId)).turns[0]?.status).toBe(
       "cancelled",
     );
   });
 
-  test("rejects one-shot admission when shutdown starts during session creation", async () => {
+  test("finishes a one-shot admitted before shutdown without leaving an empty session", async () => {
     const storage = new BlockingOneShotCreateStorage();
     const runner = new StubRunner(async (request) => completionFor(request));
-    const harness = createHarness(runner, { storage, shutdownTimeoutMs: 100 });
+    const harness = createHarness(runner, { storage, shutdownTimeoutMs: 10 });
     const preparing = harness.manager.prepareOneShot("/workspace", "racing one-shot");
     await storage.metaWriteStarted.promise;
 
     const shuttingDown = harness.manager.shutdown();
     storage.metaWriteGate.resolve();
-    expect(await preparing).toMatchObject({
-      ok: false,
-      error: { code: "internal_error", message: "core is shutting down" },
-    });
+    const prepared = unwrapResult(await preparing);
     await shuttingDown;
     expect(harness.manager.activeCount).toBe(0);
     expect(runner.requests).toHaveLength(0);
+    const history = unwrapResult(await harness.manager.getHistory(prepared.result.sessionId));
+    expect(history.turns).toHaveLength(1);
+    expect(history.turns[0]?.status).toBe("cancelled");
+    expect(unwrapResult(await harness.store.load(prepared.result.sessionId)).sessionEvents).toEqual(
+      [
+        expect.objectContaining({ type: "session.turn_accepted" }),
+        expect.objectContaining({ type: "session.turn_finished" }),
+      ],
+    );
   });
 
   test("waits for an admission that passed the stopping check before taking the active snapshot", async () => {

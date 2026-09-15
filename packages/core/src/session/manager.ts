@@ -97,6 +97,7 @@ interface ActiveExecution {
   readonly resolveSettled: () => void;
   activated: boolean;
   acceptedPublished: boolean;
+  acceptedPublication: Promise<boolean> | undefined;
   commit: Promise<void> | undefined;
 }
 
@@ -312,9 +313,6 @@ export class SessionManager {
     }
     const sessionId = created.value.sessionId;
     return this.#withSessionLock(sessionId, async () => {
-      if (this.#stopping) {
-        return this.#internal("core is shutting down");
-      }
       const loaded = await this.#store.load(sessionId);
       if (!loaded.ok) {
         return this.#fromStore(loaded.error.code, sessionId);
@@ -353,13 +351,7 @@ export class SessionManager {
     const unfinished = active.filter((execution) =>
       this.#active.has(this.#runKey(execution.sessionId, execution.runId)),
     );
-    await this.#waitBounded(
-      unfinished.map((execution) =>
-        this.#commitOnce(execution, {
-          completion: this.#cancelledCompletion(execution.userMessage),
-        }),
-      ),
-    );
+    await this.#waitBounded(unfinished.map((execution) => this.#forceShutdownCommit(execution)));
     await this.#waitBounded([...this.#terminalCommits]);
     await this.#traces.stopAll();
   }
@@ -478,6 +470,7 @@ export class SessionManager {
       resolveSettled: deferred.resolve,
       activated: false,
       acceptedPublished: false,
+      acceptedPublication: undefined,
       commit: undefined,
     };
     this.#active.set(this.#runKey(snapshot.meta.sessionId, runId), execution);
@@ -554,10 +547,9 @@ export class SessionManager {
 
   /** 幂等激活 prepared run；后台异常被收敛后仍完成 settled。 */
   #activate(execution: ActiveExecution): void {
-    // shutdown 一旦开始或 run 已进入终态提交，迟到的响应/断连回调只能空操作。
+    // 已进入终态提交或已从 active 集合移除时，迟到的响应/断连回调只能空操作。
     if (
       execution.activated ||
-      this.#stopping ||
       execution.commit !== undefined ||
       !this.#active.has(this.#runKey(execution.sessionId, execution.runId))
     ) {
@@ -606,20 +598,28 @@ export class SessionManager {
 
   /** 持久化并广播权威 turn_accepted；失败时不启动 provider。 */
   async #publishAccepted(execution: ActiveExecution): Promise<boolean> {
-    const published = await this.#sessionEvents.publish({
-      sessionId: execution.sessionId,
-      timestamp: this.#now(),
-      durable: true,
-      type: "session.turn_accepted",
-      payload: {
-        turnId: execution.turnId,
-        runId: execution.runId,
-        clientMessageId: execution.clientMessageId,
-        userMessage: execution.userMessage,
-      },
-    });
-    execution.acceptedPublished = published.ok;
-    return published.ok;
+    if (execution.acceptedPublication !== undefined) {
+      return execution.acceptedPublication;
+    }
+    const publication = this.#sessionEvents
+      .publish({
+        sessionId: execution.sessionId,
+        timestamp: this.#now(),
+        durable: true,
+        type: "session.turn_accepted",
+        payload: {
+          turnId: execution.turnId,
+          runId: execution.runId,
+          clientMessageId: execution.clientMessageId,
+          userMessage: execution.userMessage,
+        },
+      })
+      .then((published) => {
+        execution.acceptedPublished = published.ok;
+        return published.ok;
+      });
+    execution.acceptedPublication = publication;
+    return publication;
   }
 
   /** 保证正常返回、取消、shutdown 超时与异常路径只能进入同一个终态提交。 */
@@ -635,6 +635,25 @@ export class SessionManager {
       () => this.#terminalCommits.delete(commit),
     );
     return commit;
+  }
+
+  /** shutdown 超时后补齐未激活 run 的 session 生命周期，再提交唯一 cancelled 终态。 */
+  async #forceShutdownCommit(execution: ActiveExecution): Promise<void> {
+    const wasActivated = execution.activated;
+    // 抢占尚未释放响应闸门的执行权，防止强制收尾与迟到 activate 重复发布 accepted。
+    execution.activated = true;
+    if (!execution.acceptedPublished) {
+      const published = await this.#publishAccepted(execution);
+      if (!published) {
+        this.#corruptedSessions.add(execution.sessionId);
+      }
+    }
+    await this.#commitOnce(execution, {
+      completion: this.#cancelledCompletion(execution.userMessage),
+    });
+    if (!wasActivated) {
+      execution.resolveSettled();
+    }
   }
 
   /** 严格按 history、active、run event、session event 的顺序提交 completion。 */

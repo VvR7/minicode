@@ -11,6 +11,7 @@ import type { RpcInvocationContext } from "./rpc-context.ts";
 export interface JsonRpcDispatchResult {
   readonly response: JsonRpcSuccessEnvelope | JsonRpcErrorResponse;
   readonly afterResponseEnqueued?: () => void;
+  readonly afterResponseSent?: (sent: boolean) => void;
 }
 
 export interface RpcDispatcherOptions {
@@ -59,7 +60,10 @@ export function createRpcDispatcher(options: RpcDispatcherOptions) {
     }
 
     try {
-      const result = await handler.invoke(envelope.data.params, context);
+      const result = await handler.invoke(envelope.data.params, {
+        ...context,
+        requestId: String(envelope.data.id),
+      });
       if (result.kind === "invalid-params") {
         return {
           response: makeJsonRpcError(
@@ -75,9 +79,15 @@ export function createRpcDispatcher(options: RpcDispatcherOptions) {
         id: envelope.data.id,
         result: result.result,
       };
-      return result.afterResponseEnqueued === undefined
-        ? { response }
-        : { response, afterResponseEnqueued: result.afterResponseEnqueued };
+      return {
+        response,
+        ...(result.afterResponseEnqueued === undefined
+          ? {}
+          : { afterResponseEnqueued: result.afterResponseEnqueued }),
+        ...(result.afterResponseSent === undefined
+          ? {}
+          : { afterResponseSent: result.afterResponseSent }),
+      };
     } catch {
       return {
         response: makeJsonRpcError(

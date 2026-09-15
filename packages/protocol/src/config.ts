@@ -19,6 +19,16 @@ export interface Environment {
   readonly LLM_CONTEXT_WINDOW_TOKENS?: string;
   /** 单次输出 token 上限；可选，默认 8192。 */
   readonly LLM_MAX_OUTPUT_TOKENS?: string;
+  /** Trace 开关；默认 true。 */
+  readonly MINICODE_TRACE_ENABLED?: string;
+  /** Trace payload 模式：summary | full；默认 summary。 */
+  readonly MINICODE_TRACE_PAYLOAD?: string;
+  /** Trace 队列事件数上限；默认 1024，范围 16..65536。 */
+  readonly MINICODE_TRACE_QUEUE_EVENTS?: string;
+  /** Trace 文件字节上限；默认 33554432，最小 1 MiB。 */
+  readonly MINICODE_TRACE_MAX_BYTES?: string;
+  /** Trace shutdown 等待毫秒数；默认 2000，范围 100..30000。 */
+  readonly MINICODE_TRACE_SHUTDOWN_MS?: string;
   readonly [name: string]: string | undefined;
 }
 

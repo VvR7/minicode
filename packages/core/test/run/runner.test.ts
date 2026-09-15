@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentEvent } from "@minicode/protocol";
+import { LlmError } from "../../src/llm/errors.ts";
 import { AgentRunner } from "../../src/run/runner.ts";
+import { TraceService } from "../../src/trace/service.ts";
+import { MemoryTraceStorage } from "../trace/test-helpers.ts";
 import { cleanupTempWorkspace, createTempWorkspace } from "../tools/test-helpers.ts";
 import {
   SESSION_A,
@@ -18,6 +21,20 @@ function finishedOf(events: readonly AgentEvent[]) {
     throw new Error("missing run.finished");
   }
   return finished.payload;
+}
+
+const traceConfig = {
+  enabled: true,
+  payload: "summary" as const,
+  queueEvents: 100,
+  maxBytes: 1_000_000,
+  shutdownMs: 100,
+};
+
+/** 读取测试 run 已完成刷盘的 Trace kind。 */
+function traceKinds(storage: MemoryTraceStorage): string[] {
+  const path = `/home/sessions/${SESSION_A}/runs/${RUN_A}/trace.jsonl`;
+  return storage.lines(path).map((line) => (JSON.parse(line) as { kind: string }).kind);
 }
 
 describe("AgentRunner", () => {
@@ -89,14 +106,42 @@ describe("AgentRunner", () => {
     }
   });
 
+  test("pairs a provider error trace with its LLM request", async () => {
+    const workspace = await createTempWorkspace();
+    try {
+      const bus = createBus();
+      const storage = new MemoryTraceStorage();
+      const traces = new TraceService("/home", traceConfig, storage);
+      traces.startRun(SESSION_A, RUN_A);
+      const runner = new AgentRunner({
+        environment: environmentWithLlm(),
+        bus,
+        traceService: traces,
+        providerFactory: () =>
+          new FakeProvider([{ error: new LlmError("network_error", "secret") }]),
+      });
+      await runner.run(
+        { sessionId: SESSION_A, runId: RUN_A, goal: "x", workspaceRoot: workspace },
+        new AbortController().signal,
+      );
+      expect(traceKinds(storage)).toEqual(expect.arrayContaining(["llm.request", "llm.error"]));
+    } finally {
+      await cleanupTempWorkspace(workspace);
+    }
+  });
+
   test("fails with run_timeout when the whole run exceeds its timeout", async () => {
     const workspace = await createTempWorkspace();
     try {
       const bus = createBus();
+      const storage = new MemoryTraceStorage();
+      const traces = new TraceService("/home", traceConfig, storage);
+      traces.startRun(SESSION_A, RUN_A);
       const runner = new AgentRunner({
         environment: environmentWithLlm(),
         bus,
         runTimeoutMs: 20,
+        traceService: traces,
         providerFactory: () => new HangProvider(),
       });
       const { events, subscription } = await collectEvents(bus, SESSION_A, RUN_A);
@@ -108,6 +153,7 @@ describe("AgentRunner", () => {
       await subscription.closed;
 
       expect(finishedOf(events)).toMatchObject({ status: "failed", reason: "run_timeout" });
+      expect(traceKinds(storage)).toEqual(expect.arrayContaining(["llm.request", "llm.cancelled"]));
     } finally {
       await cleanupTempWorkspace(workspace);
     }
@@ -117,9 +163,13 @@ describe("AgentRunner", () => {
     const workspace = await createTempWorkspace();
     try {
       const bus = createBus();
+      const storage = new MemoryTraceStorage();
+      const traces = new TraceService("/home", traceConfig, storage);
+      traces.startRun(SESSION_A, RUN_A);
       const runner = new AgentRunner({
         environment: environmentWithLlm(),
         bus,
+        traceService: traces,
         providerFactory: () => new HangProvider(),
       });
       const { events, subscription } = await collectEvents(bus, SESSION_A, RUN_A);
@@ -134,6 +184,7 @@ describe("AgentRunner", () => {
       await subscription.closed;
 
       expect(finishedOf(events)).toMatchObject({ status: "cancelled", reason: "cancelled" });
+      expect(traceKinds(storage)).toEqual(expect.arrayContaining(["llm.request", "llm.cancelled"]));
     } finally {
       await cleanupTempWorkspace(workspace);
     }

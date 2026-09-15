@@ -10,6 +10,7 @@ import { builtinTools } from "../tools/builtin/index.ts";
 import { ToolInvoker } from "../tools/invoker.ts";
 import { ToolRegistry } from "../tools/registry.ts";
 import type { Tool } from "../tools/types.ts";
+import type { TraceService } from "../trace/service.ts";
 
 /** 整 run 的默认超时毫秒数（10 分钟）。 */
 export const DEFAULT_RUN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -27,6 +28,8 @@ export interface AgentRunnerOptions {
   readonly runTimeoutMs?: number;
   /** 可注入的 provider 工厂，测试用 fake provider 替代真实网络。 */
   readonly providerFactory?: (config: LlmConfig) => LlmProvider;
+  /** Core 级 run recorder 注册表；省略时禁用 Trace 集成。 */
+  readonly traceService?: TraceService;
 }
 
 /**
@@ -38,12 +41,14 @@ export class AgentRunner {
   readonly #bus: EventBus;
   readonly #runTimeoutMs: number;
   readonly #providerFactory: (config: LlmConfig) => LlmProvider;
+  readonly #traceService: TraceService | undefined;
 
   constructor(options: AgentRunnerOptions) {
     this.#environment = options.environment;
     this.#bus = options.bus;
     this.#runTimeoutMs = options.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
     this.#providerFactory = options.providerFactory ?? ((config) => new AnthropicAdapter(config));
+    this.#traceService = options.traceService;
   }
 
   async run(
@@ -55,6 +60,8 @@ export class AgentRunner {
       await this.#run(request, externalSignal, onStarted);
     } catch {
       // 所有失败已在 #run 内收敛为 run.finished；此处兜底防止 daemon 崩溃。
+    } finally {
+      await this.#traceService?.finishRun(request.sessionId, request.runId);
     }
   }
 
@@ -101,7 +108,10 @@ export class AgentRunner {
         registry.register(tool as Tool);
       }
       const invoker = new ToolInvoker(registry);
-      const loop = new AgentLoop(provider, registry, invoker, this.#bus);
+      const traceRecorder = this.#traceService?.recorderFor(request.sessionId, request.runId);
+      const loop = new AgentLoop(provider, registry, invoker, this.#bus, {
+        ...(traceRecorder === undefined ? {} : { traceRecorder }),
+      });
       await loop.run(context, controller.signal, true);
     } catch {
       // AgentLoop 自身已发布终态；只有组装依赖失败时 context 仍处于 running，需补齐唯一终态。

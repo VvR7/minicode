@@ -9,4 +9,5 @@ export * from "./rpc-dispatcher.ts";
 export * from "./run/index.ts";
 export * from "./session/index.ts";
 export * from "./tools/index.ts";
+export * from "./trace/index.ts";
 export * from "./transport/ndjson-server.ts";

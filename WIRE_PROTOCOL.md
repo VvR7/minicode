@@ -927,6 +927,11 @@ Success response:
               "type": "integer",
               "minimum": 0,
               "maximum": 9007199254740991
+            },
+            "contextWindowTokens": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
             }
           },
           "required": [
@@ -3878,6 +3883,11 @@ Success response:
                     "cacheCreationInputTokens": {
                       "type": "integer",
                       "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "contextWindowTokens": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
                       "maximum": 9007199254740991
                     }
                   },

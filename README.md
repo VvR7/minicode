@@ -56,8 +56,8 @@ bun run mc --goal "Read README.md and summarize it"
 Core 默认监听 `127.0.0.1:7437`。可通过 `.env` 中的 `MINICODE_CORE_HOST` 和
 `MINICODE_CORE_PORT` 修改 loopback 地址；当前不允许监听非本机地址。
 持久化数据默认写入 `~/.minicode`，可通过绝对路径 `MINICODE_HOME` 覆盖。模型上下文预算由
-`LLM_CONTEXT_WINDOW_TOKENS` 和 `LLM_MAX_OUTPUT_TOKENS` 控制；无法容纳的新消息会在创建 turn/run
-前被拒绝。
+`LLM_CONTEXT_WINDOW_TOKENS` 和 `LLM_MAX_OUTPUT_TOKENS` 控制，省略时分别使用 200000 和 8192；
+无法容纳的新消息会在创建 turn/run 前被拒绝。
 
 ## 终端界面（TUI）
 
@@ -89,8 +89,9 @@ close/delete/rename 操作。
 | `Ctrl+Home` / `Ctrl+End` | 跳到日志开头/结尾 |
 
 selector 使用 `↑/↓` 或 `j/k` 选择、Enter 打开、Tab 切换当前/全部 workspace、`O` 显示或隐藏
-one-shot、Esc 退出。输入区中的普通 `q` 只是文本，不是退出键。终端标记以稳定文字和颜色区分
-`YOU`、`ASSISTANT`、`TURN`、`MODEL`、`TOOL`、`TASK`、`USAGE` 与 `ERROR`。
+one-shot、Esc 退出。输入区中的普通 `q` 只是文本，不是退出键。底部固定显示 workspace、最近一次
+模型请求的上下文占用/总窗口和当前模型；逐调用 Usage 不写入 transcript。Assistant 回复按 Markdown
+渲染，终端标记以稳定文字和颜色区分 `YOU`、`ASSISTANT`、`TURN`、`TOOL`、`TASK` 与 `ERROR`。
 
 详细说明见 [TUI 使用说明](TUI.md)。
 

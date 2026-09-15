@@ -2,6 +2,8 @@ import { z } from "zod";
 
 export const DEFAULT_CORE_HOST = "127.0.0.1" as const;
 export const DEFAULT_CORE_PORT = 7437;
+/** 未显式配置时采用的通用模型上下文窗口，兼容 Stage2 之前的 .env。 */
+export const DEFAULT_LLM_CONTEXT_WINDOW_TOKENS = 200_000;
 export const LOOPBACK_HOSTS = ["127.0.0.1", "::1"] as const;
 
 export const CoreEndpointSchema = z.strictObject({
@@ -15,7 +17,10 @@ export interface Environment {
   readonly MINICODE_CORE_PORT?: string;
   readonly MINICODE_HOME?: string;
   readonly MINICODE_LOG_LEVEL?: string;
-  /** 模型 context window 的 token 上限；Stage2 起必填。 */
+  readonly LLM_API_KEY?: string;
+  readonly LLM_BASE_URL?: string;
+  readonly LLM_MODEL?: string;
+  /** 模型 context window 的 token 上限；可选，默认 200000。 */
   readonly LLM_CONTEXT_WINDOW_TOKENS?: string;
   /** 单次输出 token 上限；可选，默认 8192。 */
   readonly LLM_MAX_OUTPUT_TOKENS?: string;

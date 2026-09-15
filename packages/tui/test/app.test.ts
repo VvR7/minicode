@@ -98,6 +98,8 @@ async function start(
     mode,
     workspaceRoot: "/work",
     endpoint: { host: "127.0.0.1", port: 7437 },
+    model: "test-model",
+    contextWindowTokens: 100_000,
     createRenderer: async () => setup.renderer,
     createController: (consume) => {
       fake = new FakeController(consume, sessions);
@@ -110,7 +112,7 @@ async function start(
         ? "[SESSIONS]"
         : mode.kind === "session" || mode.kind === "continue"
           ? "session"
-          : "32768 remaining",
+          : "context --/100k",
     ),
   );
   if (fake === undefined) throw new Error("controller was not created");
@@ -124,6 +126,159 @@ async function exit(setup: Awaited<ReturnType<typeof createTestRenderer>>): Prom
 }
 
 describe("TuiApp multi-turn interaction", () => {
+  test("renders assistant Markdown and keeps usage/model in the footer", async () => {
+    const { setup, controller, code } = await start();
+    controller.emit({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 1,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "llm.model_selected",
+        payload: { model: "deepseek-flash", provider: "anthropic" },
+      },
+    });
+    controller.emit({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 2,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "llm.text_delta",
+        payload: { text: "# Heading\n\n- **bold item**" },
+      },
+    });
+    controller.emit({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 3,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "llm.usage",
+        payload: {
+          inputTokens: 10_000,
+          outputTokens: 500,
+          cacheReadInputTokens: 89_000,
+          cacheCreationInputTokens: 500,
+          contextWindowTokens: 200_000,
+        },
+      },
+    });
+    await setup.waitForFrame(
+      (frame) =>
+        frame.includes("Heading") &&
+        frame.includes("bold item") &&
+        frame.includes("context 100k/200k 50.0%") &&
+        frame.includes("deepseek-flash"),
+    );
+    const frame = setup.captureCharFrame();
+    expect(frame).not.toContain("**bold item**");
+    expect(frame).not.toContain("[USAGE]");
+    expect(frame).not.toContain("[MODEL]");
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
+
+  test("renders the final Markdown answer after preceding tool events", async () => {
+    const { setup, controller, code } = await start();
+    const emitRunEvent = (event: Parameters<typeof controller.emit>[0] & { type: "run.event" }) =>
+      controller.emit(event);
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 1,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "step.started",
+        payload: { step: 1 },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 2,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "llm.text_delta",
+        payload: { text: "Checking files" },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 3,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "tool.started",
+        payload: { toolCallId: "call-1", name: "read_file", attempt: 1 },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 4,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "tool.finished",
+        payload: {
+          toolCallId: "call-1",
+          name: "read_file",
+          isError: false,
+          durationMs: 1,
+          outputBytes: 10,
+          truncated: false,
+        },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 5,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "step.started",
+        payload: { step: 2 },
+      },
+    });
+    emitRunEvent({
+      type: "run.event",
+      event: {
+        sessionId,
+        runId,
+        sequence: 6,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        durable: true,
+        type: "llm.text_delta",
+        payload: { text: "## Final answer" },
+      },
+    });
+
+    await setup.waitForFrame(
+      (frame) => frame.includes("Final answer") && frame.includes("✓ completed read_file"),
+    );
+    const frame = setup.captureCharFrame();
+    expect(frame.indexOf("Checking files")).toBeLessThan(frame.indexOf("▶ running read_file"));
+    expect(frame.indexOf("✓ completed read_file")).toBeLessThan(frame.indexOf("Final answer"));
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
+
   test("Enter sends while Ctrl+Enter inserts a newline at the OpenTUI key layer", async () => {
     const { setup, controller, code } = await start();
     await setup.mockInput.typeText("hello");
@@ -233,15 +388,25 @@ describe("TuiApp multi-turn interaction", () => {
             timestamp: "2026-01-01T00:00:00.000Z",
             content: [{ type: "text", text: "old message" }],
           },
+          {
+            messageId: "a",
+            turnId,
+            runId,
+            role: "assistant",
+            timestamp: "2026-01-01T00:00:01.000Z",
+            content: [{ type: "text", text: "## Old heading\n\n- **restored item**" }],
+          },
         ],
       },
     });
-    await setup.waitForFrame((frame) => frame.includes("old message"));
+    await setup.waitForFrame((frame) => frame.includes("restored item"));
+    expect(setup.captureCharFrame()).not.toContain("**restored item**");
     await setup.mockInput.typeText("/new");
     setup.mockInput.pressEnter();
     await setup.waitFor(() => controller.createCalls === 2);
     await setup.waitForFrame((frame) => frame.includes("session 950e8400"));
     expect(setup.captureCharFrame()).not.toContain("old message");
+    expect(setup.captureCharFrame()).not.toContain("restored item");
     await exit(setup);
     expect(await code).toBe(0);
   });
@@ -253,7 +418,7 @@ describe("TuiApp multi-turn interaction", () => {
     await goal.code;
     const audit = { ...summary, mode: "one_shot" as const };
     const resumed = await start({ kind: "session", sessionId }, [audit]);
-    await resumed.setup.waitForFrame((frame) => frame.includes("read-only audit"));
+    await resumed.setup.waitForFrame((frame) => frame.includes("read-only"));
     expect(resumed.controller.sent).toHaveLength(0);
     await resumed.setup.mockInput.typeText("not allowed");
     resumed.setup.mockInput.pressEnter();

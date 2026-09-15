@@ -75,7 +75,11 @@ export const LlmRetryingEventSchema = eventSchema(
   }),
   z.literal(true),
 );
-export const LlmUsageEventSchema = eventSchema("llm.usage", LlmUsageSchema);
+/** 单次 provider 调用用量；contextWindowTokens 可选以兼容已有持久事件。 */
+export const LlmUsageEventSchema = eventSchema(
+  "llm.usage",
+  LlmUsageSchema.extend({ contextWindowTokens: z.number().int().positive().optional() }),
+);
 export const ToolStartedEventSchema = eventSchema(
   "tool.started",
   z.strictObject({

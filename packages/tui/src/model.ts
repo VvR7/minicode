@@ -31,6 +31,8 @@ export interface LogLine {
   readonly id: number;
   readonly kind: LogKind;
   readonly text: string;
+  /** Assistant Markdown 正在接收 delta 时保持流式解析。 */
+  readonly streaming?: boolean;
 }
 /** EventLog 执行的最小增量变更。 */
 export type LogMutation =
@@ -46,6 +48,9 @@ export interface TuiSnapshot {
   readonly readOnly: boolean;
   readonly lines: readonly LogLine[];
   readonly notice: string | undefined;
+  readonly model: string | undefined;
+  readonly contextUsedTokens: number | undefined;
+  readonly contextWindowTokens: number | undefined;
 }
 
 export const MAX_LOG_LINES = 1000;
@@ -86,20 +91,33 @@ export class TuiModel {
   #readOnly = false;
   #lines: LogLine[] = [];
   #notice: string | undefined;
+  #model: string | undefined;
+  #contextUsedTokens: number | undefined;
+  #contextWindowTokens: number | undefined;
   #nextId = 1;
   #bytes = 0;
   #maxLines: number;
   #maxBytes: number;
   #knownTurns = new Set<string>();
   #runSequences = new Map<string, number>();
+  /** 每个 run 当前 step 正在流式输出的 assistant 块；新 step 必须另起一块以保持事件顺序。 */
   #assistantLines = new Map<string, number>();
   #turnLines = new Map<string, number>();
   #taskLines = new Map<string, number>();
 
   /** 测试可注入更小的 transcript 上限。 */
-  constructor(options: { readonly maxLines?: number; readonly maxBytes?: number } = {}) {
+  constructor(
+    options: {
+      readonly maxLines?: number;
+      readonly maxBytes?: number;
+      readonly model?: string;
+      readonly contextWindowTokens?: number;
+    } = {},
+  ) {
     this.#maxLines = options.maxLines ?? MAX_LOG_LINES;
     this.#maxBytes = options.maxBytes ?? MAX_LOG_BYTES;
+    this.#model = options.model;
+    this.#contextWindowTokens = options.contextWindowTokens;
   }
   /** 返回当前不可变快照。 */
   snapshot(): TuiSnapshot {
@@ -111,6 +129,9 @@ export class TuiModel {
       readOnly: this.#readOnly,
       lines: this.#lines,
       notice: this.#notice,
+      model: this.#model,
+      contextUsedTokens: this.#contextUsedTokens,
+      contextWindowTokens: this.#contextWindowTokens,
     };
   }
 
@@ -124,6 +145,7 @@ export class TuiModel {
     this.#lines = [];
     this.#bytes = 0;
     this.#notice = undefined;
+    this.#contextUsedTokens = undefined;
     this.#knownTurns.clear();
     this.#runSequences.clear();
     this.#assistantLines.clear();
@@ -227,21 +249,21 @@ export class TuiModel {
         this.#run = "running";
         this.#activeRunId = event.runId;
         break;
+      case "step.started":
+        // 一次 run 可能经历多次 LLM -> 工具调用；不能把后续 step 的最终回答写回工具前的旧块。
+        this.#assistantLines.delete(event.runId);
+        break;
       case "llm.text_delta": {
         let id = this.#assistantLines.get(event.runId);
         if (id === undefined) {
-          id = this.#append(mutations, "assistant", "[ASSISTANT] ");
+          id = this.#append(mutations, "assistant", "[ASSISTANT] ", true);
           this.#assistantLines.set(event.runId, id);
         }
         this.#extend(mutations, id, event.payload.text);
         break;
       }
       case "llm.model_selected":
-        this.#append(
-          mutations,
-          "model",
-          `[MODEL] ${event.payload.model} (${event.payload.provider})`,
-        );
+        this.#model = event.payload.model;
         break;
       case "llm.retrying":
         this.#append(
@@ -251,11 +273,13 @@ export class TuiModel {
         );
         break;
       case "llm.usage":
-        this.#append(
-          mutations,
-          "usage",
-          `[USAGE] in=${event.payload.inputTokens} out=${event.payload.outputTokens}`,
-        );
+        this.#contextUsedTokens =
+          event.payload.inputTokens +
+          event.payload.cacheReadInputTokens +
+          event.payload.cacheCreationInputTokens +
+          event.payload.outputTokens;
+        if (event.payload.contextWindowTokens !== undefined)
+          this.#contextWindowTokens = event.payload.contextWindowTokens;
         break;
       case "tool.started":
         this.#append(mutations, "tool", `[TOOL] ▶ running ${event.payload.name}`);
@@ -282,7 +306,6 @@ export class TuiModel {
         this.#correctFinalText(event.runId, event.payload.finalText, mutations);
         this.#finishTurn(event.runId, event.payload.status, event.payload.reason, mutations);
         break;
-      case "step.started":
       case "step.finished":
         break;
     }
@@ -320,9 +343,9 @@ export class TuiModel {
       if (finalText.length > 0)
         this.#assistantLines.set(
           runId,
-          this.#append(mutations, "assistant", `[ASSISTANT] ${finalText}`),
+          this.#append(mutations, "assistant", `[ASSISTANT] ${finalText}`, false),
         );
-    } else this.#replace(mutations, id, "assistant", `[ASSISTANT] ${finalText}`);
+    } else this.#replace(mutations, id, "assistant", `[ASSISTANT] ${finalText}`, false);
   }
   /** 应用权威终态并更新原 TURN 行。 */
   #finishTurn(
@@ -342,8 +365,13 @@ export class TuiModel {
     }
   }
   /** 追加日志并执行双重上限裁剪。 */
-  #append(mutations: LogMutation[], kind: LogKind, text: string): number {
-    const line = { id: this.#nextId++, kind, text };
+  #append(mutations: LogMutation[], kind: LogKind, text: string, streaming?: boolean): number {
+    const line = {
+      id: this.#nextId++,
+      kind,
+      text,
+      ...(streaming === undefined ? {} : { streaming }),
+    };
     this.#lines.push(line);
     this.#bytes += encoder.encode(text).length;
     mutations.push({ type: "append", line });
@@ -354,14 +382,20 @@ export class TuiModel {
   #extend(mutations: LogMutation[], id: number, text: string): void {
     const line = this.#lines.find((candidate) => candidate.id === id);
     if (line !== undefined && text.length > 0)
-      this.#replace(mutations, id, line.kind, line.text + text);
+      this.#replace(mutations, id, line.kind, line.text + text, line.streaming);
   }
   /** 替换稳定日志行。 */
-  #replace(mutations: LogMutation[], id: number, kind: LogKind, text: string): void {
+  #replace(
+    mutations: LogMutation[],
+    id: number,
+    kind: LogKind,
+    text: string,
+    streaming?: boolean,
+  ): void {
     const index = this.#lines.findIndex((line) => line.id === id);
     const old = this.#lines[index];
     if (old === undefined) return;
-    const line = { id, kind, text };
+    const line = { id, kind, text, ...(streaming === undefined ? {} : { streaming }) };
     this.#lines[index] = line;
     this.#bytes += encoder.encode(text).length - encoder.encode(old.text).length;
     mutations.push({ type: "update", line });

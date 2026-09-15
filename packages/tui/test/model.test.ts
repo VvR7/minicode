@@ -72,6 +72,86 @@ describe("TuiModel", () => {
     const assistants = model.snapshot().lines.filter((line) => line.kind === "assistant");
     expect(assistants).toHaveLength(1);
     expect(assistants[0]?.text).toBe("[ASSISTANT] Hello");
+    expect(assistants[0]?.streaming).toBe(false);
+  });
+  test("keeps assistant blocks in event order across tool-calling steps", () => {
+    const model = new TuiModel();
+    model.apply({ type: "run.event", event: event("step.started", { step: 1 }, 1) });
+    model.apply({ type: "run.event", event: event("llm.text_delta", { text: "Before tools" }, 2) });
+    model.apply({
+      type: "run.event",
+      event: event("tool.started", { toolCallId: "call-1", name: "read_file", attempt: 1 }, 3),
+    });
+    model.apply({
+      type: "run.event",
+      event: event(
+        "tool.finished",
+        {
+          toolCallId: "call-1",
+          name: "read_file",
+          isError: false,
+          durationMs: 1,
+          outputBytes: 10,
+          truncated: false,
+        },
+        4,
+      ),
+    });
+    model.apply({
+      type: "run.event",
+      event: event("step.finished", { step: 1, outcome: "continue" }, 5),
+    });
+    model.apply({ type: "run.event", event: event("step.started", { step: 2 }, 6) });
+    model.apply({ type: "run.event", event: event("llm.text_delta", { text: "Final" }, 7) });
+    model.apply({
+      type: "run.event",
+      event: event(
+        "run.finished",
+        {
+          status: "succeeded",
+          reason: "completed",
+          finalText: "Final answer",
+          steps: 2,
+          usage,
+        },
+        8,
+      ),
+    });
+
+    expect(model.snapshot().lines.map((line) => `${line.kind}:${line.text}`)).toEqual([
+      "assistant:[ASSISTANT] Before tools",
+      "tool:[TOOL] ▶ running read_file",
+      "tool:[TOOL] ✓ completed read_file",
+      "assistant:[ASSISTANT] Final answer",
+      `turn:[TURN] ✓ succeeded ${runId.slice(0, 8)} (completed)`,
+    ]);
+  });
+  test("projects model and latest context without adding noisy transcript lines", () => {
+    const model = new TuiModel({ contextWindowTokens: 100_000 });
+    model.apply({
+      type: "run.event",
+      event: event("llm.model_selected", { model: "deepseek-flash", provider: "anthropic" }, 1),
+    });
+    model.apply({
+      type: "run.event",
+      event: event(
+        "llm.usage",
+        {
+          inputTokens: 159,
+          outputTokens: 122,
+          cacheReadInputTokens: 1152,
+          cacheCreationInputTokens: 10,
+          contextWindowTokens: 200_000,
+        },
+        2,
+      ),
+    });
+    expect(model.snapshot()).toMatchObject({
+      model: "deepseek-flash",
+      contextUsedTokens: 1443,
+      contextWindowTokens: 200_000,
+    });
+    expect(model.snapshot().lines).toHaveLength(0);
   });
   test("restores history with folded task graph and tool summaries", () => {
     const task: TaskSnapshot = {

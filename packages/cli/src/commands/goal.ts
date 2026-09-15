@@ -169,6 +169,7 @@ export function exitCodeForResult(
     case "cancelled":
       return 130;
     case "connect-failed":
+    case "request-error":
     case "acceptance-uncertain":
       return 2;
     case "internal-error":
@@ -245,6 +246,8 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
   // 只在共享客户端无法自行给出更具体退出码的生命周期错误上补充 stderr 说明。
   if (result.kind === "connect-failed") {
     writeStderr(`error: cannot connect to core (${formatEndpoint(options.endpoint)})\n`);
+  } else if (result.kind === "request-error") {
+    writeStderr(`error: ${result.message}\n`);
   } else if (result.kind === "acceptance-uncertain") {
     writeStderr("error: agent.run failed before acceptance could be confirmed\n");
   } else if (result.kind === "internal-error") {

@@ -4,6 +4,20 @@ import { RUN_A, SESSION_A } from "../session/test-helpers.ts";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** 等待可控 gate，并在 shutdown abort 时立即退出。 */
+async function waitForGate(gate: Promise<void>, signal: AbortSignal): Promise<void> {
+  await Promise.race([
+    gate,
+    new Promise<never>((_, reject) => {
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }),
+  ]);
+}
+
 /** 可注入故障/门控/延迟的内存 Trace 存储，用于确定性地覆盖 writer 边界分支。 */
 export class MemoryTraceStorage implements TraceStorage {
   readonly files = new Map<string, string>();
@@ -16,23 +30,30 @@ export class MemoryTraceStorage implements TraceStorage {
   writeDelayMs = 0;
   openError: Error | null = null;
   writeError: Error | null = null;
+  closeError: Error | null = null;
 
-  async ensureDirectory(path: string): Promise<void> {
+  async ensureDirectory(path: string, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
     this.directories.add(path);
   }
 
-  async openAppend(path: string): Promise<TraceStorageHandle> {
+  async readFile(path: string, signal: AbortSignal): Promise<string | undefined> {
+    signal.throwIfAborted();
+    return this.files.get(path);
+  }
+
+  async openAppend(path: string, signal: AbortSignal): Promise<TraceStorageHandle> {
     if (this.openGate !== null) {
-      await this.openGate;
+      await waitForGate(this.openGate, signal);
     }
     if (this.openError !== null) {
       throw this.openError;
     }
     const storage = this;
     return {
-      async write(text) {
+      async write(text, writeSignal) {
         if (storage.writeGate !== null) {
-          await storage.writeGate;
+          await waitForGate(storage.writeGate, writeSignal);
         }
         if (storage.writeDelayMs > 0) {
           await sleep(storage.writeDelayMs);
@@ -42,7 +63,11 @@ export class MemoryTraceStorage implements TraceStorage {
         }
         storage.files.set(path, `${storage.files.get(path) ?? ""}${text}`);
       },
-      async close() {},
+      async close() {
+        if (storage.closeError !== null) {
+          throw storage.closeError;
+        }
+      },
     };
   }
 

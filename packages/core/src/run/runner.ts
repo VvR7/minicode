@@ -14,6 +14,7 @@ import { createNoteSaveTool, NoteSaveParamsSchema } from "../session/note-tool.t
 import { NoteStore } from "../session/notes.ts";
 import { nodeSessionStorage } from "../session/storage.ts";
 import { TaskManager, nodeTaskStorage, tasksPath } from "../tasks/task-store.ts";
+import type { TaskStorage } from "../tasks/types.ts";
 import {
   createTaskTools,
   TaskCreateParamsSchema,
@@ -113,6 +114,8 @@ export interface AgentRunnerOptions {
   readonly runTimeoutMs?: number;
   /** 可注入的 provider 工厂，测试用 fake provider 替代真实网络。 */
   readonly providerFactory?: (config: LlmConfig) => LlmProvider;
+  /** 可注入的任务存储，测试可替代真实文件系统。 */
+  readonly taskStorage?: TaskStorage;
 }
 
 /** 一次 run 结束后返回的完整终态，含最终任务图快照。 */
@@ -131,13 +134,16 @@ export class AgentRunner {
   readonly #homeDirectory: string;
   readonly #runTimeoutMs: number;
   readonly #providerFactory: (config: LlmConfig) => LlmProvider;
+  readonly #taskStorage: TaskStorage;
 
+  /** 保存 run 组装所需的环境、存储、事件与可注入依赖。 */
   constructor(options: AgentRunnerOptions) {
     this.#environment = options.environment;
     this.#bus = options.bus;
     this.#homeDirectory = options.homeDirectory;
     this.#runTimeoutMs = options.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
     this.#providerFactory = options.providerFactory ?? ((config) => new AnthropicAdapter(config));
+    this.#taskStorage = options.taskStorage ?? nodeTaskStorage;
   }
 
   /** 执行一次隔离 run；任何组装异常都收敛为包含本轮用户消息的安全终态。 */
@@ -217,7 +223,7 @@ export class AgentRunner {
       await nodeSessionStorage.ensureDirectory(runDirectory);
 
       const taskManager = new TaskManager(
-        nodeTaskStorage,
+        this.#taskStorage,
         tasksPath(this.#homeDirectory, request.sessionId, request.runId),
       );
       const noteStore = new NoteStore(

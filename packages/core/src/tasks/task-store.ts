@@ -1,5 +1,11 @@
 import { join } from "node:path";
-import type { RunId, SessionId, TaskSnapshot } from "@minicode/protocol";
+import {
+  RunIdSchema,
+  SessionIdSchema,
+  type RunId,
+  type SessionId,
+  type TaskSnapshot,
+} from "@minicode/protocol";
 import { nodeSessionStorage } from "../session/storage.ts";
 import {
   TASK_SCHEMA_VERSION,
@@ -15,9 +21,21 @@ import {
   type UpdateTaskInput,
 } from "./types.ts";
 
+type TaskMutationValue = { readonly revision: number; readonly task: TaskSnapshot };
+
+/** 同一进程内按 tasks.json 路径共享写锁，覆盖多个 TaskManager 实例。 */
+const mutationTails = new Map<string, Promise<void>>();
+
 /** 计算某个 run 的 tasks.json 绝对路径，与 SessionStore 的路径规则一致。 */
 export function tasksPath(homeDirectory: string, sessionId: SessionId, runId: RunId): string {
-  return join(homeDirectory, "sessions", sessionId, "runs", runId, "tasks.json");
+  return join(
+    homeDirectory,
+    "sessions",
+    SessionIdSchema.parse(sessionId),
+    "runs",
+    RunIdSchema.parse(runId),
+    "tasks.json",
+  );
 }
 
 /** 检测直接或间接依赖环。 */
@@ -92,7 +110,9 @@ export class TaskManager {
   readonly #path: string;
   readonly #now: () => string;
   #graph: TaskGraphFile | null = null;
+  #rollback: { readonly revision: number; readonly graph: TaskGraphFile } | null = null;
 
+  /** 绑定单个 run 的存储路径，并允许测试注入确定性时钟。 */
   constructor(
     storage: TaskStorage,
     path: string,
@@ -145,7 +165,15 @@ export class TaskManager {
   /** 创建新任务；ID 取 nextId 且只增不复用。 */
   async create(
     input: CreateTaskInput,
-  ): Promise<TaskStoreResult<{ revision: number; task: TaskSnapshot }>> {
+    afterCommit?: (value: TaskMutationValue) => Promise<void>,
+  ): Promise<TaskStoreResult<TaskMutationValue>> {
+    return this.#withMutationLock(async () =>
+      this.#finishMutation(await this.#create(input), afterCommit),
+    );
+  }
+
+  /** 在 mutation lock 内执行创建并提交新图。 */
+  async #create(input: CreateTaskInput): Promise<TaskStoreResult<TaskMutationValue>> {
     const loaded = await this.#ensureLoaded();
     if (!loaded.ok) {
       return loaded;
@@ -197,7 +225,15 @@ export class TaskManager {
   /** 更新任务；校验状态转换、blocked 约束、依赖引用与环，completed 不可变。 */
   async update(
     input: UpdateTaskInput,
-  ): Promise<TaskStoreResult<{ revision: number; task: TaskSnapshot }>> {
+    afterCommit?: (value: TaskMutationValue) => Promise<void>,
+  ): Promise<TaskStoreResult<TaskMutationValue>> {
+    return this.#withMutationLock(async () =>
+      this.#finishMutation(await this.#update(input), afterCommit),
+    );
+  }
+
+  /** 在 mutation lock 内执行更新、整图校验与提交。 */
+  async #update(input: UpdateTaskInput): Promise<TaskStoreResult<TaskMutationValue>> {
     const loaded = await this.#ensureLoaded();
     if (!loaded.ok) {
       return loaded;
@@ -315,6 +351,59 @@ export class TaskManager {
     };
   }
 
+  /** 在共享写锁内执行提交后回调；失败时先补偿任务图再返回稳定错误。 */
+  async #finishMutation(
+    result: TaskStoreResult<TaskMutationValue>,
+    afterCommit: ((value: TaskMutationValue) => Promise<void>) | undefined,
+  ): Promise<TaskStoreResult<TaskMutationValue>> {
+    if (!result.ok) {
+      return result;
+    }
+    if (afterCommit === undefined) {
+      this.#rollback = null;
+      return result;
+    }
+    try {
+      await afterCommit(result.value);
+      this.#rollback = null;
+      return result;
+    } catch {
+      const rolledBack = await this.#rollbackMutation(result.value.revision);
+      return this.#fail(
+        "io_error",
+        rolledBack.ok
+          ? "failed to persist task event"
+          : "failed to persist task event and roll back task state",
+      );
+    }
+  }
+
+  /** durable event 失败时恢复上一图；调用方必须已持有共享写锁。 */
+  async #rollbackMutation(revision: number): Promise<TaskStoreResult<void>> {
+    const rollback = this.#rollback;
+    if (rollback === null || rollback.revision !== revision || this.#graph?.revision !== revision) {
+      return this.#fail("stale_revision", "task mutation can no longer be rolled back");
+    }
+    const disk = await this.#readDiskGraph();
+    if (!disk.ok) {
+      return disk;
+    }
+    if (disk.value === undefined || !this.#sameGraph(disk.value, this.#graph)) {
+      return this.#fail("stale_revision", "tasks.json changed before rollback");
+    }
+    try {
+      await this.#storage.writeFileAtomic(
+        this.#path,
+        `${JSON.stringify(rollback.graph, null, 2)}\n`,
+      );
+    } catch {
+      return this.#fail("io_error", "failed to roll back tasks.json");
+    }
+    this.#graph = rollback.graph;
+    this.#rollback = null;
+    return { ok: true, value: undefined };
+  }
+
   /** 懒加载图，保证 create/update/list/get 首次调用前已校验落盘状态。 */
   async #ensureLoaded(): Promise<TaskStoreResult<void>> {
     if (this.#graph !== null) {
@@ -330,9 +419,21 @@ export class TaskManager {
   /** 校验已持久化的整图：任何结构违例都收敛为 task_store_corrupted。 */
   #validatePersisted(tasks: readonly TaskRecord[], nextId: number): TaskStoreResult<void> {
     const ids = new Set<number>();
-    for (const task of tasks) {
+    for (const [index, task] of tasks.entries()) {
       if (ids.has(task.id)) {
         return this.#fail("task_store_corrupted", "duplicate task id");
+      }
+      if (index > 0 && (tasks[index - 1]?.id ?? 0) >= task.id) {
+        return this.#fail("task_store_corrupted", "tasks are not ordered by id");
+      }
+      if (
+        task.blockedBy.some(
+          (dependency, dependencyIndex) =>
+            dependencyIndex > 0 &&
+            (task.blockedBy[dependencyIndex - 1] ?? dependency) >= dependency,
+        )
+      ) {
+        return this.#fail("task_store_corrupted", "task dependencies are not unique and ordered");
       }
       ids.add(task.id);
     }
@@ -346,6 +447,10 @@ export class TaskManager {
     if (hasCycle(tasks)) {
       return this.#fail("task_store_corrupted", "dependency graph contains a cycle");
     }
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+    if (tasks.some((task) => task.status !== "pending" && deriveBlocked(task, byId))) {
+      return this.#fail("task_store_corrupted", "a started or completed task is blocked");
+    }
     const maxId = tasks.reduce((max, task) => Math.max(max, task.id), 0);
     if (nextId <= maxId) {
       return this.#fail("task_store_corrupted", "nextId must exceed every task id");
@@ -355,11 +460,23 @@ export class TaskManager {
 
   /** 原子提交：先做 stale revision 检测，写失败绝不推进内存状态。 */
   async #commit(nextGraph: TaskGraphFile): Promise<TaskStoreResult<void>> {
-    const diskRevision = await this.#readDiskRevision();
-    if (!diskRevision.ok) {
-      return diskRevision;
+    if (!TaskGraphFileSchema.safeParse(nextGraph).success) {
+      return this.#fail("invalid_task", "task graph limit reached");
     }
-    if (diskRevision.value !== (this.#graph as TaskGraphFile).revision) {
+    const disk = await this.#readDiskGraph();
+    if (!disk.ok) {
+      return disk;
+    }
+    const current = this.#graph as TaskGraphFile;
+    const diskMatchesInitialEmpty =
+      disk.value === undefined &&
+      current.revision === 0 &&
+      current.nextId === 1 &&
+      current.tasks.length === 0;
+    if (
+      !diskMatchesInitialEmpty &&
+      (disk.value === undefined || !this.#sameGraph(disk.value, current))
+    ) {
       return this.#fail("stale_revision", "tasks.json was modified by another manager");
     }
     try {
@@ -367,12 +484,13 @@ export class TaskManager {
     } catch {
       return this.#fail("io_error", "failed to write tasks.json");
     }
+    this.#rollback = { revision: nextGraph.revision, graph: current };
     this.#graph = nextGraph;
     return { ok: true, value: undefined };
   }
 
-  /** 读取磁盘当前 revision；文件缺失视为 0，损坏返回 task_store_corrupted。 */
-  async #readDiskRevision(): Promise<TaskStoreResult<number>> {
+  /** 读取并完整校验磁盘图；文件缺失返回 undefined。 */
+  async #readDiskGraph(): Promise<TaskStoreResult<TaskGraphFile | undefined>> {
     let raw: string | undefined;
     try {
       raw = await this.#storage.readFile(this.#path);
@@ -380,7 +498,7 @@ export class TaskManager {
       return this.#fail("io_error", "failed to read tasks.json during commit");
     }
     if (raw === undefined) {
-      return { ok: true, value: 0 };
+      return { ok: true, value: undefined };
     }
     let parsed: unknown;
     try {
@@ -392,7 +510,37 @@ export class TaskManager {
     if (!result.success) {
       return this.#fail("task_store_corrupted", "tasks.json schema became invalid");
     }
-    return { ok: true, value: result.data.revision };
+    const validated = this.#validatePersisted(result.data.tasks, result.data.nextId);
+    if (!validated.ok) {
+      return validated;
+    }
+    return { ok: true, value: result.data };
+  }
+
+  /** 比较两个规范化任务图，检测 revision 未变但内容被外部替换的情况。 */
+  #sameGraph(left: TaskGraphFile, right: TaskGraphFile): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
+  }
+
+  /** 按文件路径串行化所有 manager 的变更与提交后回调，避免交错覆盖。 */
+  async #withMutationLock<Value>(
+    operation: () => Promise<TaskStoreResult<Value>>,
+  ): Promise<TaskStoreResult<Value>> {
+    const previous = mutationTails.get(this.#path) ?? Promise.resolve();
+    let release = (): void => {};
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    mutationTails.set(this.#path, current);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (mutationTails.get(this.#path) === current) {
+        mutationTails.delete(this.#path);
+      }
+    }
   }
 
   /** 由已落盘的任务数组构建单个任务的快照。 */
@@ -401,6 +549,7 @@ export class TaskManager {
     return toSnapshot(task, byId);
   }
 
+  /** 构造稳定且不包含底层异常细节的领域失败结果。 */
   #fail(code: TaskStoreFailure["code"], message: string): TaskStoreResult<never> {
     return { ok: false, error: { code, message } };
   }

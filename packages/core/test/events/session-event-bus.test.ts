@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import type { SessionEvent } from "@minicode/protocol";
+import type { HistoryMessage, SessionEvent, SessionId } from "@minicode/protocol";
+import type { SessionStore } from "../../src/session/session-store.ts";
 import { SessionEventBus } from "../../src/events/session-event-bus.ts";
 import { createMemoryStore, seedSession } from "../session/test-helpers.ts";
 import {
@@ -46,11 +47,48 @@ function finished(sessionId = SESSION_A) {
   };
 }
 
+/** 先写入与 accepted 事件一致的权威历史，模拟 SessionManager 的真实提交顺序。 */
+async function persistAccepted(store: SessionStore, sessionId: SessionId): Promise<void> {
+  const result = await store.appendAccepted(sessionId, {
+    turnId: sessionId === SESSION_A ? TURN_A : TURN_B,
+    runId: sessionId === SESSION_A ? RUN_A : RUN_B,
+    clientMessageId: CLIENT_MESSAGE_A,
+    userMessage: "hello",
+  });
+  expect(result.ok).toBe(true);
+}
+
+/** 先写入与 finished 事件一致的权威终态历史，避免构造不可能出现的事件日志。 */
+async function persistFinished(store: SessionStore, sessionId = SESSION_A): Promise<void> {
+  const turnId = sessionId === SESSION_A ? TURN_A : TURN_B;
+  const runId = sessionId === SESSION_A ? RUN_A : RUN_B;
+  const messages: HistoryMessage[] = [
+    {
+      messageId: crypto.randomUUID(),
+      turnId,
+      runId,
+      role: "user",
+      timestamp: new Date().toISOString(),
+      content: [{ type: "text", text: "hello" }],
+    },
+  ];
+  const result = await store.appendCompleted(sessionId, {
+    turnId,
+    runId,
+    status: "succeeded",
+    reason: "completed",
+    messages,
+    model: "test-model",
+  });
+  expect(result.ok).toBe(true);
+}
+
 describe("SessionEventBus", () => {
   test("keeps replay paused until activation and preserves replay/live order", async () => {
     const { store, storage } = createMemoryStore(HOME);
     seedSession(storage, HOME, SESSION_A);
     const bus = new SessionEventBus(store);
+    await persistAccepted(store, SESSION_A);
     expect((await bus.publish(accepted())).ok).toBe(true);
     const events: SessionEvent[] = [];
     const subscribed = await bus.subscribe(
@@ -65,6 +103,7 @@ describe("SessionEventBus", () => {
     expect(subscribed.ok).toBe(true);
     if (!subscribed.ok) return;
     expect(subscribed.value.latestSequence).toBe(1);
+    await persistFinished(store);
     await bus.publish(finished());
     await Bun.sleep(0);
     expect(events).toEqual([]);
@@ -83,12 +122,14 @@ describe("SessionEventBus", () => {
     seedSession(storage, HOME, SESSION_A);
     seedSession(storage, HOME, SESSION_B);
     const bus = new SessionEventBus(store);
+    await Promise.all([persistAccepted(store, SESSION_A), persistAccepted(store, SESSION_B)]);
     const [a, b] = await Promise.all([
       bus.publish(accepted(SESSION_A)),
       bus.publish(accepted(SESSION_B)),
     ]);
     expect(a.ok && a.value.sessionSequence).toBe(1);
     expect(b.ok && b.value.sessionSequence).toBe(1);
+    await persistFinished(store);
     await bus.publish(finished(SESSION_A));
 
     const restarted = new SessionEventBus(store);
@@ -110,14 +151,19 @@ describe("SessionEventBus", () => {
     const { store, storage } = createMemoryStore(HOME);
     seedSession(storage, HOME, SESSION_A);
     const bus = new SessionEventBus(store, { maxQueueEvents: 1 });
-    const invalid = await bus.publish({ ...accepted(), durable: false });
+    const invalid = await bus.publish({
+      ...accepted(),
+      durable: false,
+    } as unknown as Parameters<SessionEventBus["publish"]>[0]);
     expect(invalid).toMatchObject({ ok: false, error: { code: "invalid_event" } });
 
+    await persistAccepted(store, SESSION_A);
     storage.appendError = new Error("disk");
     const failed = await bus.publish(accepted());
     expect(failed).toMatchObject({ ok: false, error: { code: "session_store_error" } });
     storage.appendError = undefined;
     await bus.publish(accepted());
+    await persistFinished(store);
     await bus.publish(finished());
     const overflow = await bus.subscribe(SESSION_A, () => {}, 0, undefined, true);
     expect(overflow).toMatchObject({ ok: false, error: { code: "subscriber_overflow" } });

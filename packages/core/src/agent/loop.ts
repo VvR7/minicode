@@ -210,71 +210,7 @@ export class AgentLoop {
 
   /** 消费 provider 流，把 text_delta / retrying 事件转换为 IPC 事件，返回 completed 响应。 */
   async #consumeStream(context: ExecutionContext, signal: AbortSignal): Promise<LlmResponse> {
-    let response: LlmResponse | undefined;
-    for await (const event of this.#stream(context, signal)) {
-      switch (event.type) {
-        case "text_delta":
-          for (const chunk of chunkText(event.text, MAX_TEXT_DELTA_CHARS)) {
-            await this.#publish(
-              context,
-              { type: "llm.text_delta", payload: { text: chunk } },
-              true,
-            );
-          }
-          break;
-        case "retrying":
-          await this.#publish(
-            context,
-            {
-              type: "llm.retrying",
-              payload: {
-                attempt: event.attempt,
-                maxAttempts: event.maxAttempts,
-                delayMs: event.delayMs,
-                reason: event.reason,
-              },
-            },
-            true,
-          );
-          break;
-        case "completed":
-          response = event.response;
-          break;
-      }
-    }
-    if (response === undefined) {
-      throw new LlmError("invalid_response", "stream ended without a completed event");
-    }
-    return response;
-  }
-
-  /** 使用当前上下文调用 provider，并在外层附加 best-effort Trace。 */
-  #stream(context: ExecutionContext, signal: AbortSignal): AsyncIterable<LlmStreamEvent> {
-    const options = {
-      system: this.#systemPrompt,
-      toolSchemas: this.#registry.toolSchemas(),
-      signal,
-      ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }),
-      ...(this.#maxAttempts === undefined ? {} : { maxAttempts: this.#maxAttempts }),
-    };
-    const stream = this.#provider.stream(context.messages, options);
-    return this.#traceStream(context, stream, options);
-  }
-
-  /** 包装 provider 流并保证每个 llm.request 都有 response/error/cancelled 终结记录。 */
-  async *#traceStream(
-    context: ExecutionContext,
-    stream: AsyncIterable<LlmStreamEvent>,
-    options: {
-      readonly system: string;
-      readonly toolSchemas: readonly unknown[];
-      readonly signal: AbortSignal;
-      readonly timeoutMs?: number;
-      readonly maxAttempts?: number;
-    },
-  ): AsyncIterable<LlmStreamEvent> {
     const startedAt = performance.now();
-    let terminalRecorded = false;
     this.#trace?.record({
       source: "CORE",
       target: "LLM",
@@ -282,63 +218,94 @@ export class AgentLoop {
       step: context.step,
       data: {
         model: this.#provider.model,
+        provider: this.#provider.providerName,
+        systemPrompt: this.#systemPrompt,
         messages: context.messages,
-        system: options.system,
-        toolSchemas: options.toolSchemas,
+        tools: this.#registry.toolSchemas(),
       },
     });
+    let response: LlmResponse | undefined;
     try {
-      for await (const event of stream) {
-        if (event.type === "text_delta") {
-          this.#trace?.record({
-            source: "LLM",
-            target: "CORE",
-            kind: "llm.stream_delta",
-            step: context.step,
-            data: { text: event.text },
-          });
-        } else if (event.type === "completed") {
-          terminalRecorded = true;
-          this.#trace?.record({
-            source: "LLM",
-            target: "CORE",
-            kind: "llm.response",
-            step: context.step,
-            durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
-            data: {
-              model: this.#provider.model,
-              response: event.response,
-              usage: event.response.usage,
-            },
-          });
+      for await (const event of this.#stream(context, signal)) {
+        switch (event.type) {
+          case "text_delta":
+            this.#trace?.record({
+              source: "LLM",
+              target: "CORE",
+              kind: "llm.stream_delta",
+              step: context.step,
+              data: { bytes: new TextEncoder().encode(event.text).byteLength, delta: event.text },
+            });
+            for (const chunk of chunkText(event.text, MAX_TEXT_DELTA_CHARS)) {
+              await this.#publish(
+                context,
+                { type: "llm.text_delta", payload: { text: chunk } },
+                true,
+              );
+            }
+            break;
+          case "retrying":
+            await this.#publish(
+              context,
+              {
+                type: "llm.retrying",
+                payload: {
+                  attempt: event.attempt,
+                  maxAttempts: event.maxAttempts,
+                  delayMs: event.delayMs,
+                  reason: event.reason,
+                },
+              },
+              true,
+            );
+            break;
+          case "completed":
+            response = event.response;
+            break;
         }
-        yield event;
       }
-      if (!terminalRecorded) {
-        this.#trace?.record({
-          source: "LLM",
-          target: "CORE",
-          kind: "llm.error",
-          step: context.step,
-          durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
-          data: { category: "invalid_response", message: "stream ended without completion" },
-        });
+      if (response === undefined) {
+        throw new LlmError("invalid_response", "stream ended without a completed event");
       }
-    } catch (error) {
-      const cancelled = options.signal.aborted;
       this.#trace?.record({
         source: "LLM",
         target: "CORE",
-        kind: cancelled ? "llm.cancelled" : "llm.error",
+        kind: "llm.response",
         step: context.step,
-        durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        durationMs: Math.max(0, Math.floor(performance.now() - startedAt)),
         data: {
-          category: error instanceof LlmError ? error.code : "unknown",
-          message: error instanceof Error ? error.message : "unknown LLM error",
+          finishReason: response.finishReason,
+          usage: response.usage,
+          response,
+        },
+      });
+      return response;
+    } catch (error) {
+      this.#trace?.record({
+        source: signal.aborted ? "CORE" : "LLM",
+        target: "CORE",
+        kind: signal.aborted ? "llm.cancelled" : "llm.error",
+        step: context.step,
+        durationMs: Math.max(0, Math.floor(performance.now() - startedAt)),
+        data: {
+          errorCategory: error instanceof LlmError ? error.code : "unknown",
+          reason: signal.aborted ? "aborted" : "provider_error",
+          safeMessage: signal.aborted ? "LLM request cancelled" : "LLM provider request failed",
         },
       });
       throw error;
     }
+  }
+
+  /** 使用当前上下文和统一超时/重试参数调用 provider。 */
+  #stream(context: ExecutionContext, signal: AbortSignal): AsyncIterable<LlmStreamEvent> {
+    return this.#provider.stream(context.messages, {
+      system: this.#systemPrompt,
+      toolSchemas: this.#registry.toolSchemas(),
+      signal,
+      ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }),
+      ...(this.#maxAttempts === undefined ? {} : { maxAttempts: this.#maxAttempts }),
+    });
   }
 
   /** 顺序执行全部工具调用，发布 tool.* 事件，结果合并为一条 user message。 */

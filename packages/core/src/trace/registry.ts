@@ -1,6 +1,6 @@
 import type { AgentEvent, Environment, RunId, SessionEvent, SessionId } from "@minicode/protocol";
 import { loadTraceConfig } from "./config.ts";
-import { TraceRecorder, runTraceDirectory } from "./recorder.ts";
+import { TraceRecorder } from "./recorder.ts";
 import { nodeTraceStorage } from "./storage.ts";
 import {
   TRACE_MAX_BYTES_DEFAULT,
@@ -26,6 +26,7 @@ export class RunTraceRegistry {
   readonly #config: TraceConfig;
   readonly #recorders = new Map<string, TraceRecorder>();
 
+  /** 保存 Core home 并加载一次全局 Trace 配置。 */
   constructor(homeDirectory: string, environment: Environment) {
     this.#homeDirectory = homeDirectory;
     const loaded = loadTraceConfig(environment);
@@ -44,7 +45,7 @@ export class RunTraceRegistry {
       runId,
       this.#config,
       nodeTraceStorage,
-      runTraceDirectory(this.#homeDirectory, sessionId, runId),
+      this.#homeDirectory,
     );
     recorder.start();
     this.#recorders.set(key, recorder);

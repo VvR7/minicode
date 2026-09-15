@@ -334,7 +334,7 @@ export class NdjsonRpcServer {
       return this.#stopPromise;
     }
     // 未启动或已经停止时没有资源需要释放。
-    if (this.#listener === undefined) {
+    if (this.#listener === undefined && !this.#stopping) {
       return Promise.resolve();
     }
     const stopping = this.#stopCurrent(graceMs);
@@ -352,12 +352,8 @@ export class NdjsonRpcServer {
 
   /** 执行单次 transport 停机；调用方通过 stop 复用本次完成屏障。 */
   async #stopCurrent(graceMs: number): Promise<void> {
-    this.#stopping = true;
+    this.beginShutdown();
     try {
-      // false 表示停止监听新连接，但先不强制关闭已有连接。
-      this.#listener?.stop(false);
-      // 清空引用，令本次 stop 完成后 start 可重新创建监听器。
-      this.#listener = undefined;
       // 让 listener.stop 前已被内核接受的 open 回调完成登记，再拍活动连接快照。
       await Bun.sleep(0);
 
@@ -394,6 +390,18 @@ export class NdjsonRpcServer {
     } finally {
       // stop() 完成或失败后释放重入标志；失败不会伪装成成功完成。
       this.#stopping = false;
+    }
+  }
+
+  /** 第一阶段关闭：同步停止 admission，但保留已有连接供已入队请求返回响应。 */
+  beginShutdown(): void {
+    if (this.#stopping) return;
+    this.#stopping = true;
+    // false 表示停止监听新连接，但先不强制关闭已有连接。
+    this.#listener?.stop(false);
+    this.#listener = undefined;
+    for (const socket of this.#activeSockets) {
+      socket.data.acceptingInput = false;
     }
   }
 

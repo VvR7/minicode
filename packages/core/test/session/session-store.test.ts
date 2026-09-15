@@ -31,22 +31,22 @@ import {
 
 const HOME = "/home";
 
-function userMessage(text: string): HistoryMessage {
+function userMessage(text: string, turnId = TURN_A, runId = RUN_A): HistoryMessage {
   return {
     messageId: crypto.randomUUID(),
-    turnId: TURN_A,
-    runId: RUN_A,
+    turnId,
+    runId,
     role: "user",
     timestamp: "2026-09-14T08:00:10.000Z",
     content: [{ type: "text", text }],
   };
 }
 
-function assistantMessage(text: string): HistoryMessage {
+function assistantMessage(text: string, turnId = TURN_A, runId = RUN_A): HistoryMessage {
   return {
     messageId: crypto.randomUUID(),
-    turnId: TURN_A,
-    runId: RUN_A,
+    turnId,
+    runId,
     role: "assistant",
     timestamp: "2026-09-14T08:00:11.000Z",
     content: [{ type: "text", text }],
@@ -283,7 +283,7 @@ describe("SessionStore turn lifecycle", () => {
         turnId: entry.turnId,
         runId: entry.runId,
         status: entry.status,
-        messages: [userMessage(`msg-${entry.status}`)],
+        messages: [userMessage(`msg-${entry.status}`, entry.turnId, entry.runId)],
         model: "test-model",
       });
       expect(completed.ok).toBe(true);
@@ -394,6 +394,38 @@ describe("SessionStore turn lifecycle", () => {
     }
   });
 
+  test("rejects an invalid completion without poisoning the history journal", async () => {
+    const { store, storage } = createMemoryStore(HOME);
+    seedSession(storage, HOME, SESSION_A);
+    await store.appendAccepted(SESSION_A, {
+      turnId: TURN_A,
+      runId: RUN_A,
+      clientMessageId: CLIENT_MESSAGE_A,
+      userMessage: "hello",
+    });
+    const path = sessionPaths(HOME, SESSION_A).history;
+    const before = storage.files.get(path);
+    const invalid = await store.appendCompleted(SESSION_A, {
+      turnId: TURN_A,
+      runId: RUN_A,
+      status: "succeeded",
+      messages: [],
+      model: "",
+    });
+    expect(invalid.ok).toBe(false);
+    expect(storage.files.get(path)).toBe(before);
+
+    const foreignMessage = await store.appendCompleted(SESSION_A, {
+      turnId: TURN_A,
+      runId: RUN_A,
+      status: "succeeded",
+      messages: [userMessage("hello", TURN_B, RUN_B)],
+      model: "model",
+    });
+    expect(foreignMessage.ok).toBe(false);
+    expect(storage.files.get(path)).toBe(before);
+  });
+
   test("rejects invalid turn input and reports storage failures", async () => {
     const { store, storage } = createMemoryStore(HOME);
     seedSession(storage, HOME, SESSION_A);
@@ -450,7 +482,21 @@ describe("SessionStore session events", () => {
   test("appends contiguous events and replays after a cursor", async () => {
     const { store, storage } = createMemoryStore(HOME);
     seedSession(storage, HOME, SESSION_A);
+    await store.appendAccepted(SESSION_A, {
+      turnId: TURN_A,
+      runId: RUN_A,
+      clientMessageId: CLIENT_MESSAGE_A,
+      userMessage: "hello",
+    });
     expect((await store.appendSessionEvent(SESSION_A, acceptedEvent(1))).ok).toBe(true);
+    await store.appendCompleted(SESSION_A, {
+      turnId: TURN_A,
+      runId: RUN_A,
+      status: "succeeded",
+      reason: "completed",
+      messages: [userMessage("hello"), assistantMessage("done")],
+      model: "test-model",
+    });
     expect((await store.appendSessionEvent(SESSION_A, finishedEvent(2))).ok).toBe(true);
 
     const replay = await store.readSessionEvents(SESSION_A, 1);
@@ -485,6 +531,82 @@ describe("SessionStore session events", () => {
 });
 
 describe("SessionStore corruption detection", () => {
+  test("marks missing fixed journals or notes as corrupt", async () => {
+    for (const name of ["history", "sessionEvents", "notes"] as const) {
+      const { store, storage } = createMemoryStore(HOME);
+      seedSession(storage, HOME, SESSION_A);
+      storage.files.delete(sessionPaths(HOME, SESSION_A)[name]);
+      const loaded = await store.load(SESSION_A);
+      expect([name, loaded.ok]).toEqual([name, false]);
+    }
+  });
+
+  test("marks a valid note owned by another session as corrupt", async () => {
+    const { store, storage } = createMemoryStore(HOME);
+    seedSession(storage, HOME, SESSION_A);
+    const foreign = store.createNoteStore(SESSION_B, RUN_A).render("foreign secret");
+    storage.files.set(sessionPaths(HOME, SESSION_A).notes, foreign);
+    expect((await store.load(SESSION_A)).ok).toBe(false);
+  });
+
+  test("marks duplicate client IDs with changed identity or content as corrupt", async () => {
+    const { store, storage } = createMemoryStore(HOME);
+    seedSession(storage, HOME, SESSION_A);
+    const base = {
+      schemaVersion: 1,
+      recordId: crypto.randomUUID(),
+      sessionId: SESSION_A,
+      turnId: TURN_A,
+      runId: RUN_A,
+      timestamp: "2026-09-14T08:00:00.000Z",
+      kind: "turn.accepted",
+      clientMessageId: CLIENT_MESSAGE_A,
+      userMessage: "one",
+    };
+    storage.files.set(
+      sessionPaths(HOME, SESSION_A).history,
+      `${JSON.stringify(base)}\n${JSON.stringify({
+        ...base,
+        recordId: crypto.randomUUID(),
+        runId: RUN_B,
+        userMessage: "two",
+      })}\n`,
+    );
+    expect((await store.load(SESSION_A)).ok).toBe(false);
+  });
+
+  test("marks duplicate event IDs and event/history identity mismatches as corrupt", async () => {
+    const { store, storage } = createMemoryStore(HOME);
+    seedSession(storage, HOME, SESSION_A);
+    await store.appendAccepted(SESSION_A, {
+      turnId: TURN_A,
+      runId: RUN_A,
+      clientMessageId: CLIENT_MESSAGE_A,
+      userMessage: "hello",
+    });
+    const recordId = crypto.randomUUID();
+    const first = { schemaVersion: 1, recordId, event: acceptedEvent(1) };
+    const second = {
+      schemaVersion: 1,
+      recordId,
+      event: {
+        ...acceptedEvent(2),
+        payload: { ...acceptedEvent(2).payload, userMessage: "other" },
+      },
+    };
+    storage.files.set(
+      sessionPaths(HOME, SESSION_A).sessionEvents,
+      `${JSON.stringify(first)}\n${JSON.stringify(second)}\n`,
+    );
+    expect((await store.load(SESSION_A)).ok).toBe(false);
+
+    storage.files.set(
+      sessionPaths(HOME, SESSION_A).sessionEvents,
+      `${JSON.stringify({ ...second, recordId: crypto.randomUUID(), event: second.event })}\n`,
+    );
+    expect((await store.load(SESSION_A)).ok).toBe(false);
+  });
+
   test("marks tail truncation, bad lines, foreign identities, and sequence gaps corrupt", async () => {
     const cases: { name: string; mutate: (storage: MemorySessionStorage) => void }[] = [
       {
@@ -552,13 +674,23 @@ describe("SessionStore corruption detection", () => {
       clientMessageId: CLIENT_MESSAGE_A,
       userMessage: "hello",
     });
-    await store.appendCompleted(SESSION_A, {
-      turnId: TURN_A,
-      runId: RUN_A,
-      status: "succeeded",
-      messages: [toolPair()[0] as HistoryMessage],
-      model: "m",
-    });
+    const paths = sessionPaths(HOME, SESSION_A);
+    storage.files.set(
+      paths.history,
+      `${storage.files.get(paths.history) ?? ""}${JSON.stringify({
+        schemaVersion: 1,
+        recordId: crypto.randomUUID(),
+        sessionId: SESSION_A,
+        turnId: TURN_A,
+        runId: RUN_A,
+        timestamp: "2026-09-14T08:00:11.000Z",
+        kind: "turn.completed",
+        status: "succeeded",
+        messages: [toolPair()[0] as HistoryMessage],
+        includedInContext: true,
+        model: "m",
+      })}\n`,
+    );
     const loaded = await store.load(SESSION_A);
     expect(loaded.ok).toBe(false);
     if (!loaded.ok) {

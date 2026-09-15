@@ -77,7 +77,7 @@ export const TurnCompletedRecordSchema = z
     kind: z.literal("turn.completed"),
     status: CompletedStatusSchema,
     reason: HistoryTurnReasonSchema.optional(),
-    messages: z.array(HistoryMessageSchema),
+    messages: z.array(HistoryMessageSchema).min(1),
     includedInContext: z.boolean(),
     // config_error 可能发生在选定模型之前，此时允许空字符串作为“未选择”审计值。
     model: z.string().max(256),
@@ -86,6 +86,22 @@ export const TurnCompletedRecordSchema = z
     runResult: RunFinishedPayloadSchema.optional(),
   })
   .superRefine((record, ctx) => {
+    for (const [index, message] of record.messages.entries()) {
+      if (message.turnId !== record.turnId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "history message turnId must match its completion",
+          path: ["messages", index, "turnId"],
+        });
+      }
+      if (message.runId !== record.runId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "history message runId must match its completion",
+          path: ["messages", index, "runId"],
+        });
+      }
+    }
     // succeeded 才允许进入下一轮上下文；其余终态只能是审计记录。
     if (record.includedInContext && record.status !== "succeeded") {
       ctx.addIssue({

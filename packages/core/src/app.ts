@@ -44,12 +44,14 @@ export class CoreApp {
   #stopping = false;
   #stopPromise: Promise<void> | undefined;
 
+  /** 保存 Core 配置、环境与日志依赖。 */
   constructor(config: CoreConfig, environment: Environment = Bun.env) {
     this.#config = config;
     this.#environment = environment;
     this.#logger = createLogger(config.logLevel);
   }
 
+  /** 组装 Session/Run/Trace/IPC 服务并开始监听。 */
   start(): CoreEndpoint {
     if (this.#server !== undefined || this.#stopping) {
       throw new Error("core already started");
@@ -110,6 +112,7 @@ export class CoreApp {
     return endpoint;
   }
 
+  /** 幂等停止 Core；并发调用共享同一个完成 Promise。 */
   stop(): Promise<void> {
     if (this.#stopPromise !== undefined) {
       return this.#stopPromise;
@@ -154,6 +157,7 @@ export class CoreApp {
     }
   }
 
+  /** 返回运行中的 run EventBus；未启动时拒绝访问。 */
   get eventBus(): EventBus {
     if (this.#eventBus === undefined) {
       throw new Error("core is not started");

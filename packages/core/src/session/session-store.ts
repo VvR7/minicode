@@ -8,14 +8,13 @@ import type {
   SessionId,
   SessionSummary,
 } from "@minicode/protocol";
-import { HistoryTurnReasonSchema, SessionIdSchema, SessionSummarySchema } from "@minicode/protocol";
+import { SessionIdSchema, SessionSummarySchema } from "@minicode/protocol";
 import { z } from "zod";
 import type { LlmContentPart, LlmMessage } from "../llm/types.ts";
-import { NoteStore } from "./notes.ts";
+import { NoteStore, parseSessionNotes } from "./notes.ts";
 import type { SessionStorage } from "./storage.ts";
 import { nodeSessionStorage } from "./storage.ts";
 import {
-  CompletedStatusSchema,
   HistoryRecordSchema,
   SESSION_SCHEMA_VERSION,
   SessionEventRecordSchema,
@@ -27,6 +26,7 @@ import {
   type CompleteTurnInput,
   type CreateSessionOptions,
   type HistoryRecord,
+  MAX_NOTES_BYTES,
   type PendingInterruption,
   type SessionListOptions,
   type SessionListPage,
@@ -499,9 +499,6 @@ export class SessionStore {
       }
 
       const timestamp = this.#now();
-      const status = CompletedStatusSchema.parse(input.status);
-      const reason =
-        input.reason === undefined ? undefined : HistoryTurnReasonSchema.parse(input.reason);
       const record = TurnCompletedRecordSchema.safeParse({
         schemaVersion: SESSION_SCHEMA_VERSION,
         recordId: crypto.randomUUID(),
@@ -510,15 +507,18 @@ export class SessionStore {
         runId: input.runId,
         timestamp,
         kind: "turn.completed" as const,
-        status,
-        ...(reason === undefined ? {} : { reason }),
+        status: input.status,
+        ...(input.reason === undefined ? {} : { reason: input.reason }),
         messages: input.messages,
-        includedInContext: status === "succeeded",
+        includedInContext: input.status === "succeeded",
         model: input.model,
         ...(input.taskGraph === undefined ? {} : { taskGraph: input.taskGraph }),
         ...(input.runResult === undefined ? {} : { runResult: input.runResult }),
       });
-      if (!record.success) {
+      if (
+        !record.success ||
+        (record.data.includedInContext && !hasCompleteToolPairing(record.data.messages))
+      ) {
         return {
           ok: false,
           error: { code: "invalid_input", message: "completion input is invalid" },
@@ -657,11 +657,21 @@ export class SessionStore {
     });
     const events = await this.#readRecords(paths.sessionEvents, (value) => {
       const parsed = SessionEventRecordSchema.safeParse(value);
-      return parsed.success ? parsed.data.event : undefined;
+      return parsed.success ? parsed.data : undefined;
     });
     let notes: string;
     try {
-      notes = (await this.#storage.readFile(paths.notes)) ?? "";
+      const rawNotes = await this.#storage.readFile(paths.notes);
+      const noteRecords = rawNotes === undefined ? undefined : parseSessionNotes(rawNotes);
+      if (
+        rawNotes === undefined ||
+        new TextEncoder().encode(rawNotes).byteLength > MAX_NOTES_BYTES ||
+        noteRecords === undefined ||
+        noteRecords.some((record) => record.sessionId !== sessionId)
+      ) {
+        return { ok: true, value: { meta: meta.data } };
+      }
+      notes = rawNotes;
     } catch {
       return { ok: false, error: { code: "io_error", message: "failed to read session notes" } };
     }
@@ -676,7 +686,7 @@ export class SessionStore {
     return { ok: true, value: { meta: meta.data, snapshot: built.value } };
   }
 
-  /** 读取 JSONL 记录；文件缺失视为空。 */
+  /** 读取固定 JSONL journal；文件缺失或读取失败均视为损坏。 */
   async #readRecords<Record>(
     path: string,
     parse: (value: unknown) => Record | undefined,
@@ -686,6 +696,9 @@ export class SessionStore {
       content = await this.#storage.readFile(path);
     } catch {
       return { ok: false, reason: "read failed" };
+    }
+    if (content === undefined) {
+      return { ok: false, reason: "journal file is missing" };
     }
     return parseJsonLines(content, parse);
   }
@@ -697,7 +710,7 @@ export class SessionStore {
   #buildSnapshot(
     meta: SessionMeta,
     history: readonly HistoryRecord[],
-    events: readonly SessionEvent[],
+    eventRecords: readonly z.infer<typeof SessionEventRecordSchema>[],
     notes: string,
   ): SessionStoreResult<SessionSnapshot> {
     const accepted = new Map<string, Extract<HistoryRecord, { kind: "turn.accepted" }>>();
@@ -812,15 +825,41 @@ export class SessionStore {
     }
 
     let latestSessionSequence = 0;
-    for (const event of events) {
+    const eventRecordIds = new Set<string>();
+    const events: SessionEvent[] = [];
+    for (const eventRecord of eventRecords) {
+      if (eventRecordIds.has(eventRecord.recordId)) {
+        return this.#corrupt("duplicate session event record id");
+      }
+      eventRecordIds.add(eventRecord.recordId);
+      const event = eventRecord.event;
       if (event.sessionId !== meta.sessionId) {
         return this.#corrupt("session event identity mismatch");
       }
       if (event.sessionSequence !== latestSessionSequence + 1) {
         return this.#corrupt("session event sequence gap");
       }
+      const key = `${event.payload.turnId}:${event.payload.runId}`;
+      const acceptedRecord = accepted.get(key);
+      const completion = completedByKey.get(key);
+      if (event.type === "session.turn_accepted") {
+        if (
+          acceptedRecord === undefined ||
+          event.payload.clientMessageId !== acceptedRecord.clientMessageId ||
+          event.payload.userMessage !== acceptedRecord.userMessage
+        ) {
+          return this.#corrupt("accepted event does not match history");
+        }
+      } else if (
+        completion === undefined ||
+        event.payload.status !== completion.status ||
+        event.payload.reason !== completion.reason
+      ) {
+        return this.#corrupt("finished event does not match history");
+      }
       latestSessionSequence = event.sessionSequence;
       updatedAt = latestTimestamp(updatedAt, event.timestamp);
+      events.push(event);
     }
 
     // 首条用户消息已落盘但 meta 缓存落后的场景：以合法 journal 为准重建标题。

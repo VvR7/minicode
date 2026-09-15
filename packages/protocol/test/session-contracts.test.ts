@@ -7,6 +7,8 @@ import {
   EVENT_UNSUBSCRIBE_METHOD,
   HistoryTurnSchema,
   JsonRpcErrorCode,
+  JsonRpcErrorResponseSchema,
+  MAX_HISTORY_TEXT_CHARS,
   MAX_SESSION_LIST_LIMIT,
   SessionCreateRequestSchema,
   SessionCreateResultSchema,
@@ -235,6 +237,7 @@ describe("session events and push scope", () => {
     expect(SessionEventSchema.safeParse(withoutSession).success).toBe(false);
     expect(SessionEventSchema.safeParse({ ...base, sequence: 1 }).success).toBe(false);
     expect(SessionEventSchema.safeParse({ ...base, sessionSequence: 0 }).success).toBe(false);
+    expect(SessionEventSchema.safeParse({ ...base, durable: false }).success).toBe(false);
     expect(
       SessionEventSchema.safeParse({ ...base, payload: { ...base.payload, extra: 1 } }).success,
     ).toBe(false);
@@ -333,6 +336,32 @@ describe("session events and push scope", () => {
       payload: { text: "partial" },
     } as const;
     expect(AgentEventSchema.parse(durableDelta)).toEqual(durableDelta);
+  });
+
+  test("rejects transient transcript deltas and retry events", () => {
+    const requiredDurableEvents = [
+      { type: "llm.text_delta", payload: { text: "partial" } },
+      {
+        type: "llm.retrying",
+        payload: { attempt: 2, maxAttempts: 3, delayMs: 10, reason: "network" },
+      },
+      {
+        type: "tool.retrying",
+        payload: {
+          toolCallId: "call-1",
+          name: "read_file",
+          attempt: 2,
+          maxAttempts: 3,
+          delayMs: 10,
+          errorCode: "busy",
+        },
+      },
+    ] as const;
+    for (const event of requiredDurableEvents) {
+      const base = { sessionId, runId, sequence: 1, timestamp, ...event };
+      expect(AgentEventSchema.safeParse({ ...base, durable: false }).success).toBe(false);
+      expect(AgentEventSchema.safeParse({ ...base, durable: true }).success).toBe(true);
+    }
   });
 });
 
@@ -492,6 +521,49 @@ describe("provider-neutral history", () => {
       ],
     };
     expect(HistoryTurnSchema.safeParse(paired).success).toBe(true);
+
+    const duplicateUse = {
+      ...unpaired,
+      messages: [unpaired.messages[0], unpaired.messages[0], paired.messages[1]],
+    };
+    expect(HistoryTurnSchema.safeParse(duplicateUse).success).toBe(false);
+  });
+
+  test("rejects messages with foreign turn/run identities and oversized text", () => {
+    const baseTurn = {
+      turnId,
+      runId,
+      clientMessageId,
+      status: "succeeded",
+      reason: "completed",
+      acceptedAt: timestamp,
+      finishedAt: timestamp,
+      includedInContext: true,
+      messages: [userMessage],
+    } as const;
+    expect(
+      HistoryTurnSchema.safeParse({
+        ...baseTurn,
+        messages: [{ ...userMessage, turnId: "6ba7b810-9dad-41d1-80b4-00c04fd430c9" }],
+      }).success,
+    ).toBe(false);
+    expect(
+      HistoryTurnSchema.safeParse({
+        ...baseTurn,
+        messages: [{ ...userMessage, runId: "6ba7b811-9dad-41d1-80b4-00c04fd430c9" }],
+      }).success,
+    ).toBe(false);
+    expect(
+      HistoryTurnSchema.safeParse({
+        ...baseTurn,
+        messages: [
+          {
+            ...userMessage,
+            content: [{ type: "text", text: "x".repeat(MAX_HISTORY_TEXT_CHARS + 1) }],
+          },
+        ],
+      }).success,
+    ).toBe(false);
   });
 
   test("rejects a non-succeeded turn marked includedInContext", () => {
@@ -540,6 +612,28 @@ describe("session error contracts", () => {
     expect(
       SessionErrorDataSchema.safeParse({ sessionId, workspaceRoot: "/secret", prompt: "x" })
         .success,
+    ).toBe(false);
+    expect(
+      JsonRpcErrorResponseSchema.safeParse({
+        jsonrpc: "2.0",
+        id: "request-1",
+        error: {
+          code: JsonRpcErrorCode.sessionNotFound,
+          message: "session not found",
+          data: { sessionId },
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      JsonRpcErrorResponseSchema.safeParse({
+        jsonrpc: "2.0",
+        id: "request-1",
+        error: {
+          code: JsonRpcErrorCode.sessionNotFound,
+          message: "session not found",
+          data: { sessionId, workspaceRoot: "/secret", prompt: "x" },
+        },
+      }).success,
     ).toBe(false);
   });
 

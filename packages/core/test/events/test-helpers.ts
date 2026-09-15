@@ -2,6 +2,10 @@ import type { AgentEvent, RunId, SessionId } from "@minicode/protocol";
 import type { AgentEventInput } from "../../src/events/event-bus.ts";
 import type { EventJournalStorage } from "../../src/events/event-store.ts";
 
+type StartedEventInput = Extract<AgentEventInput, { readonly type: "run.started" }>;
+type DeltaEventInput = Extract<AgentEventInput, { readonly type: "llm.text_delta" }>;
+type FinishedEventInput = Extract<AgentEventInput, { readonly type: "run.finished" }>;
+
 export const SESSION_A = "550e8400-e29b-41d4-a716-446655440000" as SessionId;
 export const SESSION_B = "550e8400-e29b-41d4-a716-446655440001" as SessionId;
 export const RUN_A = "6ba7b810-9dad-41d1-80b4-00c04fd430c8" as RunId;
@@ -10,7 +14,7 @@ export const RUN_B = "6ba7b810-9dad-41d1-80b4-00c04fd430c9" as RunId;
 export function startedInput(
   sessionId: SessionId = SESSION_A,
   runId: RunId = RUN_A,
-): AgentEventInput {
+): StartedEventInput {
   return {
     sessionId,
     runId,
@@ -21,18 +25,18 @@ export function startedInput(
   };
 }
 
-export function deltaInput(text: string, runId: RunId = RUN_A): AgentEventInput {
+export function deltaInput(text: string, runId: RunId = RUN_A): DeltaEventInput {
   return {
     sessionId: SESSION_A,
     runId,
     timestamp: "2026-09-13T08:00:01.000Z",
-    durable: false,
+    durable: true,
     type: "llm.text_delta",
     payload: { text },
   };
 }
 
-export function finishedInput(runId: RunId = RUN_A): AgentEventInput {
+export function finishedInput(runId: RunId = RUN_A): FinishedEventInput {
   return {
     sessionId: SESSION_A,
     runId,

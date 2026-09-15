@@ -210,7 +210,7 @@ export class AgentLoop {
             await this.#publish(
               context,
               { type: "llm.text_delta", payload: { text: chunk } },
-              false,
+              true,
             );
           }
           break;
@@ -226,7 +226,7 @@ export class AgentLoop {
                 reason: event.reason,
               },
             },
-            false,
+            true,
           );
           break;
         case "completed":
@@ -287,7 +287,7 @@ export class AgentLoop {
               errorCode: retry.errorCode,
             },
           },
-          false,
+          true,
         );
       }
 

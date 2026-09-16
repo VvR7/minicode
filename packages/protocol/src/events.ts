@@ -2,6 +2,14 @@ import { z } from "zod";
 import { RunIdSchema, SessionIdSchema, SubscriptionIdSchema } from "./agent.ts";
 import { jsonRpcNotificationSchema } from "./json-rpc.ts";
 import {
+  PermissionDecisionSchema,
+  PermissionRequestIdSchema,
+  PermissionRequestSummarySchema,
+  PermissionRiskCategorySchema,
+  PermissionSourceSchema,
+  ToolFailureCategorySchema,
+} from "./permissions.ts";
+import {
   SessionTurnAcceptedEventSchema,
   SessionTurnFinishedEventSchema,
   TaskSnapshotSchema,
@@ -89,24 +97,91 @@ export const ToolStartedEventSchema = eventSchema(
 );
 export const ToolRetryingEventSchema = eventSchema(
   "tool.retrying",
-  z.strictObject({
-    ...ToolIdentityShape,
-    attempt: z.number().int().min(2),
-    maxAttempts: z.number().int().min(2),
-    delayMs: z.number().int().nonnegative(),
-    errorCode: z.string().min(1).max(128),
-  }),
+  z.union([
+    // Stage2 持久事件不含 failureCategory，保留 legacy 分支用于重放。
+    z.strictObject({
+      ...ToolIdentityShape,
+      attempt: z.number().int().min(2),
+      maxAttempts: z.number().int().min(2),
+      delayMs: z.number().int().nonnegative(),
+      errorCode: z.string().min(1).max(128),
+    }),
+    z.strictObject({
+      ...ToolIdentityShape,
+      attempt: z.number().int().min(2),
+      maxAttempts: z.number().int().min(2),
+      delayMs: z.number().int().nonnegative(),
+      failureCategory: ToolFailureCategorySchema,
+      errorCode: z.string().min(1).max(128),
+    }),
+  ]),
   z.literal(true),
 );
-export const ToolFinishedEventSchema = eventSchema(
-  "tool.finished",
+const LegacyToolFinishedPayloadSchema = z.strictObject({
+  ...ToolIdentityShape,
+  isError: z.boolean(),
+  durationMs: z.number().int().nonnegative(),
+  outputBytes: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+});
+const Stage3ToolFinishedPayloadSchema = z.discriminatedUnion("isError", [
   z.strictObject({
     ...ToolIdentityShape,
-    isError: z.boolean(),
+    isError: z.literal(false),
     durationMs: z.number().int().nonnegative(),
     outputBytes: z.number().int().nonnegative(),
     truncated: z.boolean(),
+    attempts: z.number().int().positive(),
+    permissionSource: PermissionSourceSchema,
   }),
+  z.strictObject({
+    ...ToolIdentityShape,
+    isError: z.literal(true),
+    durationMs: z.number().int().nonnegative(),
+    outputBytes: z.number().int().nonnegative(),
+    truncated: z.boolean(),
+    attempts: z.number().int().nonnegative(),
+    failureCategory: ToolFailureCategorySchema,
+    errorCode: z.string().min(1).max(128),
+    permissionSource: PermissionSourceSchema.optional(),
+  }),
+]);
+export const ToolFinishedEventSchema = eventSchema(
+  "tool.finished",
+  z.union([LegacyToolFinishedPayloadSchema, Stage3ToolFinishedPayloadSchema]),
+);
+export const PermissionRequestedEventSchema = eventSchema(
+  "permission.requested",
+  z.strictObject({
+    permissionRequestId: PermissionRequestIdSchema,
+    ...ToolIdentityShape,
+    riskCategories: z.array(PermissionRiskCategorySchema).min(1).max(4),
+    cacheable: z.boolean(),
+    summary: PermissionRequestSummarySchema,
+  }),
+  z.literal(true),
+);
+export const PermissionResolvedEventSchema = eventSchema(
+  "permission.resolved",
+  z
+    .strictObject({
+      permissionRequestId: PermissionRequestIdSchema,
+      ...ToolIdentityShape,
+      decision: PermissionDecisionSchema,
+      allowed: z.boolean(),
+      source: z.literal("user"),
+    })
+    .superRefine((payload, ctx) => {
+      const shouldAllow = payload.decision === "allow_once" || payload.decision === "always_allow";
+      if (payload.allowed !== shouldAllow) {
+        ctx.addIssue({
+          code: "custom",
+          message: "allowed must match the permission decision",
+          path: ["allowed"],
+        });
+      }
+    }),
+  z.literal(true),
 );
 export const StepFinishedEventSchema = eventSchema(
   "step.finished",
@@ -177,6 +252,8 @@ export const AgentEventSchema = z.discriminatedUnion("type", [
   ToolStartedEventSchema,
   ToolRetryingEventSchema,
   ToolFinishedEventSchema,
+  PermissionRequestedEventSchema,
+  PermissionResolvedEventSchema,
   StepFinishedEventSchema,
   TaskCreatedEventSchema,
   TaskUpdatedEventSchema,
@@ -195,6 +272,8 @@ export const PushedEventSchema = z.discriminatedUnion("type", [
   ToolStartedEventSchema,
   ToolRetryingEventSchema,
   ToolFinishedEventSchema,
+  PermissionRequestedEventSchema,
+  PermissionResolvedEventSchema,
   StepFinishedEventSchema,
   TaskCreatedEventSchema,
   TaskUpdatedEventSchema,

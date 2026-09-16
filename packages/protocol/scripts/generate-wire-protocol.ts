@@ -19,6 +19,8 @@ import {
   PingRequestSchema,
   PingSuccessResponseSchema,
   PongResultSchema,
+  PermissionRespondRequestSchema,
+  PermissionRespondSuccessResponseSchema,
   SessionCreateRequestSchema,
   SessionCreateSuccessResponseSchema,
   SessionEventSchema,
@@ -53,6 +55,8 @@ export function renderWireProtocol(): string {
     schemaBlock("AgentRunSuccessResponse", AgentRunSuccessResponseSchema),
     schemaBlock("AgentCancelRequest", AgentCancelRequestSchema),
     schemaBlock("AgentCancelSuccessResponse", AgentCancelSuccessResponseSchema),
+    schemaBlock("PermissionRespondRequest", PermissionRespondRequestSchema),
+    schemaBlock("PermissionRespondSuccessResponse", PermissionRespondSuccessResponseSchema),
     schemaBlock("AgentEvent", AgentEventSchema),
     schemaBlock("EventSubscribeRequest", EventSubscribeRequestSchema),
     schemaBlock("EventSubscribeSuccessResponse", EventSubscribeSuccessResponseSchema),
@@ -106,6 +110,8 @@ export function renderWireProtocol(): string {
 - \`agent.cancel\` requests cancellation for one session-isolated run.
 - \`event.subscribe\` can resume after a durable sequence cursor; \`event.unsubscribe\` removes a
   subscription.
+- \`permission.respond\` resolves one Core-generated, session/run-scoped permission request. Its
+  result distinguishes an accepted response from an already resolved or unknown request.
 - The \`agent.run\` response is enqueued before the first \`event.push\` for that run.
 - Event sequence numbers are positive and scoped to a run; durable events can be replayed by a
   later event-store implementation.

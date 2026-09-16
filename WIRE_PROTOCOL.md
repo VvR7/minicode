@@ -27,6 +27,8 @@
 - `agent.cancel` requests cancellation for one session-isolated run.
 - `event.subscribe` can resume after a durable sequence cursor; `event.unsubscribe` removes a
   subscription.
+- `permission.respond` resolves one Core-generated, session/run-scoped permission request. Its
+  result distinguishes an accepted response from an already resolved or unknown request.
 - The `agent.run` response is enqueued before the first `event.push` for that run.
 - Event sequence numbers are positive and scoped to a run; durable events can be replayed by a
   later event-store implementation.
@@ -569,6 +571,132 @@ Success response:
 }
 ```
 
+### PermissionRespondRequest
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "jsonrpc": {
+      "type": "string",
+      "const": "2.0"
+    },
+    "id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        }
+      ]
+    },
+    "method": {
+      "type": "string",
+      "const": "permission.respond"
+    },
+    "params": {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "runId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "permissionRequestId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "decision": {
+          "type": "string",
+          "enum": [
+            "allow_once",
+            "always_allow",
+            "deny_once",
+            "always_deny"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "runId",
+        "permissionRequestId",
+        "decision"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "jsonrpc",
+    "id",
+    "method",
+    "params"
+  ],
+  "additionalProperties": false
+}
+```
+
+### PermissionRespondSuccessResponse
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "jsonrpc": {
+      "type": "string",
+      "const": "2.0"
+    },
+    "id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        }
+      ]
+    },
+    "result": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "accepted",
+            "already_resolved",
+            "not_found"
+          ]
+        }
+      },
+      "required": [
+        "outcome"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "jsonrpc",
+    "id",
+    "result"
+  ],
+  "additionalProperties": false
+}
+```
+
 ### AgentEvent
 
 ```json
@@ -1054,48 +1182,108 @@ Success response:
           "const": "tool.retrying"
         },
         "payload": {
-          "type": "object",
-          "properties": {
-            "toolCallId": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 256
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "toolCallId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "attempt": {
+                  "type": "integer",
+                  "minimum": 2,
+                  "maximum": 9007199254740991
+                },
+                "maxAttempts": {
+                  "type": "integer",
+                  "minimum": 2,
+                  "maximum": 9007199254740991
+                },
+                "delayMs": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "errorCode": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                }
+              },
+              "required": [
+                "toolCallId",
+                "name",
+                "attempt",
+                "maxAttempts",
+                "delayMs",
+                "errorCode"
+              ],
+              "additionalProperties": false
             },
-            "name": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128
-            },
-            "attempt": {
-              "type": "integer",
-              "minimum": 2,
-              "maximum": 9007199254740991
-            },
-            "maxAttempts": {
-              "type": "integer",
-              "minimum": 2,
-              "maximum": 9007199254740991
-            },
-            "delayMs": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            "errorCode": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 128
+            {
+              "type": "object",
+              "properties": {
+                "toolCallId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "attempt": {
+                  "type": "integer",
+                  "minimum": 2,
+                  "maximum": 9007199254740991
+                },
+                "maxAttempts": {
+                  "type": "integer",
+                  "minimum": 2,
+                  "maximum": 9007199254740991
+                },
+                "delayMs": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "failureCategory": {
+                  "type": "string",
+                  "enum": [
+                    "schema_error",
+                    "permission_denied",
+                    "timeout",
+                    "runtime_error",
+                    "rate_limited",
+                    "cancelled"
+                  ]
+                },
+                "errorCode": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                }
+              },
+              "required": [
+                "toolCallId",
+                "name",
+                "attempt",
+                "maxAttempts",
+                "delayMs",
+                "failureCategory",
+                "errorCode"
+              ],
+              "additionalProperties": false
             }
-          },
-          "required": [
-            "toolCallId",
-            "name",
-            "attempt",
-            "maxAttempts",
-            "delayMs",
-            "errorCode"
-          ],
-          "additionalProperties": false
+          ]
         }
       },
       "required": [
@@ -1140,8 +1328,233 @@ Success response:
           "const": "tool.finished"
         },
         "payload": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "toolCallId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "isError": {
+                  "type": "boolean"
+                },
+                "durationMs": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "outputBytes": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "toolCallId",
+                "name",
+                "isError",
+                "durationMs",
+                "outputBytes",
+                "truncated"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "toolCallId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "isError": {
+                      "type": "boolean",
+                      "const": false
+                    },
+                    "durationMs": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "outputBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "attempts": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "permissionSource": {
+                      "type": "string",
+                      "enum": [
+                        "policy",
+                        "session_cache",
+                        "user"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "toolCallId",
+                    "name",
+                    "isError",
+                    "durationMs",
+                    "outputBytes",
+                    "truncated",
+                    "attempts",
+                    "permissionSource"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "toolCallId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "isError": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "durationMs": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "outputBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "attempts": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "failureCategory": {
+                      "type": "string",
+                      "enum": [
+                        "schema_error",
+                        "permission_denied",
+                        "timeout",
+                        "runtime_error",
+                        "rate_limited",
+                        "cancelled"
+                      ]
+                    },
+                    "errorCode": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "permissionSource": {
+                      "type": "string",
+                      "enum": [
+                        "policy",
+                        "session_cache",
+                        "user"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "toolCallId",
+                    "name",
+                    "isError",
+                    "durationMs",
+                    "outputBytes",
+                    "truncated",
+                    "attempts",
+                    "failureCategory",
+                    "errorCode"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "runId",
+        "sequence",
+        "timestamp",
+        "durable",
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "runId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "sequence": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+        },
+        "durable": {
+          "type": "boolean",
+          "const": true
+        },
+        "type": {
+          "type": "string",
+          "const": "permission.requested"
+        },
+        "payload": {
           "type": "object",
           "properties": {
+            "permissionRequestId": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
             "toolCallId": {
               "type": "string",
               "minLength": 1,
@@ -1152,30 +1565,247 @@ Success response:
               "minLength": 1,
               "maxLength": 128
             },
-            "isError": {
+            "riskCategories": {
+              "minItems": 1,
+              "maxItems": 4,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "write",
+                  "edit",
+                  "bash:workspace-mutation",
+                  "bash:network",
+                  "bash:process-execution",
+                  "bash:other"
+                ]
+              }
+            },
+            "cacheable": {
               "type": "boolean"
             },
-            "durationMs": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            "outputBytes": {
-              "type": "integer",
-              "minimum": 0,
-              "maximum": 9007199254740991
-            },
-            "truncated": {
-              "type": "boolean"
+            "summary": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "const": "read"
+                    },
+                    "path": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 4096
+                    },
+                    "offset": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 2000
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "const": "write"
+                    },
+                    "path": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 4096
+                    },
+                    "contentBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 1048576
+                    },
+                    "previewStart": {
+                      "type": "string",
+                      "maxLength": 1024
+                    },
+                    "previewEnd": {
+                      "type": "string",
+                      "maxLength": 1024
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "contentBytes",
+                    "previewStart",
+                    "previewEnd"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "const": "edit"
+                    },
+                    "path": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 4096
+                    },
+                    "oldTextPreview": {
+                      "type": "string",
+                      "maxLength": 1024
+                    },
+                    "newTextPreview": {
+                      "type": "string",
+                      "maxLength": 1024
+                    },
+                    "replaceAll": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "oldTextPreview",
+                    "newTextPreview",
+                    "replaceAll"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "const": "bash"
+                    },
+                    "command": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 8192
+                    },
+                    "timeoutSeconds": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 120
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "command",
+                    "timeoutSeconds"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
             }
           },
           "required": [
+            "permissionRequestId",
             "toolCallId",
             "name",
-            "isError",
-            "durationMs",
-            "outputBytes",
-            "truncated"
+            "riskCategories",
+            "cacheable",
+            "summary"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "sessionId",
+        "runId",
+        "sequence",
+        "timestamp",
+        "durable",
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "runId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "sequence": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+        },
+        "durable": {
+          "type": "boolean",
+          "const": true
+        },
+        "type": {
+          "type": "string",
+          "const": "permission.resolved"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "permissionRequestId": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "toolCallId": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "decision": {
+              "type": "string",
+              "enum": [
+                "allow_once",
+                "always_allow",
+                "deny_once",
+                "always_deny"
+              ]
+            },
+            "allowed": {
+              "type": "boolean"
+            },
+            "source": {
+              "type": "string",
+              "const": "user"
+            }
+          },
+          "required": [
+            "permissionRequestId",
+            "toolCallId",
+            "name",
+            "decision",
+            "allowed",
+            "source"
           ],
           "additionalProperties": false
         }
@@ -4011,48 +4641,108 @@ Success response:
                   "const": "tool.retrying"
                 },
                 "payload": {
-                  "type": "object",
-                  "properties": {
-                    "toolCallId": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 256
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "toolCallId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "name": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        },
+                        "attempt": {
+                          "type": "integer",
+                          "minimum": 2,
+                          "maximum": 9007199254740991
+                        },
+                        "maxAttempts": {
+                          "type": "integer",
+                          "minimum": 2,
+                          "maximum": 9007199254740991
+                        },
+                        "delayMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "errorCode": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        }
+                      },
+                      "required": [
+                        "toolCallId",
+                        "name",
+                        "attempt",
+                        "maxAttempts",
+                        "delayMs",
+                        "errorCode"
+                      ],
+                      "additionalProperties": false
                     },
-                    "name": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128
-                    },
-                    "attempt": {
-                      "type": "integer",
-                      "minimum": 2,
-                      "maximum": 9007199254740991
-                    },
-                    "maxAttempts": {
-                      "type": "integer",
-                      "minimum": 2,
-                      "maximum": 9007199254740991
-                    },
-                    "delayMs": {
-                      "type": "integer",
-                      "minimum": 0,
-                      "maximum": 9007199254740991
-                    },
-                    "errorCode": {
-                      "type": "string",
-                      "minLength": 1,
-                      "maxLength": 128
+                    {
+                      "type": "object",
+                      "properties": {
+                        "toolCallId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "name": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        },
+                        "attempt": {
+                          "type": "integer",
+                          "minimum": 2,
+                          "maximum": 9007199254740991
+                        },
+                        "maxAttempts": {
+                          "type": "integer",
+                          "minimum": 2,
+                          "maximum": 9007199254740991
+                        },
+                        "delayMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "failureCategory": {
+                          "type": "string",
+                          "enum": [
+                            "schema_error",
+                            "permission_denied",
+                            "timeout",
+                            "runtime_error",
+                            "rate_limited",
+                            "cancelled"
+                          ]
+                        },
+                        "errorCode": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        }
+                      },
+                      "required": [
+                        "toolCallId",
+                        "name",
+                        "attempt",
+                        "maxAttempts",
+                        "delayMs",
+                        "failureCategory",
+                        "errorCode"
+                      ],
+                      "additionalProperties": false
                     }
-                  },
-                  "required": [
-                    "toolCallId",
-                    "name",
-                    "attempt",
-                    "maxAttempts",
-                    "delayMs",
-                    "errorCode"
-                  ],
-                  "additionalProperties": false
+                  ]
                 }
               },
               "required": [
@@ -4097,8 +4787,233 @@ Success response:
                   "const": "tool.finished"
                 },
                 "payload": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "toolCallId": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 256
+                        },
+                        "name": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        },
+                        "isError": {
+                          "type": "boolean"
+                        },
+                        "durationMs": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "outputBytes": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "truncated": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "toolCallId",
+                        "name",
+                        "isError",
+                        "durationMs",
+                        "outputBytes",
+                        "truncated"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "toolCallId": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 256
+                            },
+                            "name": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128
+                            },
+                            "isError": {
+                              "type": "boolean",
+                              "const": false
+                            },
+                            "durationMs": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "outputBytes": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "truncated": {
+                              "type": "boolean"
+                            },
+                            "attempts": {
+                              "type": "integer",
+                              "exclusiveMinimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "permissionSource": {
+                              "type": "string",
+                              "enum": [
+                                "policy",
+                                "session_cache",
+                                "user"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "toolCallId",
+                            "name",
+                            "isError",
+                            "durationMs",
+                            "outputBytes",
+                            "truncated",
+                            "attempts",
+                            "permissionSource"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "toolCallId": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 256
+                            },
+                            "name": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128
+                            },
+                            "isError": {
+                              "type": "boolean",
+                              "const": true
+                            },
+                            "durationMs": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "outputBytes": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "truncated": {
+                              "type": "boolean"
+                            },
+                            "attempts": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "failureCategory": {
+                              "type": "string",
+                              "enum": [
+                                "schema_error",
+                                "permission_denied",
+                                "timeout",
+                                "runtime_error",
+                                "rate_limited",
+                                "cancelled"
+                              ]
+                            },
+                            "errorCode": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128
+                            },
+                            "permissionSource": {
+                              "type": "string",
+                              "enum": [
+                                "policy",
+                                "session_cache",
+                                "user"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "toolCallId",
+                            "name",
+                            "isError",
+                            "durationMs",
+                            "outputBytes",
+                            "truncated",
+                            "attempts",
+                            "failureCategory",
+                            "errorCode"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "sessionId",
+                "runId",
+                "sequence",
+                "timestamp",
+                "durable",
+                "type",
+                "payload"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "sessionId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "runId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "sequence": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "timestamp": {
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                },
+                "durable": {
+                  "type": "boolean",
+                  "const": true
+                },
+                "type": {
+                  "type": "string",
+                  "const": "permission.requested"
+                },
+                "payload": {
                   "type": "object",
                   "properties": {
+                    "permissionRequestId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
                     "toolCallId": {
                       "type": "string",
                       "minLength": 1,
@@ -4109,30 +5024,247 @@ Success response:
                       "minLength": 1,
                       "maxLength": 128
                     },
-                    "isError": {
+                    "riskCategories": {
+                      "minItems": 1,
+                      "maxItems": 4,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "write",
+                          "edit",
+                          "bash:workspace-mutation",
+                          "bash:network",
+                          "bash:process-execution",
+                          "bash:other"
+                        ]
+                      }
+                    },
+                    "cacheable": {
                       "type": "boolean"
                     },
-                    "durationMs": {
-                      "type": "integer",
-                      "minimum": 0,
-                      "maximum": 9007199254740991
-                    },
-                    "outputBytes": {
-                      "type": "integer",
-                      "minimum": 0,
-                      "maximum": 9007199254740991
-                    },
-                    "truncated": {
-                      "type": "boolean"
+                    "summary": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "const": "read"
+                            },
+                            "path": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 4096
+                            },
+                            "offset": {
+                              "type": "integer",
+                              "exclusiveMinimum": 0,
+                              "maximum": 9007199254740991
+                            },
+                            "limit": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 2000
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "path"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "const": "write"
+                            },
+                            "path": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 4096
+                            },
+                            "contentBytes": {
+                              "type": "integer",
+                              "minimum": 0,
+                              "maximum": 1048576
+                            },
+                            "previewStart": {
+                              "type": "string",
+                              "maxLength": 1024
+                            },
+                            "previewEnd": {
+                              "type": "string",
+                              "maxLength": 1024
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "path",
+                            "contentBytes",
+                            "previewStart",
+                            "previewEnd"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "const": "edit"
+                            },
+                            "path": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 4096
+                            },
+                            "oldTextPreview": {
+                              "type": "string",
+                              "maxLength": 1024
+                            },
+                            "newTextPreview": {
+                              "type": "string",
+                              "maxLength": 1024
+                            },
+                            "replaceAll": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "path",
+                            "oldTextPreview",
+                            "newTextPreview",
+                            "replaceAll"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "const": "bash"
+                            },
+                            "command": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 8192
+                            },
+                            "timeoutSeconds": {
+                              "type": "integer",
+                              "minimum": 1,
+                              "maximum": 120
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "command",
+                            "timeoutSeconds"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ]
                     }
                   },
                   "required": [
+                    "permissionRequestId",
                     "toolCallId",
                     "name",
-                    "isError",
-                    "durationMs",
-                    "outputBytes",
-                    "truncated"
+                    "riskCategories",
+                    "cacheable",
+                    "summary"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "sessionId",
+                "runId",
+                "sequence",
+                "timestamp",
+                "durable",
+                "type",
+                "payload"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "sessionId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "runId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "sequence": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "timestamp": {
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                },
+                "durable": {
+                  "type": "boolean",
+                  "const": true
+                },
+                "type": {
+                  "type": "string",
+                  "const": "permission.resolved"
+                },
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "permissionRequestId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "toolCallId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "decision": {
+                      "type": "string",
+                      "enum": [
+                        "allow_once",
+                        "always_allow",
+                        "deny_once",
+                        "always_deny"
+                      ]
+                    },
+                    "allowed": {
+                      "type": "boolean"
+                    },
+                    "source": {
+                      "type": "string",
+                      "const": "user"
+                    }
+                  },
+                  "required": [
+                    "permissionRequestId",
+                    "toolCallId",
+                    "name",
+                    "decision",
+                    "allowed",
+                    "source"
                   ],
                   "additionalProperties": false
                 }

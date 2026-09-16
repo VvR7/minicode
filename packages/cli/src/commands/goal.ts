@@ -111,6 +111,13 @@ export class GoalEventReducer {
             `tool ${event.payload.name} ${event.payload.isError ? "error" : "done"} ${event.payload.outputBytes}B${event.payload.truncated ? " truncated" : ""}`,
           ],
         };
+      case "permission.requested":
+        // 本 Issue 只接入协议事件；CLI 的交互式响应由后续 client/CLI Issue 实现。
+        return { stderr: [`permission requested for ${event.payload.name}`] };
+      case "permission.resolved":
+        return {
+          stderr: [`permission ${event.payload.allowed ? "allowed" : "denied"}`],
+        };
       case "task.created":
       case "task.updated":
         // 任务事件只作为进度展示，不进入 assistant 输出流。

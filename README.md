@@ -8,6 +8,10 @@ TUI 前端、类型化 IPC、事件流、工具与权限系统、任务规划、
 `mc --goal`，以及支持持久多轮会话、恢复和多窗口同步的 `mc-tui`。Core 统一拥有 AgentLoop、
 历史、notes、run 级任务图、Trace 和事件流。
 
+Stage3 的 Core 权限层已接入：`write`／`edit` 及非白名单 `bash` 会挂起等待
+`permission.respond`。CLI/TUI 审批界面尚待后续开发，当前前端遇到审批时可以取消 run。
+详细行为见 [Core 工具权限生命周期](STAGE3_PERMISSIONS.md)。
+
 ## 环境要求
 
 - macOS 或 Linux

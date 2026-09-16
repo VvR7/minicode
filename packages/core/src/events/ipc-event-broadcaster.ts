@@ -132,6 +132,16 @@ export class IpcEventBroadcaster {
     return this.#subscriptions.size;
   }
 
+  /** 判断连接是否仍订阅指定 run，作为审批响应的附着凭证。 */
+  isAttached(connection: RpcConnection, sessionId: SessionId, runId: RunId): boolean {
+    return [...this.#subscriptions.values()].some(
+      (owned) =>
+        owned.connectionId === connection.id &&
+        owned.subscription.sessionId === sessionId &&
+        owned.subscription.runId === runId,
+    );
+  }
+
   #watchConnection(connection: RpcConnection): void {
     if (this.#watchedConnections.has(connection.id)) {
       return;

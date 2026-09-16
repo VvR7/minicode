@@ -95,6 +95,39 @@ describe("agent event schemas", () => {
     expect(JsonRpcNotificationEnvelopeSchema.safeParse(notification).success).toBe(true);
   });
 
+  test("accepts context window metadata while remaining compatible with old usage events", () => {
+    const usageEvent = {
+      ...eventBase,
+      type: "llm.usage",
+      payload: {
+        inputTokens: 10,
+        outputTokens: 2,
+        cacheReadInputTokens: 20,
+        cacheCreationInputTokens: 0,
+      },
+    } as const;
+    expect(
+      EventPushNotificationSchema.safeParse({
+        jsonrpc: "2.0",
+        method: "event.push",
+        params: { subscriptionId, event: usageEvent },
+      }).success,
+    ).toBe(true);
+    expect(
+      EventPushNotificationSchema.safeParse({
+        jsonrpc: "2.0",
+        method: "event.push",
+        params: {
+          subscriptionId,
+          event: {
+            ...usageEvent,
+            payload: { ...usageEvent.payload, contextWindowTokens: 200_000 },
+          },
+        },
+      }).success,
+    ).toBe(true);
+  });
+
   test("rejects event payloads that do not match their discriminator", () => {
     expect(
       ToolFinishedEventSchema.safeParse({

@@ -12,6 +12,7 @@ import {
   type SessionControllerEvent,
 } from "@minicode/client";
 import {
+  DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   MAX_SESSION_MESSAGE_CHARS,
   type CoreEndpoint,
   type SessionListResult,
@@ -33,7 +34,7 @@ import {
 } from "./selector.ts";
 import { EventLog } from "./widgets/event-log.ts";
 import { formatChatHelp, SELECTOR_HELP } from "./widgets/help-bar.ts";
-import { formatStatus } from "./widgets/status-bar.ts";
+import { formatContext, formatModel, formatRuntime } from "./widgets/chat-footer.ts";
 
 /** 渲染器工厂：真实终端走 createCliRenderer，测试可注入 headless renderer。 */
 export type RendererFactory = () => Promise<CliRenderer>;
@@ -60,6 +61,10 @@ export interface TuiAppOptions {
   readonly createRenderer?: RendererFactory;
   readonly connect?: SessionControllerConnector;
   readonly reconnectDelayMs?: number;
+  /** 启动时先展示的模型配置，收到 Core 模型事件后由权威值覆盖。 */
+  readonly model?: string;
+  /** 启动时先展示的上下文上限，收到 Core usage 事件后由权威值覆盖。 */
+  readonly contextWindowTokens?: number;
   /** 测试注入 controller；consumer 必须接收全部服务端事件。 */
   readonly createController?: (
     consumer: (event: SessionControllerEvent) => void,
@@ -103,7 +108,10 @@ export class TuiApp {
       options.createRenderer ?? (() => createCliRenderer({ exitOnCtrlC: false }))
     )();
     const workspaceRoot = normalizeWorkspaceRoot(options.workspaceRoot);
-    const model = new TuiModel();
+    const model = new TuiModel({
+      ...(options.model === undefined ? {} : { model: options.model }),
+      contextWindowTokens: options.contextWindowTokens ?? DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
+    });
     let controller: TuiSessionController | undefined;
     let screen: "chat" | "selector" = options.mode.kind === "sessions" ? "selector" : "chat";
     let selector: SelectorState = createSelectorState();
@@ -119,14 +127,6 @@ export class TuiApp {
       width: "100%",
       height: "100%",
     });
-    const status = new TextRenderable(renderer, {
-      id: "status",
-      content: formatStatus(model.snapshot()),
-      height: 1,
-      width: "100%",
-      bg: "#414559",
-      fg: "#c6d0f5",
-    });
     const log = new EventLog(renderer);
     const selectorView = new TextRenderable(renderer, {
       id: "selector",
@@ -134,13 +134,6 @@ export class TuiApp {
       width: "100%",
       flexGrow: 1,
       wrapMode: "char",
-    });
-    const counter = new TextRenderable(renderer, {
-      id: "counter",
-      content: `${MAX_SESSION_MESSAGE_CHARS} remaining`,
-      height: 1,
-      width: "100%",
-      fg: "#838ba7",
     });
     const help = new TextRenderable(renderer, {
       id: "help",
@@ -153,6 +146,7 @@ export class TuiApp {
       id: "input",
       width: "100%",
       height: 3,
+      paddingX: 1,
       placeholder: "Ask minicode…",
       wrapMode: "word",
       keyBindings: [
@@ -167,11 +161,70 @@ export class TuiApp {
         void submitInput();
       },
     });
-    root.add(status);
+    const inputFrame = new BoxRenderable(renderer, {
+      id: "input-frame",
+      width: "100%",
+      height: 5,
+      border: ["top", "bottom"],
+      borderStyle: "single",
+      borderColor: "#626880",
+      focusedBorderColor: "#8caaee",
+    });
+    inputFrame.add(input);
+    const workspaceRow = new BoxRenderable(renderer, {
+      id: "workspace-row",
+      width: "100%",
+      height: 1,
+      flexDirection: "row",
+      justifyContent: "space-between",
+    });
+    const workspace = new TextRenderable(renderer, {
+      id: "workspace",
+      content: workspaceRoot,
+      height: 1,
+      flexGrow: 1,
+      truncate: true,
+      fg: "#c6d0f5",
+    });
+    const runtime = new TextRenderable(renderer, {
+      id: "runtime",
+      content: formatRuntime(model.snapshot()),
+      height: 1,
+      width: "auto",
+      truncate: true,
+      fg: "#838ba7",
+    });
+    workspaceRow.add(workspace);
+    workspaceRow.add(runtime);
+    const footerRow = new BoxRenderable(renderer, {
+      id: "footer-row",
+      width: "100%",
+      height: 1,
+      flexDirection: "row",
+      justifyContent: "space-between",
+    });
+    const context = new TextRenderable(renderer, {
+      id: "context",
+      content: formatContext(model.snapshot()),
+      height: 1,
+      flexGrow: 1,
+      fg: "#a6d189",
+    });
+    const currentModel = new TextRenderable(renderer, {
+      id: "model",
+      content: formatModel(model.snapshot()),
+      height: 1,
+      width: "auto",
+      truncate: true,
+      fg: "#8caaee",
+    });
+    footerRow.add(context);
+    footerRow.add(currentModel);
     root.add(log.scrollbox);
     root.add(selectorView);
-    root.add(input);
-    root.add(counter);
+    root.add(inputFrame);
+    root.add(workspaceRow);
+    root.add(footerRow);
     root.add(help);
     renderer.root.add(root);
 
@@ -180,17 +233,24 @@ export class TuiApp {
       const snapshot = model.snapshot();
       const length = input.plainText.length;
       const remaining = MAX_SESSION_MESSAGE_CHARS - length;
-      status.content = formatStatus(snapshot);
       selectorView.content = formatSelector(selector, workspaceRoot);
       help.content =
         screen === "selector" ? SELECTOR_HELP : formatChatHelp(snapshot.run, snapshot.readOnly);
-      counter.content = remaining >= 0 ? `${remaining} remaining` : `${-remaining} over limit`;
-      counter.fg = remaining >= 0 ? "#838ba7" : "#ff5555";
+      workspace.content = workspaceRoot;
+      runtime.content = formatRuntime(snapshot);
+      context.content =
+        remaining >= 0
+          ? formatContext(snapshot)
+          : `draft ${-remaining} over limit · ${formatContext(snapshot)}`;
+      context.fg = remaining >= 0 ? "#a6d189" : "#ff5555";
+      currentModel.content = formatModel(snapshot);
       selectorView.visible = screen === "selector";
       log.scrollbox.visible = screen === "chat";
-      input.visible = screen === "chat";
-      counter.visible = input.visible && !snapshot.readOnly;
-      if (input.visible && snapshot.run === "idle" && !operationPending) input.focus();
+      inputFrame.visible = screen === "chat";
+      workspaceRow.visible = screen === "chat";
+      footerRow.visible = screen === "chat";
+      help.visible = screen === "selector";
+      if (inputFrame.visible && snapshot.run === "idle" && !operationPending) input.focus();
       else input.blur();
     };
 
@@ -475,6 +535,7 @@ export class TuiApp {
       try {
         await controller.dispose();
       } finally {
+        log.destroy();
         renderer.destroy();
       }
     }

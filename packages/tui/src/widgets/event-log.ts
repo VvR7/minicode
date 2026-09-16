@@ -1,11 +1,31 @@
 import {
+  BoxRenderable,
+  CodeRenderable,
+  MarkdownRenderable,
   ScrollBoxRenderable,
+  SyntaxStyle,
   TextRenderable,
+  type MarkdownOptions,
+  type Renderable,
   type RenderContext,
   type ScrollUnit,
 } from "@opentui/core";
 
 import type { LogKind, LogLine, LogMutation } from "../model.ts";
+
+/** 历史 Markdown 保持流式预览以兼容普通文本，同时单独终结完整 fenced code block。 */
+const renderCompletedCodeBlock = Object.assign(
+  ((token, context) => {
+    if (token.type !== "code") return undefined;
+    const renderable = context.defaultRender();
+    if (renderable instanceof CodeRenderable) {
+      renderable.drawUnstyledText = true;
+      renderable.streaming = false;
+    }
+    return renderable;
+  }) satisfies NonNullable<MarkdownOptions["renderNode"]>,
+  { codeBlockOnly: true as const },
+);
 
 /** 各日志类别对应的前景色；undefined 表示使用终端默认色。 */
 export const LOG_KIND_COLORS: Record<LogKind, string | undefined> = {
@@ -37,11 +57,27 @@ function wrapModeFor(kind: LogKind): "none" | "char" | "word" {
  */
 export class EventLog {
   readonly scrollbox: ScrollBoxRenderable;
-  #lines = new Map<number, TextRenderable>();
+  #lines = new Map<
+    number,
+    { readonly root: Renderable; readonly content: TextRenderable | MarkdownRenderable }
+  >();
   #ctx: RenderContext;
+  #markdownStyle: SyntaxStyle;
 
   constructor(ctx: RenderContext) {
     this.#ctx = ctx;
+    this.#markdownStyle = SyntaxStyle.fromStyles({
+      default: { fg: "#c6d0f5" },
+      "markup.heading": { fg: "#8caaee", bold: true },
+      "markup.strong": { fg: "#e5c890", bold: true },
+      "markup.italic": { fg: "#babbf1", italic: true },
+      "markup.raw": { fg: "#a6d189" },
+      "markup.link": { fg: "#85c1dc", underline: true },
+      "markup.quote": { fg: "#a5adce", italic: true },
+      comment: { fg: "#838ba7", italic: true },
+      keyword: { fg: "#ca9ee6" },
+      string: { fg: "#a6d189" },
+    });
     this.scrollbox = new ScrollBoxRenderable(ctx, {
       id: "log",
       width: "100%",
@@ -79,8 +115,45 @@ export class EventLog {
     this.#remove([...this.#lines.keys()]);
   }
 
+  /** 释放 Markdown syntax style 的原生资源。 */
+  destroy(): void {
+    this.clear();
+    this.#markdownStyle.destroy();
+  }
+
   /** 新建一行并加入滚动容器。 */
   #append(line: LogLine): void {
+    if (line.kind === "assistant") {
+      const root = new BoxRenderable(this.#ctx, {
+        width: "100%",
+        flexDirection: "column",
+        marginTop: 1,
+        marginBottom: 1,
+      });
+      root.add(
+        new TextRenderable(this.#ctx, {
+          content: "ASSISTANT",
+          height: 1,
+          fg: "#8caaee",
+        }),
+      );
+      const markdown = new MarkdownRenderable(this.#ctx, {
+        content: "",
+        syntaxStyle: this.#markdownStyle,
+        streaming: true,
+        width: "100%",
+        conceal: true,
+        tableOptions: { style: "columns", widthMode: "full", wrapMode: "word" },
+        ...(line.streaming === true ? {} : { renderNode: renderCompletedCodeBlock }),
+      });
+      root.add(markdown);
+      this.#lines.set(line.id, { root, content: markdown });
+      this.scrollbox.add(root);
+      // OpenTUI 冷路径直接以非 streaming 挂载会漏掉普通 Markdown，因此完整历史正文也先走流式预览；
+      // 上面的专用 renderer 会独立终结 fenced code block，避免尾部代码消失。
+      markdown.content = this.#assistantContent(line.text);
+      return;
+    }
     const fg = LOG_KIND_COLORS[line.kind];
     const child = new TextRenderable(this.#ctx, {
       content: line.text,
@@ -88,7 +161,7 @@ export class EventLog {
       width: "100%",
       wrapMode: wrapModeFor(line.kind),
     });
-    this.#lines.set(line.id, child);
+    this.#lines.set(line.id, { root: child, content: child });
     this.scrollbox.add(child);
   }
 
@@ -96,9 +169,12 @@ export class EventLog {
   #update(line: LogLine): void {
     const child = this.#lines.get(line.id);
     if (child !== undefined) {
-      child.content = line.text;
+      child.content.content =
+        child.content instanceof MarkdownRenderable ? this.#assistantContent(line.text) : line.text;
+      if (child.content instanceof MarkdownRenderable)
+        child.content.streaming = line.streaming ?? false;
       const fg = LOG_KIND_COLORS[line.kind];
-      if (fg !== undefined) child.fg = fg;
+      if (fg !== undefined && child.content instanceof TextRenderable) child.content.fg = fg;
     }
   }
 
@@ -109,9 +185,14 @@ export class EventLog {
       if (child === undefined) {
         continue;
       }
-      this.scrollbox.remove(child);
-      child.destroy();
+      this.scrollbox.remove(child.root);
+      child.root.destroyRecursively();
       this.#lines.delete(id);
     }
+  }
+
+  /** Markdown 组件不显示 transcript 的稳定语义标签。 */
+  #assistantContent(text: string): string {
+    return text.replace(/^\[ASSISTANT\]\s?/u, "");
   }
 }

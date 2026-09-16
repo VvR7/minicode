@@ -42,6 +42,8 @@ export interface AgentLoopOptions {
   readonly maxAttempts?: number;
   /** 当前 run 的 best-effort Trace 记录器。 */
   readonly trace?: TraceRecorder;
+  /** Core 采用的模型上下文窗口，用于向前端发布当前占用比例。 */
+  readonly contextWindowTokens?: number;
 }
 
 /** EventBus 发布失败（如 event_store_error）时抛出，由 run 映射为结构化失败。 */
@@ -79,6 +81,7 @@ export class AgentLoop {
   readonly #timeoutMs: number | undefined;
   readonly #maxAttempts: number | undefined;
   readonly #trace: TraceRecorder | undefined;
+  readonly #contextWindowTokens: number | undefined;
 
   constructor(
     provider: LlmProvider,
@@ -95,6 +98,7 @@ export class AgentLoop {
     this.#timeoutMs = options.timeoutMs;
     this.#maxAttempts = options.maxAttempts;
     this.#trace = options.trace;
+    this.#contextWindowTokens = options.contextWindowTokens;
   }
 
   /** 执行直到终止；同一 signal 贯穿 LLM 与工具调用。返回结构化 RunCompletion，不发布 run.finished。 */
@@ -174,7 +178,19 @@ export class AgentLoop {
 
     const response = await this.#consumeStream(context, signal);
 
-    await this.#publish(context, { type: "llm.usage", payload: response.usage }, true);
+    await this.#publish(
+      context,
+      {
+        type: "llm.usage",
+        payload: {
+          ...response.usage,
+          ...(this.#contextWindowTokens === undefined
+            ? {}
+            : { contextWindowTokens: this.#contextWindowTokens }),
+        },
+      },
+      true,
+    );
     context.accumulateUsage(response.usage);
 
     const parts: LlmContentPart[] = [];

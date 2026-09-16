@@ -1,7 +1,7 @@
 import { dirname, join } from "node:path";
 import type { Environment, RunId, SessionId, TaskGraphSnapshot } from "@minicode/protocol";
 import { ExecutionContext } from "../agent/context.ts";
-import { AgentLoop, DEFAULT_SYSTEM_PROMPT, RUN_TIMEOUT_REASON } from "../agent/loop.ts";
+import { AgentLoop, DEFAULT_SYSTEM_PROMPT } from "../agent/loop.ts";
 import type { EventBus } from "../events/event-bus.ts";
 import { AnthropicAdapter } from "../llm/anthropic-adapter.ts";
 import { loadLlmConfig } from "../llm/config.ts";
@@ -29,9 +29,6 @@ import { ToolRegistry } from "../tools/registry.ts";
 import type { Tool } from "../tools/types.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
 import type { RunCompletion } from "./completion.ts";
-
-/** 整 run 的默认超时毫秒数（10 分钟）。 */
-export const DEFAULT_RUN_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** 系统提示词中注入 notes 的固定区块标题。 */
 export const SESSION_NOTES_HEADING = "Session Notes";
@@ -112,7 +109,6 @@ export interface AgentRunnerOptions {
   readonly bus: EventBus;
   /** CoreConfig.homeDirectory，用于构造 run 目录、tasks.json 与 notes.md 路径。 */
   readonly homeDirectory: string;
-  readonly runTimeoutMs?: number;
   /** 可注入的 provider 工厂，测试用 fake provider 替代真实网络。 */
   readonly providerFactory?: (config: LlmConfig) => LlmProvider;
   /** 可注入的任务存储，测试可替代真实文件系统。 */
@@ -133,7 +129,6 @@ export class AgentRunner {
   readonly #environment: Environment;
   readonly #bus: EventBus;
   readonly #homeDirectory: string;
-  readonly #runTimeoutMs: number;
   readonly #providerFactory: (config: LlmConfig) => LlmProvider;
   readonly #taskStorage: TaskStorage;
 
@@ -142,7 +137,6 @@ export class AgentRunner {
     this.#environment = options.environment;
     this.#bus = options.bus;
     this.#homeDirectory = options.homeDirectory;
-    this.#runTimeoutMs = options.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
     this.#providerFactory = options.providerFactory ?? ((config) => new AnthropicAdapter(config));
     this.#taskStorage = options.taskStorage ?? nodeTaskStorage;
   }
@@ -211,71 +205,53 @@ export class AgentRunner {
       return { completion: this.#completionFromContext(context) };
     }
 
-    const controller = new AbortController();
-    const onExternalAbort = (): void => controller.abort();
-    const timeoutTimer = setTimeout(() => {
-      controller.abort(RUN_TIMEOUT_REASON);
-    }, this.#runTimeoutMs);
-    if (externalSignal.aborted) {
-      controller.abort();
-    } else {
-      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    const runDirectory = dirname(tasksPath(this.#homeDirectory, request.sessionId, request.runId));
+    await nodeSessionStorage.ensureDirectory(runDirectory);
+
+    const taskManager = new TaskManager(
+      this.#taskStorage,
+      tasksPath(this.#homeDirectory, request.sessionId, request.runId),
+    );
+    const noteStore = new NoteStore(
+      nodeSessionStorage,
+      join(this.#homeDirectory, "sessions", request.sessionId, "notes.md"),
+      { sessionId: request.sessionId, runId: request.runId },
+    );
+
+    const provider = this.#providerFactory(llmConfig.value);
+    const registry = new ToolRegistry();
+    for (const tool of builtinTools) {
+      registry.register(tool as Tool);
     }
-
-    try {
-      const runDirectory = dirname(
-        tasksPath(this.#homeDirectory, request.sessionId, request.runId),
-      );
-      await nodeSessionStorage.ensureDirectory(runDirectory);
-
-      const taskManager = new TaskManager(
-        this.#taskStorage,
-        tasksPath(this.#homeDirectory, request.sessionId, request.runId),
-      );
-      const noteStore = new NoteStore(
-        nodeSessionStorage,
-        join(this.#homeDirectory, "sessions", request.sessionId, "notes.md"),
-        { sessionId: request.sessionId, runId: request.runId },
-      );
-
-      const provider = this.#providerFactory(llmConfig.value);
-      const registry = new ToolRegistry();
-      for (const tool of builtinTools) {
-        registry.register(tool as Tool);
-      }
-      for (const tool of createTaskTools({
-        manager: taskManager,
-        bus: this.#bus,
-        sessionId: request.sessionId,
-        runId: request.runId,
-      })) {
-        registry.register(tool);
-      }
-      registry.register(createNoteSaveTool(noteStore));
-
-      const invoker = new ToolInvoker(registry);
-      const loop = new AgentLoop(provider, registry, invoker, this.#bus, {
-        ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
-        ...(request.trace === undefined ? {} : { trace: request.trace }),
-        contextWindowTokens: contextBudgetConfig.value.contextWindowTokens,
-      });
-      const completion = await loop.run(context, controller.signal, true);
-
-      const listed = await taskManager.list();
-      const taskGraph: TaskGraphSnapshot | undefined =
-        listed.ok && listed.value.tasks.length > 0
-          ? { revision: listed.value.revision, tasks: listed.value.tasks }
-          : undefined;
-      return {
-        completion: {
-          ...completion,
-          ...(taskGraph === undefined ? {} : { taskGraph }),
-        },
-      };
-    } finally {
-      clearTimeout(timeoutTimer);
-      externalSignal.removeEventListener("abort", onExternalAbort);
+    for (const tool of createTaskTools({
+      manager: taskManager,
+      bus: this.#bus,
+      sessionId: request.sessionId,
+      runId: request.runId,
+    })) {
+      registry.register(tool);
     }
+    registry.register(createNoteSaveTool(noteStore));
+
+    const invoker = new ToolInvoker(registry);
+    const loop = new AgentLoop(provider, registry, invoker, this.#bus, {
+      ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
+      ...(request.trace === undefined ? {} : { trace: request.trace }),
+      contextWindowTokens: contextBudgetConfig.value.contextWindowTokens,
+    });
+    const completion = await loop.run(context, externalSignal, true);
+
+    const listed = await taskManager.list();
+    const taskGraph: TaskGraphSnapshot | undefined =
+      listed.ok && listed.value.tasks.length > 0
+        ? { revision: listed.value.revision, tasks: listed.value.tasks }
+        : undefined;
+    return {
+      completion: {
+        ...completion,
+        ...(taskGraph === undefined ? {} : { taskGraph }),
+      },
+    };
   }
 
   /** 由 context 组装 RunCompletion。 */

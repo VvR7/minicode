@@ -25,7 +25,7 @@ export function environmentWithoutLlm(): Environment {
 
 /**
  * 挂起直到 abort 的 provider，用于验证整 run 超时与取消都能中断循环。
- * 响应 signal 抛 aborted，由 AgentLoop 据 reason 区分 cancelled 与 run_timeout。
+ * 响应 signal 抛 aborted，由 AgentLoop 将外部取消收敛为 cancelled。
  */
 export class HangProvider implements LlmProvider {
   readonly providerName = "hang";

@@ -141,7 +141,10 @@ describe("AgentRunner", () => {
       });
       expect(runToolSchemas().map((schema) => schema.name)).toEqual(
         expect.arrayContaining([
-          "read_file",
+          "read",
+          "write",
+          "edit",
+          "bash",
           "task_create",
           "task_update",
           "task_list",
@@ -173,31 +176,6 @@ describe("AgentRunner", () => {
       );
       subscription.dispose();
       expect(outcome.completion).toMatchObject({ status: "failed", reason: "internal_error" });
-    } finally {
-      await cleanupTempWorkspace(workspace);
-    }
-  });
-
-  test("fails with run_timeout when the whole run exceeds its timeout", async () => {
-    const workspace = await createTempWorkspace();
-    try {
-      const bus = createBus();
-      const runner = new AgentRunner({
-        environment: environmentWithLlm(),
-        bus,
-        homeDirectory: workspace,
-        runTimeoutMs: 20,
-        providerFactory: () => new HangProvider(),
-      });
-      const { subscription } = await collectEvents(bus, SESSION_A, RUN_A);
-
-      const outcome = await runner.run(
-        { sessionId: SESSION_A, runId: RUN_A, goal: "x", workspaceRoot: workspace },
-        new AbortController().signal,
-      );
-      subscription.dispose();
-
-      expect(outcome.completion).toMatchObject({ status: "failed", reason: "run_timeout" });
     } finally {
       await cleanupTempWorkspace(workspace);
     }

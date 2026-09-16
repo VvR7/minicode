@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentEvent } from "@minicode/protocol";
+import { z } from "zod";
 import { ExecutionContext } from "../../src/agent/context.ts";
 import { AgentLoop } from "../../src/agent/loop.ts";
 import type { RunCompletion } from "../../src/run/completion.ts";
 import { ToolInvoker } from "../../src/tools/invoker.ts";
 import { ToolRegistry } from "../../src/tools/registry.ts";
 import type { Tool } from "../../src/tools/types.ts";
+import { ToolError } from "../../src/tools/types.ts";
 import { builtinTools } from "../../src/tools/builtin/index.ts";
 import { LlmError } from "../../src/llm/errors.ts";
 import { cleanupTempWorkspace, createTempWorkspace } from "../tools/test-helpers.ts";
@@ -42,6 +44,7 @@ interface Harness {
 function buildHarness(
   turns: readonly FakeTurn[],
   opts: ConstructorParameters<typeof AgentLoop>[4] = {},
+  extraTools: readonly Tool[] = [],
 ): Harness {
   const bus = createBus();
   const provider = new FakeProvider(turns);
@@ -50,6 +53,7 @@ function buildHarness(
     // builtinTools 为联合类型，注册时统一收敛为通用 Tool 契约。
     registry.register(tool as Tool);
   }
+  for (const tool of extraTools) registry.register(tool);
   const invoker = new ToolInvoker(registry, { retryDelaysMs: [0] });
   const loop = new AgentLoop(provider, registry, invoker, bus, opts);
   return { bus, provider, loop };
@@ -160,7 +164,7 @@ describe("AgentLoop", () => {
     try {
       await writeFile(join(workspace, "a.txt"), "AAA\n");
       const { bus, provider, loop } = buildHarness([
-        { response: toolResponse([toolCall("c1", "read_file", { path: "a.txt" })]) },
+        { response: toolResponse([toolCall("c1", "read", { path: "a.txt" })]) },
         { response: textResponse("file read done") },
       ]);
       const context = makeContext(workspace);
@@ -188,7 +192,7 @@ describe("AgentLoop", () => {
       const toolFinished = events.find((e) => e.type === "tool.finished");
       expect(toolFinished?.payload).toMatchObject({
         toolCallId: "c1",
-        name: "read_file",
+        name: "read",
         isError: false,
       });
       expect(stepsOf(events, "step.started")).toEqual([1, 2]);
@@ -206,8 +210,8 @@ describe("AgentLoop", () => {
       const { bus, provider, loop } = buildHarness([
         {
           response: toolResponse([
-            toolCall("c1", "read_file", { path: "a.txt" }),
-            toolCall("c2", "read_file", { path: "b.txt" }),
+            toolCall("c1", "read", { path: "a.txt" }),
+            toolCall("c2", "read", { path: "b.txt" }),
           ]),
         },
         { response: textResponse("both read") },
@@ -267,12 +271,59 @@ describe("AgentLoop", () => {
     }
   });
 
+  test("publishes start, retry, and one typed terminal event in execution order", async () => {
+    const workspace = await createTempWorkspace();
+    let attempts = 0;
+    const flaky: Tool = {
+      name: "flaky",
+      description: "test transient failure",
+      inputSchema: z.strictObject({}),
+      execute: () => {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new ToolError("temporary_io_error", "temporary", { retryable: true });
+        }
+        return { content: "ok" };
+      },
+    };
+    try {
+      const { bus, loop } = buildHarness(
+        [
+          { response: toolResponse([toolCall("c1", "flaky", {})]) },
+          { response: textResponse("done") },
+        ],
+        {},
+        [flaky],
+      );
+      const { events } = await runAndDrain(loop, makeContext(workspace), bus);
+      const lifecycle = events.filter((event) => event.type.startsWith("tool."));
+      expect(lifecycle.map((event) => event.type)).toEqual([
+        "tool.started",
+        "tool.retrying",
+        "tool.finished",
+      ]);
+      expect(lifecycle[1]?.payload).toMatchObject({
+        attempt: 2,
+        maxAttempts: 3,
+        failureCategory: "runtime_error",
+        errorCode: "temporary_io_error",
+      });
+      expect(lifecycle[2]?.payload).toMatchObject({
+        isError: false,
+        attempts: 2,
+        permissionSource: "policy",
+      });
+    } finally {
+      await cleanupTempWorkspace(workspace);
+    }
+  });
+
   test("fails with max_steps when the loop keeps requesting tools", async () => {
     const workspace = await createTempWorkspace();
     try {
       await writeFile(join(workspace, "a.txt"), "AAA\n");
       const { loop, bus } = buildHarness([
-        { response: toolResponse([toolCall("c1", "read_file", { path: "a.txt" })]) },
+        { response: toolResponse([toolCall("c1", "read", { path: "a.txt" })]) },
       ]);
       const context = makeContext(workspace, 1);
       const { events, completion } = await runAndDrain(loop, context, bus);

@@ -190,7 +190,7 @@ function coreEnvironment(port: number, homeDirectory: string, baseUrl?: string):
 }
 
 describe("mc --goal process-level E2E", () => {
-  test("mock provider drives read_file and streams the README summary to stdout", async () => {
+  test("mock provider drives read and streams the README summary to stdout", async () => {
     const homeDirectory = await mkdtemp(join(tmpdir(), "minicode-goal-"));
     const workspace = await makeWorkspace("alpha");
     const mock = startAnthropicMock();
@@ -217,7 +217,7 @@ describe("mc --goal process-level E2E", () => {
     // 进度信息进入 stderr，不污染 stdout。
     expect(result.stdout).not.toContain("tool");
     expect(result.stdout).not.toContain("step");
-    expect(result.stderr).toContain("tool read_file");
+    expect(result.stderr).toContain("tool read");
     expect(result.stderr).toContain("step 1");
     expect(result.stderr).toContain("run succeeded (completed)");
     // 两次 LLM 调用：首次 tool_use，第二次含 tool_result 后给出最终回答。

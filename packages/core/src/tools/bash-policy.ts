@@ -8,11 +8,10 @@ export interface BashPolicyResult {
 }
 
 const DANGEROUS_PATTERNS = [
-  /(?:^|\s)rm\s+(?:-[A-Za-z]*r[A-Za-z]*f|-[A-Za-z]*f[A-Za-z]*r)\s+(?:\/|~)(?:\s|$)/u,
-  /(?:^|\s)git\s+reset\s+--hard(?:\s|$)/u,
-  /(?:^|\s)git\s+clean\s+-[A-Za-z]*f/u,
-  /(?:^|\s)(?:shutdown|reboot|poweroff|halt|mkfs(?:\.[\w-]+)?)\b/u,
-  /(?:^|\s)dd\b[^\n]*\bof=\/dev\//u,
+  /(?:^|[\s;&|])git\s+reset\s+--hard(?:\s|$)/u,
+  /(?:^|[\s;&|])git\s+clean\s+-[A-Za-z]*f/u,
+  /(?:^|[\s;&|])(?:shutdown|reboot|poweroff|halt|mkfs(?:\.[\w-]+)?)\b/u,
+  /(?:^|[\s;&|])dd\b[^\n]*\bof=\/dev\//u,
   /:\(\)\s*\{\s*:\|:&\s*;\s*\}/u,
 ] as const;
 
@@ -24,7 +23,10 @@ const SAFE_GIT = /^git\s+(?:status|diff|log|show|branch|rev-parse)(?:\s|$)/u;
 /** 对 Bash 命令做固定规则分类；它是权限层和执行层共用的唯一策略入口。 */
 export function classifyBashCommand(command: string): BashPolicyResult {
   const trimmed = command.trim();
-  if (DANGEROUS_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+  if (
+    isRecursiveRootDelete(trimmed) ||
+    DANGEROUS_PATTERNS.some((pattern) => pattern.test(trimmed))
+  ) {
     return { decision: "deny", riskCategories: inferRisks(trimmed), cacheable: false };
   }
   if (!SIMPLE_SHELL_META.test(trimmed) && isSafeCommand(trimmed)) {
@@ -36,6 +38,21 @@ export function classifyBashCommand(command: string): BashPolicyResult {
     riskCategories,
     cacheable: riskCategories.length === 1 && !SIMPLE_SHELL_META.test(trimmed),
   };
+}
+
+/** 识别常见递归删除根目录变体，包括分隔符、拆分选项及额外选项。 */
+function isRecursiveRootDelete(command: string): boolean {
+  return command.split(/[;&|\n]+/u).some((part) => {
+    const tokens = part.trim().split(/\s+/u);
+    const rmIndex = tokens.indexOf("rm");
+    if (rmIndex < 0) return false;
+    const args = tokens.slice(rmIndex + 1);
+    const recursive = args.some(
+      (arg) => /^-[A-Za-z]*[rR][A-Za-z]*$/u.test(arg) || arg === "--recursive",
+    );
+    const rootTarget = args.some((arg) => ["/", "~"].includes(arg.replace(/^["']|["']$/gu, "")));
+    return recursive && rootTarget;
+  });
 }
 
 /** 判断无复合 shell 操作符的命令是否落在固定只读白名单。 */
@@ -54,7 +71,7 @@ function isSafeCommand(command: string): boolean {
 function inferRisks(command: string): PermissionRiskCategory[] {
   const risks: PermissionRiskCategory[] = [];
   if (
-    /\b(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|install|truncate)\b|\bsed\s+-i\b|\bgit\s+(?:add|commit|checkout|switch|merge|rebase|reset|clean)\b/u.test(
+    /\b(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|install|truncate)\b|\bsed\s+-i\b|\bfind\b[^\n]*\s-(?:delete|exec|execdir|ok|okdir)(?:\s|$)|\bgit\s+branch\b[^\n]*\s(?:-[dDmMcC]|--(?:delete|move|copy))(?:\s|$)|\bgit\s+(?:add|commit|checkout|switch|merge|rebase|reset|clean)\b/u.test(
       command,
     )
   ) {

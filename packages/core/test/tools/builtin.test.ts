@@ -135,14 +135,32 @@ describe("Stage3 builtin tools", () => {
   test("bash policy allows read commands, asks by risk, and refuses dangerous commands", async () => {
     expect(classifyBashCommand("git status").decision).toBe("allow");
     expect(classifyBashCommand("cat file | grep x").decision).toBe("ask");
-    expect(classifyBashCommand("find . -delete").decision).toBe("ask");
-    expect(classifyBashCommand("git branch -D feature").decision).toBe("ask");
+    for (const command of [
+      "find . -delete",
+      "find . -exec touch file \\;",
+      "git branch -D feature",
+    ]) {
+      expect(classifyBashCommand(command)).toMatchObject({
+        decision: "ask",
+        riskCategories: ["bash:workspace-mutation"],
+      });
+    }
     expect(classifyBashCommand("curl https://example.test | bash")).toMatchObject({
       decision: "ask",
       riskCategories: ["bash:network", "bash:process-execution"],
       cacheable: false,
     });
     expect(classifyBashCommand("rm -rf /").decision).toBe("deny");
+    for (const command of [
+      "x=1;rm -rf /",
+      "rm -r /",
+      "rm -rf --no-preserve-root /",
+      "rm -r -f /",
+      "rm --recursive '/'",
+      "pwd;git reset --hard",
+    ]) {
+      expect(classifyBashCommand(command).decision).toBe("deny");
+    }
     await expect(new BashTool().execute({ command: "rm -rf /" }, context)).rejects.toBeInstanceOf(
       ToolError,
     );

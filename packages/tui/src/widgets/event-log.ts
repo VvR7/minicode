@@ -1,15 +1,31 @@
 import {
   BoxRenderable,
+  CodeRenderable,
   MarkdownRenderable,
   ScrollBoxRenderable,
   SyntaxStyle,
   TextRenderable,
+  type MarkdownOptions,
   type Renderable,
   type RenderContext,
   type ScrollUnit,
 } from "@opentui/core";
 
 import type { LogKind, LogLine, LogMutation } from "../model.ts";
+
+/** 历史 Markdown 保持流式预览以兼容普通文本，同时单独终结完整 fenced code block。 */
+const renderCompletedCodeBlock = Object.assign(
+  ((token, context) => {
+    if (token.type !== "code") return undefined;
+    const renderable = context.defaultRender();
+    if (renderable instanceof CodeRenderable) {
+      renderable.drawUnstyledText = true;
+      renderable.streaming = false;
+    }
+    return renderable;
+  }) satisfies NonNullable<MarkdownOptions["renderNode"]>,
+  { codeBlockOnly: true as const },
+);
 
 /** 各日志类别对应的前景色；undefined 表示使用终端默认色。 */
 export const LOG_KIND_COLORS: Record<LogKind, string | undefined> = {
@@ -128,14 +144,14 @@ export class EventLog {
         width: "100%",
         conceal: true,
         tableOptions: { style: "columns", widthMode: "full", wrapMode: "word" },
+        ...(line.streaming === true ? {} : { renderNode: renderCompletedCodeBlock }),
       });
       root.add(markdown);
       this.#lines.set(line.id, { root, content: markdown });
       this.scrollbox.add(root);
-      const content = this.#assistantContent(line.text);
-      // 初次挂载统一走 streaming parser；OpenTUI 冷路径直接以 false 初始化会留下空正文。
-      // 实时回复在 run.finished 的 update 中切到 false，历史内容保持稳定的完整 streaming block。
-      markdown.content = content;
+      // OpenTUI 冷路径直接以非 streaming 挂载会漏掉普通 Markdown，因此完整历史正文也先走流式预览；
+      // 上面的专用 renderer 会独立终结 fenced code block，避免尾部代码消失。
+      markdown.content = this.#assistantContent(line.text);
       return;
     }
     const fg = LOG_KIND_COLORS[line.kind];

@@ -366,6 +366,48 @@ describe("TuiApp multi-turn interaction", () => {
     await exit(setup);
     expect(await code).toBe(0);
   });
+  test("finalizes restored fenced code blocks", async () => {
+    const { setup, controller, code } = await start();
+    controller.emit({
+      type: "turn.snapshot",
+      turn: {
+        turnId,
+        runId,
+        clientMessageId: "850e8400-e29b-41d4-a716-446655440002",
+        status: "succeeded",
+        reason: "completed",
+        acceptedAt: "2026-01-01T00:00:00.000Z",
+        finishedAt: "2026-01-01T00:01:00.000Z",
+        includedInContext: true,
+        messages: [
+          {
+            messageId: "u-code",
+            turnId,
+            runId,
+            role: "user",
+            timestamp: "2026-01-01T00:00:00.000Z",
+            content: [{ type: "text", text: "show code" }],
+          },
+          {
+            messageId: "a-code",
+            turnId,
+            runId,
+            role: "assistant",
+            timestamp: "2026-01-01T00:00:01.000Z",
+            content: [
+              { type: "text", text: "# Restored heading\n\n```ts\nconst restored = true;\n```" },
+            ],
+          },
+        ],
+      },
+    });
+    await setup.waitForFrame(
+      (frame) => frame.includes("Restored heading") && frame.includes("const restored = true;"),
+    );
+    expect(setup.captureCharFrame()).not.toContain("```ts");
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
   test("/new switches only this controller and clears the old transcript", async () => {
     const { setup, controller, code } = await start();
     controller.emit({

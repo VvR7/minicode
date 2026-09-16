@@ -31,7 +31,30 @@
   result distinguishes an accepted response from an already resolved or unknown request.
 - The `agent.run` response is enqueued before the first `event.push` for that run.
 - Event sequence numbers are positive and scoped to a run; durable events can be replayed by a
-  later event-store implementation.
+  reconnecting client through the run journal.
+
+## Stage3 permission lifecycle
+
+- Core validates strict tool arguments before policy evaluation or approval. General tools are
+  read/write/edit/bash; task and note tools remain available. Old tool names are history-only.
+- Durable permission.requested events contain bounded summaries, not full write/edit content.
+  Responses require an attached connection and matching session/run/Core-generated request ID.
+- Decisions are allow_once, deny_once, always_allow, and always_deny. Always decisions cache one
+  risk category in daemon memory for that session only; composite risks accept once decisions only.
+  Forced policy denial cannot be overridden by the cache.
+- The first valid response claims the request; Core persists permission.resolved before releasing
+  execution. accepted is not a client-side resolved event. Repeats return already_resolved;
+  unknown, mismatched, unattached, or ineligible always responses return not_found.
+- Approval has no timeout and does not consume tool execution time. Tool retries are durable,
+  bounded to three attempts with cancellable 2/4-second backoff for explicitly transient runtime
+  failures or tool rate limits; schema errors, denial, timeout, and deterministic failures do not retry.
+- Tool failures remain observations. Cancellation/shutdown closes pending approval without a fake
+  user decision; restart repairs terminal journals but never resumes tools or restores approval cache.
+- Completed run approvals replay through event.subscribe; chat history alone is not a pending
+  approval queue. Stage2 persisted events/history remain readable without executing old tool names.
+- workspaceRoot is a relative-path base, not a filesystem sandbox: absolute/external symlink paths
+  are permitted. Bash classification is heuristic, not a shell parser or security isolation layer.
+  See [Stage3 permissions](STAGE3_PERMISSIONS.md) and [test matrix](STAGE3_TEST_MATRIX.md).
 
 ## Sessions
 

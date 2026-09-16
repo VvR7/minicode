@@ -12,6 +12,9 @@ Stage3 的 Core 权限层已接入：`write`／`edit` 及非白名单 `bash` 会
 `permission.respond`。`mc --goal` 在交互终端支持允许／拒绝一次及 session 内 always 决策；
 没有交互 TTY 时自动拒绝一次。审批与进度写 stderr，assistant 输出仍写 stdout。
 TUI 在 transcript 内展示审批摘要，支持方向键／Tab 加 Enter，以及 1–4 快捷键；Ctrl-C 仍可取消 run。
+通用工具为 `read`、`write`、`edit`、`bash`，保留任务和笔记工具。工具参数先严格校验，
+再审批、执行和有限重试。workspace 不是沙箱：允许外部绝对路径和符号链接目标；
+Bash 权限规则是启发式检测，不能代替系统隔离。
 详细行为见 [Core 工具权限生命周期](STAGE3_PERMISSIONS.md)。
 
 ## 环境要求
@@ -119,7 +122,7 @@ failed/cancelled/interrupted turn 保留用于审计。notes 属于 session，Ta
 
 Trace 默认开启，`summary` 只保留结构、名称、状态和用量；`full` 保留经容量限制后的业务 payload。
 两种模式都会递归脱敏 credential。Trace 使用有界队列和文件上限，写入失败只丢弃 Trace，不改变
-Agent 终态；当前没有 Trace viewer。配置项和完整设计见 [Stage2 架构](ARCHITECTURE.md)。
+Agent 终态；当前没有 Trace viewer。配置项和完整设计见 [架构与持久化](ARCHITECTURE.md)。
 
 提交前运行：
 
@@ -153,7 +156,9 @@ LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run 
 
 ## 文档
 
-- [Stage2 架构与持久化](ARCHITECTURE.md)
+- [架构与持久化（Stage2 / Stage3）](ARCHITECTURE.md)
 - [Stage2 验证矩阵](STAGE2_TEST_MATRIX.md)
+- [Stage3 权限与工具](STAGE3_PERMISSIONS.md)
+- [Stage3 验证矩阵](STAGE3_TEST_MATRIX.md)
 - [TUI 使用说明](TUI.md)
 - [Wire protocol](WIRE_PROTOCOL.md)

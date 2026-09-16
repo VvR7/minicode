@@ -1,5 +1,42 @@
 # Core 工具权限生命周期
 
+## 工具契约与安全边界
+
+模型获得四个通用工具 `read`、`write`、`edit`、`bash`，另保留 `task_*` 与 `note_save`。
+旧名称不提供执行别名，但 Stage2 历史仍可读。strict schema 不接受未知字段或隐式类型转换。
+
+| 工具 | 参数与限制 |
+| --- | --- |
+| `read` | `path`；可选 `offset`（1-based）、`limit`（默认／最大 2000 行）；UTF-8 文本，最多 256 KiB 输出 |
+| `write` | `path`、`content`；最多 1 MiB；创建父目录，原子创建／覆盖 |
+| `edit` | `path`、`oldText`、`newText`；可选 `replaceAll`；精确字面替换，不匹配或非唯一且未指定全部替换时失败；原子写入 |
+| `bash` | `command`（最多 8 KiB）；可选 `timeout`（整数秒，1–120，默认 120）；`/bin/bash -lc`，合并输出最多 64 KiB |
+
+read/write/edit 执行预算统一 10 秒，bash 使用模型指定预算。bash 超时／取消终止进程组，
+子进程环境过滤常见凭据变量。输出截断保持合法 UTF-8。
+
+文件路径只拒绝显式 `..` 段，**允许外部绝对路径和指向 workspace 外的符号链接**。
+workspaceRoot 是相对路径基准，不是文件访问隔离边界；read 外部文件也不额外审批。
+write/edit 经批准后可改写外部目标，不同 session 对同一文件没有访问锁或沙箱隔离。
+
+bash 权限分类是启发式规则，不是 shell parser、安全沙箱或完整危险检测。白名单包括
+pwd/ls/find/rg/grep/cat/head/tail/wc、sed -n 和 git status/diff/log/show/branch/rev-parse；
+带变更选项的 find/branch 转审批，含复合操作符的命令不按简单白名单放行。危险规则覆盖
+常见根目录递归删除、git reset --hard／clean -f、关机、格式化等，但不保证识别所有变体，
+也没有完整证明白名单所有参数的只读语义。always allow 不提供系统安全保证；需要严格
+隔离时应使用外部容器／受限账号。
+
+## 失败与重试
+
+工具终态包含 attempts、failureCategory、errorCode 及可用的 permissionSource
+（policy/session_cache/user）。分类为 schema_error、permission_denied、timeout、
+runtime_error、rate_limited、cancelled。只重试显式瞬时运行时错误和工具上游限速，最多三次，
+间隔 2／4 秒；未知异常、文件不存在、编辑不匹配、bash 非零退出、参数错误、拒绝和超时
+不重试。失败仍作为 observation 继续模型循环，工具失败不意味着 run 必定失败。
+`tool.retrying` 是 durable 事件，供重放与前端显示；provider 层重试独立管理。
+
+## Core 权限审批
+
 Core 为整个 daemon 创建一个 `PermissionManager`，跨 turn 复用，同一 session 的
 always 决策仅保存在内存。独立 session 和 daemon 重启均不会继承该缓存。
 

@@ -1,4 +1,4 @@
-# Stage2 架构与持久化
+# 架构与持久化（Stage2 / Stage3）
 
 ## 进程与数据流
 
@@ -15,8 +15,43 @@ TUI -> SessionController -> IPC -> SessionManager -> AgentRunner -> LLM provider
 ```
 
 启动 TUI 时，规范化的 `cwd` 成为新 session 的固定 `workspaceRoot`。恢复只允许在相同
-workspace 中进行；不同 session 的 active run、事件订阅、取消和文件路径都按 sessionId/runId
-隔离。同一 session 只允许一个 active turn，不同 session 可以并行。
+workspace 中进行；不同 session 的 active run、事件订阅、取消和持久数据都按 sessionId/runId
+隔离。同一 session 只允许一个 active turn，不同 session 可以并行。工具文件路径不是沙箱：
+不同 session 可以访问同一个文件，也允许访问 workspace 外的绝对路径与符号链接目标。
+
+## Stage3 工具与权限
+
+每个 run 注册四个通用工具 `read`、`write`、`edit`、`bash`，保留 `task_*` 与 `note_save`。
+旧 `read_file` 等名称只在历史记录中兼容，不再暴露给模型或提供执行别名。
+
+```text
+AgentLoop -> ToolInvoker -> strict schema -> PermissionManager
+                                               | policy / session cache
+                                               +-> durable permission.requested
+                                                   -> IPC -> CLI / TUI
+                                                   <- permission.respond
+                                                   -> durable permission.resolved
+            <- observation <- execute / bounded retry <- pending Promise
+```
+
+CoreApp 创建 daemon 共享 PermissionManager，AgentRunner 注入每轮 ToolInvoker。挂起 Promise
+绑定 Core 生成的审批 ID 与 session/run/tool call。响应连接须附着相同 session 或 run；首个
+有效响应先占位，持久化决定后才放行，重复响应返回 `already_resolved`。前端只有消费决策
+事件才更新 resolved 投影，不从 RPC `accepted` 推导已批准，也不拥有权限策略。
+
+read/task/note 默认允许，write/edit 请求审批；bash 固定危险规则优先于 always 缓存，
+简单白名单允许，其余请求审批。always 在 daemon 内存按 session + 单一风险类别保存，
+不是对某一个文件／命令的授权；复合命令或多风险请求不可缓存，没有持久化策略文件。
+
+审批无超时、不占执行预算。read/write/edit 统一 10 秒，bash 默认／最大 120 秒，可传
+1–120 秒。没有 run 全程超时，provider 仍保留独立请求超时。工具失败作为 observation
+继续模型循环；只有取消、provider 或 Core 基础设施错误结束 run。显式瞬时 runtime_error
+和 rate_limited 最多执行三次，退避 2／4 秒可取消；参数错误、拒绝、超时、非零退出和
+确定性文件错误不重试。
+
+权限 requested/resolved 与工具 retry/terminal 持久化、广播、重放。取消／shutdown 释放
+Promise，不伪造 deny。重启仅补中断终态，不恢复审批 Promise、工具执行或 always 缓存。
+完整契约与安全边界见 [Stage3 权限说明](STAGE3_PERMISSIONS.md)。
 
 ## 会话与上下文
 

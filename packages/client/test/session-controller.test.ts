@@ -9,6 +9,11 @@ import type {
 } from "@minicode/protocol";
 import { type NdjsonRpcConnection, RpcClientError } from "../src/ndjson-rpc-client.ts";
 import { SessionController, type SessionControllerEvent } from "../src/session-controller.ts";
+import {
+  permissionRequest,
+  permissionResolved,
+  runFinished,
+} from "./helpers/permission-fixture.ts";
 
 const sessionId = "550e8400-e29b-41d4-a716-446655440000" as SessionId;
 const turnId = "650e8400-e29b-41d4-a716-446655440000";
@@ -171,6 +176,75 @@ function asConnection(connection: FakeConnection): NdjsonRpcConnection {
 }
 
 describe("SessionController", () => {
+  test("projects replay/live permissions and validates attached response outcomes", async () => {
+    const request = { ...permissionRequest, sessionId, runId };
+    let outcome = "accepted";
+    const base = attachHandler([runningTurn], (connection) => {
+      connection.emit(push(runSubscriptionId, request));
+      connection.emit(push(runSubscriptionId, request));
+    });
+    const connection = new FakeConnection((method, params, current) =>
+      method === "permission.respond" ? { result: { outcome } } : base(method, params, current),
+    );
+    const changes: string[][] = [];
+    const controller = new SessionController({
+      endpoint,
+      connect: async () => asConnection(connection),
+      onEvent: () => {},
+      onPermissions: (entries) => changes.push(entries.map((entry) => entry.status)),
+    });
+    await expect(
+      controller.respondPermission(runId, request.payload.permissionRequestId, "allow_once"),
+    ).rejects.toThrow("no session");
+    await controller.attach(sessionId);
+    expect(controller.permissions).toHaveLength(1);
+    expect(
+      await controller.respondPermission(
+        runId,
+        request.payload.permissionRequestId,
+        "always_allow",
+      ),
+    ).toEqual({ outcome: "accepted" });
+    expect(connection.requests.at(-1)?.params).toEqual({
+      sessionId,
+      runId,
+      permissionRequestId: request.payload.permissionRequestId,
+      decision: "always_allow",
+    });
+    expect(controller.permissions[0]?.status).toBe("pending");
+    outcome = "not_found";
+    expect(
+      await controller.respondPermission(
+        crypto.randomUUID(),
+        request.payload.permissionRequestId,
+        "deny_once",
+      ),
+    ).toEqual({ outcome: "not_found" });
+    expect(controller.permissions[0]?.status).toBe("pending");
+    outcome = "already_resolved";
+    expect(
+      await controller.respondPermission(runId, request.payload.permissionRequestId, "deny_once"),
+    ).toEqual({ outcome: "already_resolved" });
+    expect(controller.permissions[0]?.status).toBe("closed");
+    outcome = "not_found";
+    expect(await controller.respondPermission(runId, crypto.randomUUID(), "deny_once")).toEqual({
+      outcome: "not_found",
+    });
+    connection.emit(push(runSubscriptionId, permissionResolved(request, "allow_once")));
+    await Bun.sleep(0);
+    expect(controller.permissions[0]?.status).toBe("resolved");
+    expect(changes).toContainEqual(["resolved"]);
+    connection.emit(push(runSubscriptionId, runFinished(request)));
+    await Bun.sleep(0);
+    await expect(controller.respondPermission(runId, "bad-id", "deny_once")).rejects.toThrow();
+    outcome = "invalid";
+    await expect(
+      controller.respondPermission(runId, request.payload.permissionRequestId, "allow_once"),
+    ).rejects.toThrow();
+    await controller.dispose();
+    expect(controller.permissions).toEqual([]);
+  });
+
   test("emits history before the complete run replay and deduplicates replayed events", async () => {
     const connection = new FakeConnection(
       attachHandler([runningTurn], (current) => {

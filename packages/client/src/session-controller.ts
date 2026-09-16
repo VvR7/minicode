@@ -6,6 +6,9 @@ import type {
   CoreEndpoint,
   HistoryTurn,
   JsonRpcNotificationEnvelope,
+  PermissionDecision,
+  PermissionRequestId,
+  PermissionRespondResult,
   RunId,
   SessionEvent,
   SessionId,
@@ -26,6 +29,9 @@ import {
   EventUnsubscribeResultSchema,
   isAgentEvent,
   isSessionEvent,
+  PERMISSION_RESPOND_METHOD,
+  PermissionRespondParamsSchema,
+  PermissionRespondResultSchema,
   SESSION_CREATE_METHOD,
   SESSION_GET_HISTORY_METHOD,
   SESSION_LIST_METHOD,
@@ -38,6 +44,7 @@ import {
   SessionSubscribeResultSchema,
 } from "@minicode/protocol";
 import { NdjsonRpcConnection, RpcClientError } from "./ndjson-rpc-client.ts";
+import { type ClientPermission, PermissionState } from "./permission-state.ts";
 
 /** SessionController 对 TUI 输出的唯一、已校验且去重的事件流。 */
 export type SessionControllerEvent =
@@ -78,6 +85,7 @@ export interface SessionControllerOptions {
   readonly onEvent: SessionControllerConsumer;
   readonly connect?: SessionControllerConnector;
   readonly reconnectDelayMs?: number;
+  readonly onPermissions?: (permissions: readonly ClientPermission[]) => void;
 }
 
 interface RunObservation {
@@ -112,6 +120,8 @@ function waitForRetry(ms: number, signal: AbortSignal): Promise<void> {
  * 并在断线后使用两个独立 cursor 恢复订阅。
  */
 export class SessionController {
+  #permissions = new PermissionState();
+  #onPermissions: SessionControllerOptions["onPermissions"];
   readonly #endpoint: CoreEndpoint;
   readonly #consumer: SessionControllerConsumer;
   readonly #connect: SessionControllerConnector;
@@ -139,6 +149,7 @@ export class SessionController {
 
   /** 保存连接配置与单一事件 consumer；实例在 attach/create 前不建立连接。 */
   constructor(options: SessionControllerOptions) {
+    this.#onPermissions = options.onPermissions;
     this.#endpoint = options.endpoint;
     this.#consumer = options.onEvent;
     this.#connect = options.connect ?? ((endpoint) => NdjsonRpcConnection.connect(endpoint));
@@ -236,6 +247,47 @@ export class SessionController {
     return response.result;
   }
 
+  /** 暴露当前 session 的审批投影，供前端显示待处理和已解决请求。 */
+  get permissions(): readonly ClientPermission[] {
+    return this.#permissions.snapshot;
+  }
+
+  /** 已附着 session 才能发送审批；结果不乐观覆盖 durable 决策。 */
+  async respondPermission(
+    runId: RunId,
+    id: PermissionRequestId,
+    decision: PermissionDecision,
+  ): Promise<PermissionRespondResult> {
+    const sessionId = this.#requiredSessionId();
+    const params = PermissionRespondParamsSchema.parse({
+      sessionId,
+      runId,
+      permissionRequestId: id,
+      decision,
+    });
+    const entry = this.permissions.find(
+      (entry) => entry.request.runId === runId && entry.request.payload.permissionRequestId === id,
+    );
+    if (entry !== undefined && !entry.request.payload.cacheable && decision.startsWith("always_"))
+      throw new Error("always decisions are unavailable for this request");
+    const connection = await this.#waitForConnection();
+    if (this.#session?.sessionId !== sessionId) throw new Error("attached session changed");
+    try {
+      const response = await connection.request(
+        PERMISSION_RESPOND_METHOD,
+        params,
+        PermissionRespondResultSchema,
+      );
+      const result = PermissionRespondResultSchema.parse(response.result);
+      if (result.outcome !== "accepted" && entry !== undefined && this.#permissions.close(id))
+        this.#onPermissions?.(this.permissions);
+      return result;
+    } catch (error) {
+      connection.close();
+      throw error;
+    }
+  }
+
   /** 仅切换当前 controller：释放旧订阅后在同 workspace 创建并附着新 session。 */
   async switchToNewSession(): Promise<SessionSummary> {
     const workspaceRoot = this.#workspaceRoot;
@@ -257,6 +309,7 @@ export class SessionController {
   /** 清理旧连接并重置会话级 reducer source。 */
   async #leaveCurrentSession(): Promise<void> {
     this.#lifecycle.abort();
+    this.#ready.resolve();
     const connection = this.#connection;
     if (connection !== undefined) {
       const subscriptions = [
@@ -284,6 +337,8 @@ export class SessionController {
     this.#watchTask = undefined;
     this.#connection = undefined;
     this.#session = undefined;
+    this.#permissions.clear();
+    this.#onPermissions?.(this.permissions);
     this.#sessionCursor = 0;
     this.#sessionSubscriptionId = undefined;
     this.#runs.clear();
@@ -372,6 +427,7 @@ export class SessionController {
     await this.#drainNotifications();
     await this.#emit({ type: "controller.status", status: "connected" });
     this.#ready.resolve();
+    this.#onPermissions?.(this.permissions);
   }
 
   /** 监听断线并使用已成功消费的 cursor 重建 history/session/run 三个来源。 */
@@ -508,6 +564,7 @@ export class SessionController {
     if (event.sessionId !== this.#session.sessionId || event.runId !== observation.runId) return;
     if (event.sequence <= observation.cursor) return;
     await this.#emit({ type: "run.event", event });
+    if (this.#permissions.apply(event)) this.#onPermissions?.(this.permissions);
     observation.cursor = event.sequence;
     if (event.type === "run.finished") {
       observation.finished = true;
@@ -585,7 +642,13 @@ export class SessionController {
     for (;;) {
       if (this.#lifecycle.signal.aborted) throw new Error("session controller is disposed");
       const connection = this.#connection;
-      if (connection !== undefined && !connection.closed && connection !== previous)
+      if (
+        connection !== undefined &&
+        !connection.closed &&
+        connection !== previous &&
+        !this.#notificationsPaused &&
+        this.#sessionSubscriptionId !== undefined
+      )
         return connection;
       await this.#ready.promise;
     }

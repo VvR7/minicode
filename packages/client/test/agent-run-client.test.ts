@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
 
 import type { AgentEvent, CoreEndpoint, JsonRpcNotificationEnvelope } from "@minicode/protocol";
-import { RpcClientError, type NdjsonRpcConnection } from "../src/ndjson-rpc-client.ts";
 import {
   AgentRunClient,
   type AgentRunClientCallbacks,
   type AgentRunClientResult,
 } from "../src/agent-run-client.ts";
+import { type NdjsonRpcConnection, RpcClientError } from "../src/ndjson-rpc-client.ts";
+import {
+  permissionRequest,
+  permissionResolved,
+  runFinished,
+} from "./helpers/permission-fixture.ts";
 
 const sessionId = "550e8400-e29b-41d4-a716-446655440000";
 const runId = "6ba7b810-9dad-41d1-80b4-00c04fd430c8";
@@ -156,6 +161,125 @@ function collectCallbacks() {
 }
 
 describe("AgentRunClient", () => {
+  for (const outcome of ["accepted", "already_resolved", "not_found"] as const) {
+    test(`permission response ${outcome} respects Core authority`, async () => {
+      const connection = new FakeConnection();
+      connection.requestHandler = (method, params) =>
+        method === "permission.respond" ? { result: { outcome } } : defaultHandler(method, params);
+      const client = new AgentRunClient();
+      await expect(
+        client.respondPermission(permissionRequest.payload.permissionRequestId, "allow_once"),
+      ).rejects.toThrow("not connected");
+      const { callbacks, events } = collectCallbacks();
+      const snapshots: string[][] = [];
+      callbacks.onPermissions = (entries) => snapshots.push(entries.map((entry) => entry.status));
+      const running = client.run(
+        {
+          goal: "x",
+          workspaceRoot: "/w",
+          endpoint,
+          connect: async () => connection as unknown as NdjsonRpcConnection,
+        },
+        callbacks,
+      );
+      await connection.listening;
+      connection.emit(pushNotification(subscriptionId, permissionRequest));
+      connection.emit(pushNotification(subscriptionId, permissionRequest));
+      expect(client.permissions).toHaveLength(1);
+      expect(
+        await client.respondPermission(
+          permissionRequest.payload.permissionRequestId,
+          "always_deny",
+        ),
+      ).toEqual({ outcome });
+      expect(connection.requests.at(-1)).toEqual({
+        method: "permission.respond",
+        params: {
+          sessionId,
+          runId,
+          permissionRequestId: permissionRequest.payload.permissionRequestId,
+          decision: "always_deny",
+        },
+      });
+      expect(client.permissions[0]?.status).toBe(outcome === "accepted" ? "pending" : "closed");
+      connection.emit(
+        pushNotification(subscriptionId, permissionResolved(permissionRequest, "deny_once")),
+      );
+      expect(client.permissions[0]?.status).toBe("resolved");
+      connection.emit(pushNotification(subscriptionId, runFinished()));
+      expect((await running).kind).toBe("finished");
+      expect(events.filter((event) => event.type === "permission.requested")).toHaveLength(1);
+      expect(snapshots).toContainEqual(["resolved"]);
+    });
+  }
+
+  test("failed approval send reconnects and retains pending state without duplicating replay", async () => {
+    const first = new FakeConnection();
+    const second = new FakeConnection();
+    first.requestHandler = (method, params) => {
+      if (method === "permission.respond") throw new Error("lost response");
+      return defaultHandler(method, params);
+    };
+    second.requestHandler = (method, params) =>
+      method === "permission.respond"
+        ? { result: { outcome: "accepted" } }
+        : defaultHandler(method, params);
+    const client = new AgentRunClient();
+    const { callbacks, events } = collectCallbacks();
+    const snapshots: string[][] = [];
+    callbacks.onPermissions = (entries) => snapshots.push(entries.map((entry) => entry.status));
+    const { connect } = connectSequence([first, second]);
+    const running = client.run(
+      { goal: "x", workspaceRoot: "/w", endpoint, connect, reconnectDelayMs: 0 },
+      callbacks,
+    );
+    await first.listening;
+    first.emit(pushNotification(subscriptionId, permissionRequest));
+    await expect(
+      client.respondPermission(permissionRequest.payload.permissionRequestId, "allow_once"),
+    ).rejects.toThrow("lost response");
+    await second.listening;
+    second.emit(pushNotification(subscriptionId, permissionRequest));
+    expect(events.filter((event) => event.type === "permission.requested")).toHaveLength(1);
+    expect(snapshots.filter((snapshot) => snapshot[0] === "pending")).toHaveLength(2);
+    expect(second.requests[0]?.params).toMatchObject({ afterSequence: 1 });
+    expect(
+      await client.respondPermission(permissionRequest.payload.permissionRequestId, "allow_once"),
+    ).toEqual({ outcome: "accepted" });
+    second.emit(pushNotification(subscriptionId, runFinished()));
+    await running;
+    expect(client.permissions[0]?.status).toBe("closed");
+  });
+
+  test("invalid approval parameters/responses never appear as accepted", async () => {
+    const connection = new FakeConnection();
+    connection.requestHandler = (method, params) =>
+      method === "permission.respond"
+        ? { result: { outcome: "bogus" } }
+        : defaultHandler(method, params);
+    const client = new AgentRunClient();
+    const running = client.run(
+      {
+        goal: "x",
+        workspaceRoot: "/w",
+        endpoint,
+        connect: async () => connection as unknown as NdjsonRpcConnection,
+      },
+      collectCallbacks().callbacks,
+    );
+    await connection.listening;
+    await expect(client.respondPermission("invalid-id", "allow_once")).rejects.toThrow();
+    expect(connection.requests).toHaveLength(1);
+    connection.emit(pushNotification(subscriptionId, permissionRequest));
+    await expect(
+      client.respondPermission(permissionRequest.payload.permissionRequestId, "deny_once"),
+    ).rejects.toThrow();
+    expect(client.permissions[0]?.status).toBe("pending");
+    client.shutdown();
+    await running;
+    expect(client.permissions[0]?.status).toBe("closed");
+  });
+
   test("streams a successful run, dedups by sequence and rejects foreign events", async () => {
     const connection = new FakeConnection();
     connection.requestHandler = defaultHandler;

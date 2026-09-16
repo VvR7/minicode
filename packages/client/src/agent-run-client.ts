@@ -1,6 +1,9 @@
 import type {
   AgentEvent,
   CoreEndpoint,
+  PermissionDecision,
+  PermissionRequestId,
+  PermissionRespondResult,
   RunId,
   SessionId,
   SubscriptionId,
@@ -14,8 +17,12 @@ import {
   EventPushNotificationSchema,
   EventSubscribeResultSchema,
   isAgentEvent,
+  PERMISSION_RESPOND_METHOD,
+  PermissionRespondParamsSchema,
+  PermissionRespondResultSchema,
 } from "@minicode/protocol";
 import { NdjsonRpcConnection, RpcClientError } from "./ndjson-rpc-client.ts";
+import { type ClientPermission, PermissionState } from "./permission-state.ts";
 
 /** 一次 run 的 sessionId/runId 标识，run 建立后不再变化。 */
 interface RunIdentity {
@@ -36,6 +43,8 @@ export interface AgentRunClientCallbacks {
   onEvent(event: AgentEvent): void;
   /** 连接生命周期变化；CLI 可忽略，TUI 据此更新状态栏。 */
   onStatus(status: AgentRunClientStatus): void;
+  /** 审批投影变化或重新附着时通知前端；不能阻塞事件接收。 */
+  onPermissions?(permissions: readonly ClientPermission[]): void;
 }
 
 /**
@@ -116,6 +125,48 @@ export class AgentRunClient {
   #shutdownController = new AbortController();
   #connections = new Set<NdjsonRpcConnection>();
   #closedConnections = new WeakSet<NdjsonRpcConnection>();
+  #permissions = new PermissionState();
+  #attached: { connection: NdjsonRpcConnection; identity: RunIdentity } | undefined;
+  #onPermissions: AgentRunClientCallbacks["onPermissions"];
+
+  /** 当前 run 的审批快照，决策以 Core journal 为准。 */
+  get permissions(): readonly ClientPermission[] {
+    return this.#permissions.snapshot;
+  }
+
+  /** 仅通过已附着的连接响应审批；发送失败关闭旧连接，交由 run 流程重连。 */
+  async respondPermission(
+    id: PermissionRequestId,
+    decision: PermissionDecision,
+  ): Promise<PermissionRespondResult> {
+    const attached = this.#attached;
+    if (attached === undefined || attached.connection.closed)
+      throw new Error("run is not connected");
+    const params = PermissionRespondParamsSchema.parse({
+      ...attached.identity,
+      permissionRequestId: id,
+      decision,
+    });
+    const entry = this.permissions.find(
+      (entry) => entry.request.payload.permissionRequestId === id,
+    );
+    if (entry !== undefined && !entry.request.payload.cacheable && decision.startsWith("always_"))
+      throw new Error("always decisions are unavailable for this request");
+    try {
+      const response = await attached.connection.request(
+        PERMISSION_RESPOND_METHOD,
+        params,
+        PermissionRespondResultSchema,
+      );
+      const result = PermissionRespondResultSchema.parse(response.result);
+      if (result.outcome !== "accepted" && this.#permissions.close(id))
+        this.#onPermissions?.(this.permissions);
+      return result;
+    } catch (error) {
+      attached.connection.close();
+      throw error;
+    }
+  }
 
   /**
    * 显式停止客户端：中断连接/重连等待并关闭当前 socket。
@@ -128,6 +179,8 @@ export class AgentRunClient {
     for (const connection of this.#connections) {
       this.#closeConnection(connection);
     }
+    this.#attached = undefined;
+    if (this.#permissions.close()) this.#onPermissions?.(this.permissions);
   }
 
   /** 只关闭一次连接，避免 shutdown 与 run finally 重复释放同一 socket。 */
@@ -155,6 +208,8 @@ export class AgentRunClient {
     const reconnectDelayMs = options.reconnectDelayMs ?? 100;
     const initialConnectAttempts = options.initialConnectAttempts ?? 3;
     const cancelTimeoutMs = options.cancelTimeoutMs ?? 5_000;
+    this.#permissions.clear();
+    this.#onPermissions = callbacks.onPermissions;
 
     let lastSequence = 0;
     let cancelledByUser = false;
@@ -216,6 +271,7 @@ export class AgentRunClient {
         return;
       }
       cancelledByUser = true;
+      if (this.#permissions.close()) callbacks.onPermissions?.(this.permissions);
       cancelDeadline = Date.now() + cancelTimeoutMs;
       userAbortRequested.resolve();
       cancelTimer = setTimeout(() => cancelExpired.resolve(), cancelTimeoutMs);
@@ -266,12 +322,16 @@ export class AgentRunClient {
               return;
             }
             lastSequence = event.sequence;
+            if (this.#permissions.apply(event)) callbacks.onPermissions?.(this.permissions);
             callbacks.onEvent(event);
             if (event.type === "run.finished") {
               finished = true;
               runFinished.resolve();
             }
           });
+          // listener 已注册、精确订阅已建立，重连后再次展示未处理审批。
+          if (runIdentity !== undefined) this.#attached = { connection, identity: runIdentity };
+          callbacks.onPermissions?.(this.permissions);
           await Promise.race([
             runFinished.promise,
             connection.waitUntilClosed(),
@@ -419,6 +479,7 @@ export class AgentRunClient {
             return cancelledByUser ? { kind: "cancelled" } : { kind: "acceptance-uncertain" };
           }
         } finally {
+          this.#attached = undefined;
           this.#closeConnection(connection);
           currentConnection = undefined;
         }
@@ -434,6 +495,9 @@ export class AgentRunClient {
       // 任何未预期的内部错误都不向上抛。
       return { kind: "internal-error" };
     } finally {
+      this.#attached = undefined;
+      if (this.#permissions.close()) callbacks.onPermissions?.(this.permissions);
+      this.#onPermissions = undefined;
       if (cancelTimer !== undefined) {
         clearTimeout(cancelTimer);
       }

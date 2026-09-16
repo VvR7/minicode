@@ -149,6 +149,13 @@ export class IpcSessionBroadcaster {
     return this.#subscriptions.size;
   }
 
+  /** 判断连接是否仍订阅指定 session，不授予其他 session 的审批权。 */
+  isAttached(connection: RpcConnection, sessionId: SessionId): boolean {
+    return [...this.#subscriptions.values()].some(
+      (owned) => owned.connectionId === connection.id && owned.subscription.sessionId === sessionId,
+    );
+  }
+
   /** 首次订阅时监听连接关闭并释放该连接的全部 session 订阅。 */
   #watchConnection(connection: RpcConnection): void {
     if (this.#watchedConnections.has(connection.id)) {

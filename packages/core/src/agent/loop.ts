@@ -336,7 +336,11 @@ export class AgentLoop {
         call.input,
         { workspaceRoot: context.workspaceRoot, signal },
         {
-          permissionSource: "policy",
+          permissionScope: {
+            sessionId: context.sessionId,
+            runId: context.runId,
+            toolCallId: call.id,
+          },
           onRetry: async (retry) => {
             await this.#publish(
               context,

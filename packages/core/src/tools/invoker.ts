@@ -10,16 +10,20 @@ import {
   type ToolRetry,
 } from "./types.ts";
 import type { ToolRegistry } from "./registry.ts";
+import type { PermissionManager } from "../permissions/manager.ts";
+import type { PermissionScope } from "../permissions/policy.ts";
 
 const DEFAULT_RETRY_DELAYS_MS = [2_000, 4_000] as const;
 
 export interface ToolInvokerOptions {
+  readonly permissions?: PermissionManager;
   readonly timeoutMs?: number;
   readonly maxAttempts?: number;
   readonly retryDelaysMs?: readonly number[];
 }
 
 export interface ToolInvocationOptions {
+  readonly permissionScope?: PermissionScope;
   readonly permissionSource?: "policy" | "session_cache" | "user";
   readonly onRetry?: (retry: ToolRetry) => Promise<void> | void;
 }
@@ -131,10 +135,12 @@ export class ToolInvoker {
   readonly #timeoutMs: number;
   readonly #maxAttempts: number;
   readonly #retryDelaysMs: readonly number[];
+  readonly #permissions: PermissionManager | undefined;
 
   /** 保存注册表及统一超时、尝试次数和退避配置。 */
   constructor(registry: ToolRegistry, options: ToolInvokerOptions = {}) {
     this.#registry = registry;
+    this.#permissions = options.permissions;
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
     this.#maxAttempts = Math.min(3, Math.max(1, options.maxAttempts ?? DEFAULT_TOOL_MAX_ATTEMPTS));
     this.#retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
@@ -167,6 +173,39 @@ export class ToolInvoker {
     // 在创建执行 promise 前退出，确保已取消的 run 不会实际调用工具。
     if (context.signal.aborted) {
       return this.#fail(new ToolError("tool_cancelled", "tool call cancelled"), 0, [], duration());
+    }
+
+    let permissionSource = options.permissionSource ?? "policy";
+    if (this.#permissions !== undefined) {
+      if (options.permissionScope === undefined) throw new Error("permission scope required");
+      try {
+        const outcome = await this.#permissions.check(
+          name,
+          parsed.data,
+          options.permissionScope,
+          context.signal,
+        );
+        permissionSource = outcome.source;
+        if (!outcome.allowed)
+          return this.#fail(
+            new ToolError("permission_denied", "tool permission denied"),
+            0,
+            [],
+            duration(),
+            permissionSource,
+          );
+      } catch (error) {
+        if (!(error instanceof ToolError)) throw error;
+        return this.#fail(error, 0, [], duration());
+      }
+      if (context.signal.aborted)
+        return this.#fail(
+          new ToolError("tool_cancelled", "tool call cancelled"),
+          0,
+          [],
+          duration(),
+          permissionSource,
+        );
     }
 
     // 组合外部取消与内部超时，二者必须可区分。
@@ -210,7 +249,7 @@ export class ToolInvoker {
               attempts,
               retries,
               duration(),
-              options.permissionSource ?? "policy",
+              permissionSource,
             );
           }
           if (timedOut) {
@@ -219,19 +258,13 @@ export class ToolInvoker {
               attempts,
               retries,
               duration(),
-              options.permissionSource ?? "policy",
+              permissionSource,
             );
           }
 
           const toolError = toToolError(error);
           if (!canRetry(toolError) || attempt >= this.#maxAttempts) {
-            return this.#fail(
-              toolError,
-              attempts,
-              retries,
-              duration(),
-              options.permissionSource ?? "policy",
-            );
+            return this.#fail(toolError, attempts, retries, duration(), permissionSource);
           }
 
           const delayMs =
@@ -255,7 +288,7 @@ export class ToolInvoker {
               attempts,
               retries,
               duration(),
-              options.permissionSource ?? "policy",
+              permissionSource,
             );
           }
           continue;
@@ -266,7 +299,7 @@ export class ToolInvoker {
           attempts,
           retries,
           durationMs: duration(),
-          permissionSource: options.permissionSource ?? "policy",
+          permissionSource,
         };
       }
       return this.#fail(
@@ -274,7 +307,7 @@ export class ToolInvoker {
         attempts,
         retries,
         duration(),
-        options.permissionSource ?? "policy",
+        permissionSource,
       );
     } finally {
       clearTimeout(timer);

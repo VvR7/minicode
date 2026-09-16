@@ -13,6 +13,8 @@ import {
   EventUnsubscribeHandler,
 } from "./handlers/event-subscription-handlers.ts";
 import { PingHandler } from "./handlers/ping-handler.ts";
+import { PermissionRespondHandler } from "./handlers/permission-respond-handler.ts";
+import { PermissionManager } from "./permissions/manager.ts";
 import {
   SessionCreateHandler,
   SessionGetHandler,
@@ -40,6 +42,7 @@ export class CoreApp {
   #sessionBroadcaster: IpcSessionBroadcaster | undefined;
   #manager: SessionManager | undefined;
   #traces: RunTraceRegistry | undefined;
+  #permissions: PermissionManager | undefined;
   #startedAt = 0;
   #stopping = false;
   #stopPromise: Promise<void> | undefined;
@@ -69,10 +72,12 @@ export class CoreApp {
     });
     const broadcaster = new IpcEventBroadcaster(eventBus, traces);
     const sessionBroadcaster = new IpcSessionBroadcaster(sessionEvents, traces);
+    const permissions = new PermissionManager(eventBus);
     const runner = new AgentRunner({
       environment: this.#environment,
       bus: eventBus,
       homeDirectory: this.#config.homeDirectory,
+      permissions,
     });
     const manager = new SessionManager({
       store: sessionStore,
@@ -87,6 +92,12 @@ export class CoreApp {
     const dispatcher = createRpcDispatcher({
       handlers: [
         new PingHandler({ uptimeMs: () => performance.now() - this.#startedAt }),
+        new PermissionRespondHandler(
+          permissions,
+          (context, params) =>
+            broadcaster.isAttached(context.connection, params.sessionId, params.runId) ||
+            sessionBroadcaster.isAttached(context.connection, params.sessionId),
+        ),
         new EventSubscribeHandler(broadcaster),
         new EventUnsubscribeHandler(broadcaster, sessionBroadcaster),
         new AgentRunHandler({ manager, broadcaster }),
@@ -107,6 +118,7 @@ export class CoreApp {
     this.#sessionBroadcaster = sessionBroadcaster;
     this.#manager = manager;
     this.#traces = traces;
+    this.#permissions = permissions;
 
     this.#logger.info(`mc-core ${MINICODE_VERSION} listening address=${formatEndpoint(endpoint)}`);
     return endpoint;
@@ -141,6 +153,7 @@ export class CoreApp {
     try {
       // 先封闭 admission/发出取消，再排空 RPC 响应闸门，最后才允许强制终态提交。
       manager?.beginShutdown();
+      this.#permissions?.close();
       await server.stop();
       await manager?.shutdown();
 
@@ -150,6 +163,7 @@ export class CoreApp {
       this.#sessionBroadcaster = undefined;
       this.#eventBus = undefined;
       this.#manager = undefined;
+      this.#permissions = undefined;
       await this.#traces?.stopAll();
       this.#traces = undefined;
     } finally {

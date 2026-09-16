@@ -240,7 +240,7 @@ describe("agent.run lifecycle (integration)", () => {
     }
   });
 
-  test("startup marks an incomplete journal as core_restarted", async () => {
+  test("startup marks an incomplete approval journal as core_restarted", async () => {
     const home = await mkdtemp(join(tmpdir(), "minicode-run-"));
     try {
       // 先写一个合法 session 的 accepted history 与未完成 run journal。
@@ -270,6 +270,29 @@ describe("agent.run lifecycle (integration)", () => {
         durable: true,
         type: "run.started",
         payload: {},
+      });
+
+      // 模拟审批挂起期间异常退出：重启只补 run 终态，不重建等待 Promise。
+      await bus.publish({
+        sessionId: session.value.meta.sessionId,
+        runId: RUN_A,
+        timestamp: new Date().toISOString(),
+        durable: true,
+        type: "permission.requested",
+        payload: {
+          permissionRequestId: crypto.randomUUID(),
+          toolCallId: "pending-write",
+          name: "write",
+          riskCategories: ["write"],
+          cacheable: true,
+          summary: {
+            kind: "write",
+            path: "pending.txt",
+            contentBytes: 4,
+            previewStart: "test",
+            previewEnd: "test",
+          },
+        },
       });
 
       const app = makeApp(home);

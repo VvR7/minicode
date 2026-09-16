@@ -29,6 +29,7 @@ import { ToolRegistry } from "../tools/registry.ts";
 import type { Tool } from "../tools/types.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
 import type { RunCompletion } from "./completion.ts";
+import { PermissionManager } from "../permissions/manager.ts";
 
 /** 系统提示词中注入 notes 的固定区块标题。 */
 export const SESSION_NOTES_HEADING = "Session Notes";
@@ -105,6 +106,7 @@ export interface AgentRunRequest {
 }
 
 export interface AgentRunnerOptions {
+  readonly permissions?: PermissionManager;
   readonly environment: Environment;
   readonly bus: EventBus;
   /** CoreConfig.homeDirectory，用于构造 run 目录、tasks.json 与 notes.md 路径。 */
@@ -131,6 +133,7 @@ export class AgentRunner {
   readonly #homeDirectory: string;
   readonly #providerFactory: (config: LlmConfig) => LlmProvider;
   readonly #taskStorage: TaskStorage;
+  readonly #permissions: PermissionManager;
 
   /** 保存 run 组装所需的环境、存储、事件与可注入依赖。 */
   constructor(options: AgentRunnerOptions) {
@@ -139,6 +142,7 @@ export class AgentRunner {
     this.#homeDirectory = options.homeDirectory;
     this.#providerFactory = options.providerFactory ?? ((config) => new AnthropicAdapter(config));
     this.#taskStorage = options.taskStorage ?? nodeTaskStorage;
+    this.#permissions = options.permissions ?? new PermissionManager(options.bus);
   }
 
   /** 执行一次隔离 run；任何组装异常都收敛为包含本轮用户消息的安全终态。 */
@@ -233,7 +237,7 @@ export class AgentRunner {
     }
     registry.register(createNoteSaveTool(noteStore));
 
-    const invoker = new ToolInvoker(registry);
+    const invoker = new ToolInvoker(registry, { permissions: this.#permissions });
     const loop = new AgentLoop(provider, registry, invoker, this.#bus, {
       ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
       ...(request.trace === undefined ? {} : { trace: request.trace }),

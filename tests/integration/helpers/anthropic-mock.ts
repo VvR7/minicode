@@ -12,7 +12,7 @@ export interface MockAnthropicServer {
 }
 
 export interface MockAnthropicOptions {
-  /** 依据 read_file 等工具返回的 observation 内容生成最终回答文本。 */
+  /** 依据 read 等工具返回的 observation 内容生成最终回答文本。 */
   readonly finalText?: (toolResults: readonly string[]) => string;
   /** 每次请求前的延迟毫秒数，用于制造慢速 run。 */
   readonly delayMs?: number;
@@ -72,7 +72,7 @@ function sseResponse(events: readonly unknown[]): Response {
   });
 }
 
-/** 首次调用返回的 read_file(README.md) tool_use 事件序列。 */
+/** 首次调用返回的 read(README.md) tool_use 事件序列。 */
 function toolUseEvents(): unknown[] {
   const input = { path: "README.md" };
   return [
@@ -89,7 +89,7 @@ function toolUseEvents(): unknown[] {
     {
       type: "content_block_start",
       index: 0,
-      content_block: { type: "tool_use", id: "toolu_1", name: "read_file", input: {} },
+      content_block: { type: "tool_use", id: "toolu_1", name: "read", input: {} },
     },
     {
       type: "content_block_delta",
@@ -139,7 +139,7 @@ function finalTextEvents(text: string): unknown[] {
 }
 
 /**
- * 启动 mock Anthropic Messages 服务。首个请求（无 tool_result）返回 read_file 调用，
+ * 启动 mock Anthropic Messages 服务。首个请求（无 tool_result）返回 read 调用，
  * 后续请求（含 tool_result）返回 finalText(toolResults) 作为最终回答。
  */
 export function startAnthropicMock(options: MockAnthropicOptions = {}): MockAnthropicServer {

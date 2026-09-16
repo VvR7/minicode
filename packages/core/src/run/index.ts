@@ -1,7 +1,6 @@
 export {
   AgentRunner,
   buildRunSystemPrompt,
-  DEFAULT_RUN_TIMEOUT_MS,
   runToolSchemas,
   SESSION_NOTES_HEADING,
 } from "./runner.ts";

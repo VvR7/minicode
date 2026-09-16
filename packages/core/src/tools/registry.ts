@@ -9,7 +9,7 @@ export interface LlmToolDescription {
 }
 
 /**
- * 按名称注册只读工具的注册表。重复工具名视为编程错误，注册时即失败。
+ * 按名称注册工具的注册表。重复工具名视为编程错误，注册时即失败。
  */
 export class ToolRegistry {
   readonly #tools = new Map<string, Tool<Record<string, unknown>>>();

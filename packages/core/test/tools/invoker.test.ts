@@ -23,6 +23,7 @@ describe("ToolInvoker parameter handling", () => {
     const result = await invoker.invoke("nope", {}, context());
     expect(result.result.isError).toBe(true);
     expect(result.result.content).toBe("unknown tool: nope");
+    expect(result.result.failure).toEqual({ category: "schema_error", errorCode: "unknown_tool" });
     expect(result.attempts).toBe(0);
   });
 
@@ -62,6 +63,34 @@ describe("ToolInvoker parameter handling", () => {
 });
 
 describe("ToolInvoker retry", () => {
+  test("publishes retry before the next attempt and supports cancellation during backoff", async () => {
+    const order: string[] = [];
+    const controller = new AbortController();
+    const tool: Tool = {
+      name: "flaky",
+      description: "",
+      inputSchema: z.strictObject({}),
+      execute: () => {
+        order.push("execute");
+        throw new ToolError("temporary_io_error", "temporary", { retryable: true });
+      },
+    };
+    const result = await invokerWith(tool, { retryDelaysMs: [1_000] }).invoke(
+      "flaky",
+      {},
+      context(controller.signal),
+      {
+        onRetry: (retry) => {
+          order.push(`retry-${retry.attempt}`);
+          controller.abort();
+        },
+      },
+    );
+    expect(order).toEqual(["execute", "retry-2"]);
+    expect(result.attempts).toBe(1);
+    expect(result.result.failure).toEqual({ category: "cancelled", errorCode: "tool_cancelled" });
+  });
+
   test("retries safe-to-retry errors up to max attempts", async () => {
     let calls = 0;
     const tool: Tool = {
@@ -80,8 +109,48 @@ describe("ToolInvoker retry", () => {
     expect(result.result.isError).toBe(false);
     expect(result.attempts).toBe(2);
     expect(result.retries).toEqual([
-      { attempt: 2, maxAttempts: 2, delayMs: 0, errorCode: "io_error" },
+      {
+        attempt: 2,
+        maxAttempts: 3,
+        delayMs: 0,
+        errorCode: "io_error",
+        failureCategory: "runtime_error",
+      },
     ]);
+  });
+
+  test("retries rate limits but never retries forbidden failure categories", async () => {
+    let rateCalls = 0;
+    const rateLimited: Tool = {
+      name: "rate",
+      description: "",
+      inputSchema: z.strictObject({}),
+      execute: () => {
+        rateCalls += 1;
+        if (rateCalls === 1) throw new ToolError("rate_limited", "slow down");
+        return { content: "ok" };
+      },
+    };
+    const rateResult = await invokerWith(rateLimited, { retryDelaysMs: [0] }).invoke(
+      "rate",
+      {},
+      context(),
+    );
+    expect(rateResult.attempts).toBe(2);
+    expect(rateResult.retries[0]).toMatchObject({ failureCategory: "rate_limited" });
+
+    let deniedCalls = 0;
+    const denied: Tool = {
+      name: "denied",
+      description: "",
+      inputSchema: z.strictObject({}),
+      execute: () => {
+        deniedCalls += 1;
+        throw new ToolError("permission_denied", "denied", { retryable: true });
+      },
+    };
+    await invokerWith(denied, { retryDelaysMs: [0] }).invoke("denied", {}, context());
+    expect(deniedCalls).toBe(1);
   });
 
   test("does not retry non-retryable errors", async () => {
@@ -127,11 +196,24 @@ describe("ToolInvoker retry", () => {
       },
     };
     const result = await invokerWith(tool, { retryDelaysMs: [0] }).invoke("t", {}, context());
-    expect(result.attempts).toBe(2);
+    expect(result.attempts).toBe(3);
     expect(result.result.isError).toBe(true);
     expect(result.result.content).toBe("still broken");
     expect(result.retries).toEqual([
-      { attempt: 2, maxAttempts: 2, delayMs: 0, errorCode: "io_error" },
+      {
+        attempt: 2,
+        maxAttempts: 3,
+        delayMs: 0,
+        errorCode: "io_error",
+        failureCategory: "runtime_error",
+      },
+      {
+        attempt: 3,
+        maxAttempts: 3,
+        delayMs: 0,
+        errorCode: "io_error",
+        failureCategory: "runtime_error",
+      },
     ]);
   });
 });
@@ -147,6 +229,7 @@ describe("ToolInvoker timeout and abort", () => {
     const result = await invokerWith(tool, { timeoutMs: 20 }).invoke("slow", {}, context());
     expect(result.result.isError).toBe(true);
     expect(result.result.content).toBe("tool call timed out");
+    expect(result.result.failure).toEqual({ category: "timeout", errorCode: "tool_timeout" });
   });
 
   test("aborts when the caller cancels", async () => {
@@ -161,7 +244,7 @@ describe("ToolInvoker timeout and abort", () => {
     controller.abort();
     const result = await pending;
     expect(result.result.isError).toBe(true);
-    expect(result.result.content).toBe("tool call aborted");
+    expect(result.result.content).toBe("tool call cancelled");
   });
 
   test("does not execute a tool when the caller is already cancelled", async () => {
@@ -179,7 +262,7 @@ describe("ToolInvoker timeout and abort", () => {
     controller.abort();
     const result = await invokerWith(tool).invoke("t", {}, context(controller.signal));
     expect(calls).toBe(0);
-    expect(result.result.content).toBe("tool call aborted");
+    expect(result.result.content).toBe("tool call cancelled");
   });
 });
 

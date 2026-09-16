@@ -1,6 +1,7 @@
-import { GlobTool } from "./glob.ts";
-import { GrepTool } from "./grep.ts";
-import { ReadFileTool } from "./read-file.ts";
+import { BashTool } from "./bash.ts";
+import { EditTool } from "./edit.ts";
+import { WriteTool } from "./file-write.ts";
+import { ReadTool } from "./read.ts";
 
-/** 静态导入的只读内置工具目录，由 AgentRunner 注册到 ToolRegistry。 */
-export const builtinTools = [new ReadFileTool(), new GlobTool(), new GrepTool()];
+/** 静态导入的四个通用 coding tools，由 AgentRunner 注册到 ToolRegistry。 */
+export const builtinTools = [new ReadTool(), new WriteTool(), new EditTool(), new BashTool()];

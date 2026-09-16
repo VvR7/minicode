@@ -11,15 +11,9 @@ import type { ExecutionContext, FailedReason, RunFinishReason } from "./context.
 
 /** 默认系统提示词；Agent 层负责，provider 不内置默认 prompt。 */
 export const DEFAULT_SYSTEM_PROMPT =
-  "You are a helpful coding agent. Use the provided read-only tools to inspect the workspace, then respond with your final answer in plain text. " +
+  "You are a helpful coding agent. Use the provided tools to inspect and modify the workspace, then respond with your final answer in plain text. " +
   "For complex, multi-step goals that require several tool calls, first create a task plan with task_create and keep it updated with task_update as you start and finish each piece of work. " +
   "Simple questions and single-step reads do not require a plan.";
-
-/**
- * AgentRunner 用该 reason abort 信号表示“整 run 超时”而非用户取消；
- * loop 据此区分 cancelled 与 run_timeout。
- */
-export const RUN_TIMEOUT_REASON = "run-timeout";
 
 /** 协议层 llm.text_delta 的单事件文本上限（字符数），超出时按此分段发布。 */
 const MAX_TEXT_DELTA_CHARS = 16 * 1024;
@@ -129,13 +123,8 @@ export class AgentLoop {
           outcome = await this.#runStep(context, signal);
         } catch (error) {
           if (signal.aborted) {
-            if (signal.reason === RUN_TIMEOUT_REASON) {
-              context.markFailed("run_timeout");
-              outcome = "failed";
-            } else {
-              context.markCancelled();
-              outcome = "cancelled";
-            }
+            context.markCancelled();
+            outcome = "cancelled";
           } else {
             context.markFailed(this.#mapError(error));
             outcome = "failed";
@@ -342,41 +331,62 @@ export class AgentLoop {
         true,
       );
 
-      const invocation = await this.#invoker.invoke(call.name, call.input, {
-        workspaceRoot: context.workspaceRoot,
-        signal,
-      });
-
-      for (const retry of invocation.retries) {
-        await this.#publish(
-          context,
-          {
-            type: "tool.retrying",
-            payload: {
-              toolCallId: call.id,
-              name: call.name,
-              attempt: retry.attempt,
-              maxAttempts: retry.maxAttempts,
-              delayMs: retry.delayMs,
-              errorCode: retry.errorCode,
-            },
+      const invocation = await this.#invoker.invoke(
+        call.name,
+        call.input,
+        { workspaceRoot: context.workspaceRoot, signal },
+        {
+          permissionSource: "policy",
+          onRetry: async (retry) => {
+            await this.#publish(
+              context,
+              {
+                type: "tool.retrying",
+                payload: {
+                  toolCallId: call.id,
+                  name: call.name,
+                  attempt: retry.attempt,
+                  maxAttempts: retry.maxAttempts,
+                  delayMs: retry.delayMs,
+                  failureCategory: retry.failureCategory,
+                  errorCode: retry.errorCode,
+                },
+              },
+              true,
+            );
           },
-          true,
-        );
-      }
+        },
+      );
 
       await this.#publish(
         context,
         {
           type: "tool.finished",
-          payload: {
-            toolCallId: call.id,
-            name: call.name,
-            isError: invocation.result.isError,
-            durationMs: invocation.durationMs,
-            outputBytes: invocation.result.outputBytes,
-            truncated: invocation.result.truncated,
-          },
+          payload: invocation.result.isError
+            ? {
+                toolCallId: call.id,
+                name: call.name,
+                isError: true,
+                durationMs: invocation.durationMs,
+                outputBytes: invocation.result.outputBytes,
+                truncated: invocation.result.truncated,
+                attempts: invocation.attempts,
+                failureCategory: invocation.result.failure?.category ?? "runtime_error",
+                errorCode: invocation.result.failure?.errorCode ?? "io_error",
+                ...(invocation.permissionSource === undefined
+                  ? {}
+                  : { permissionSource: invocation.permissionSource }),
+              }
+            : {
+                toolCallId: call.id,
+                name: call.name,
+                isError: false,
+                durationMs: invocation.durationMs,
+                outputBytes: invocation.result.outputBytes,
+                truncated: invocation.result.truncated,
+                attempts: invocation.attempts,
+                permissionSource: invocation.permissionSource ?? "policy",
+              },
         },
         true,
       );
@@ -437,7 +447,7 @@ export class AgentLoop {
         case "config_error":
           return "config_error";
         case "timeout":
-          return "run_timeout";
+          return "llm_error";
         case "invalid_response":
           return "invalid_llm_response";
         case "aborted":

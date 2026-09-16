@@ -1,7 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { SessionControllerEvent } from "@minicode/client";
-import type { SessionSummary } from "@minicode/protocol";
+import type {
+  PermissionDecision,
+  PermissionRespondResult,
+  SessionSummary,
+} from "@minicode/protocol";
 import { createTestRenderer } from "@opentui/core/testing";
+import {
+  permissionRequest,
+  permissionResolved,
+} from "../../client/test/helpers/permission-fixture.ts";
 import { TuiApp, type TuiSessionController } from "../src/app.ts";
 import type { TuiLaunchMode } from "../src/options.ts";
 
@@ -26,6 +34,9 @@ class FakeController implements TuiSessionController {
   disposeCalls = 0;
   createCalls = 0;
   sessions: SessionSummary[];
+  readonly approvals: { runId: string; id: string; decision: PermissionDecision }[] = [];
+  approvalOutcome: PermissionRespondResult["outcome"] = "accepted";
+  approvalError: string | undefined;
   #consume: (event: SessionControllerEvent) => void;
   constructor(consume: (event: SessionControllerEvent) => void, sessions: SessionSummary[]) {
     this.#consume = consume;
@@ -66,6 +77,16 @@ class FakeController implements TuiSessionController {
   async cancelActiveRun(): Promise<void> {
     this.cancelCalls += 1;
   }
+  /** 记录审批请求，结果仍由后续 journal 决定。 */
+  async respondPermission(
+    runId: string,
+    id: string,
+    decision: PermissionDecision,
+  ): Promise<PermissionRespondResult> {
+    this.approvals.push({ runId, id, decision });
+    if (this.approvalError !== undefined) throw new Error(this.approvalError);
+    return { outcome: this.approvalOutcome };
+  }
   /** 记录资源释放。 */
   async dispose(): Promise<void> {
     this.disposeCalls += 1;
@@ -85,10 +106,11 @@ afterEach(() => {
 async function start(
   mode: TuiLaunchMode = { kind: "new" },
   sessions: SessionSummary[] = [summary],
+  height = 14,
 ) {
   const setup = await createTestRenderer({
     width: 90,
-    height: 14,
+    height,
     exitOnCtrlC: false,
     kittyKeyboard: true,
   });
@@ -550,5 +572,125 @@ describe("TuiApp launch and selector", () => {
     await selected.setup.waitForFrame((frame) => frame.includes("corrupted"));
     selected.setup.mockInput.pressEscape();
     expect(await selected.code).toBe(0);
+  });
+});
+
+describe("TuiApp permission keyboard", () => {
+  for (const [key, decision] of [
+    ["1", "allow_once"],
+    ["2", "always_allow"],
+    ["3", "deny_once"],
+    ["4", "always_deny"],
+  ] as const) {
+    test(`sends ${decision} and waits for the authoritative block`, async () => {
+      const { setup, controller, code } = await start({ kind: "new" }, [summary], 26);
+      controller.emit({
+        type: "run.event",
+        event: { ...permissionRequest, type: "run.started", payload: {}, sequence: 1 },
+      });
+      const request = { ...permissionRequest, sequence: 2 };
+      controller.emit({ type: "run.event", event: request });
+      controller.emit({ type: "run.event", event: request });
+      await setup.waitForFrame((frame) => frame.includes("[PERMISSION]"));
+      setup.mockInput.pressKey(key);
+      await setup.waitFor(() => controller.approvals.length === 1);
+      expect(controller.approvals[0]).toEqual({
+        runId,
+        id: request.payload.permissionRequestId,
+        decision,
+      });
+      setup.mockInput.pressKey(key);
+      expect(controller.approvals).toHaveLength(1);
+      expect(controller.sent).toHaveLength(0);
+      controller.emit({ type: "run.event", event: permissionResolved(request, decision, 3) });
+      controller.emit({
+        type: "turn.committed",
+        sessionId,
+        sessionSequence: 1,
+        turnId,
+        runId,
+        status: "succeeded",
+        reason: "completed",
+      });
+      await setup.waitForFrame((frame) => frame.includes("context --/100k"));
+      await exit(setup);
+      expect(await code).toBe(0);
+    });
+  }
+
+  test("non-cacheable choices are skipped by arrows and disabled shortcuts do nothing", async () => {
+    const { setup, controller, code } = await start({ kind: "new" }, [summary], 26);
+    controller.emit({
+      type: "run.event",
+      event: { ...permissionRequest, payload: { ...permissionRequest.payload, cacheable: false } },
+    });
+    await setup.waitForFrame((frame) => frame.includes("disabled"));
+    setup.mockInput.pressKey("2");
+    setup.mockInput.pressKey("4");
+    expect(controller.approvals).toHaveLength(0);
+    setup.mockInput.pressArrow("down");
+    setup.mockInput.pressEnter();
+    await setup.waitFor(() => controller.approvals.length === 1);
+    expect(controller.approvals[0]?.decision).toBe("deny_once");
+    controller.emit({
+      type: "run.event",
+      event: permissionResolved(permissionRequest, "deny_once"),
+    });
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
+
+  test("send errors remain retryable after reconnect and already-resolved waits for first decision", async () => {
+    const { setup, controller, code } = await start({ kind: "new" }, [summary], 26);
+    controller.approvalError = "send failed";
+    controller.emit({ type: "run.event", event: permissionRequest });
+    await setup.waitForFrame((frame) => frame.includes("[PERMISSION]"));
+    setup.mockInput.pressKey("y");
+    await setup.waitForFrame((frame) => frame.includes("send failed"));
+    controller.emit({ type: "controller.status", status: "reconnecting" });
+    setup.mockInput.pressKey("n");
+    expect(controller.approvals).toHaveLength(1);
+    controller.approvalError = undefined;
+    controller.approvalOutcome = "already_resolved";
+    controller.emit({ type: "controller.status", status: "connected" });
+    controller.emit({ type: "run.event", event: permissionRequest });
+    setup.mockInput.pressKey("n");
+    await setup.waitFor(() => controller.approvals.length === 2);
+    await setup.waitForFrame((frame) => frame.includes("closed"));
+    controller.emit({
+      type: "run.event",
+      event: permissionResolved(permissionRequest, "always_allow"),
+    });
+    await setup.waitForFrame((frame) => frame.includes("Always allow"));
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
+
+  test("Ctrl+C cancels pending approval once while scrolling shortcuts still work", async () => {
+    const { setup, controller, code } = await start({ kind: "new" }, [summary], 26);
+    controller.emit({
+      type: "run.event",
+      event: { ...permissionRequest, type: "run.started", payload: {}, sequence: 1 },
+    });
+    controller.emit({ type: "run.event", event: { ...permissionRequest, sequence: 2 } });
+    await setup.waitForFrame((frame) => frame.includes("[PERMISSION]"));
+    setup.mockInput.pressKey("\u001b[5~");
+    setup.mockInput.pressKey("\u001b[6~");
+    setup.mockInput.pressCtrlC();
+    setup.mockInput.pressCtrlC();
+    await setup.waitFor(() => controller.cancelCalls === 1);
+    setup.mockInput.pressKey("y");
+    expect(controller.approvals).toHaveLength(0);
+    controller.emit({
+      type: "turn.committed",
+      sessionId,
+      sessionSequence: 1,
+      turnId,
+      runId,
+      status: "cancelled",
+      reason: "cancelled",
+    });
+    await exit(setup);
+    expect(await code).toBe(0);
   });
 });

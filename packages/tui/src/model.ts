@@ -1,11 +1,14 @@
+import type { SessionControllerEvent, SessionControllerStatus } from "@minicode/client";
+import { type ClientPermission, PermissionState } from "@minicode/client";
 import type {
   AgentEvent,
   HistoryContent,
   HistoryTurn,
+  PermissionDecision,
   SessionSummary,
   TaskSnapshot,
 } from "@minicode/protocol";
-import type { SessionControllerEvent, SessionControllerStatus } from "@minicode/client";
+import { allowedChoices, formatPermissionBlock } from "./widgets/permission-block.ts";
 
 /** 会话运行阶段；cancelling 表示已发取消请求但尚未收到权威终态。 */
 export type RunState = "idle" | "running" | "cancelling";
@@ -51,6 +54,8 @@ export interface TuiSnapshot {
   readonly model: string | undefined;
   readonly contextUsedTokens: number | undefined;
   readonly contextWindowTokens: number | undefined;
+  readonly permission: ClientPermission | undefined;
+  readonly permissionSelection: PermissionDecision;
 }
 
 export const MAX_LOG_LINES = 1000;
@@ -104,6 +109,11 @@ export class TuiModel {
   #assistantLines = new Map<string, number>();
   #turnLines = new Map<string, number>();
   #taskLines = new Map<string, number>();
+  #permissions = new PermissionState();
+  #permissionLines = new Map<string, number>();
+  #permissionSelection: PermissionDecision = "allow_once";
+  #permissionSending = new Set<string>();
+  #permissionErrors = new Map<string, string>();
 
   /** 测试可注入更小的 transcript 上限。 */
   constructor(
@@ -132,6 +142,8 @@ export class TuiModel {
       model: this.#model,
       contextUsedTokens: this.#contextUsedTokens,
       contextWindowTokens: this.#contextWindowTokens,
+      permission: this.#permissions.snapshot.find((entry) => entry.status === "pending"),
+      permissionSelection: this.#permissionSelection,
     };
   }
 
@@ -151,6 +163,11 @@ export class TuiModel {
     this.#assistantLines.clear();
     this.#turnLines.clear();
     this.#taskLines.clear();
+    this.#permissions.clear();
+    this.#permissionLines.clear();
+    this.#permissionSending.clear();
+    this.#permissionErrors.clear();
+    this.#permissionSelection = "allow_once";
     return removed.length === 0 ? [] : [{ type: "remove", ids: removed }];
   }
   /** 设置本地提示。 */
@@ -162,11 +179,87 @@ export class TuiModel {
     if (this.#run === "running") this.#run = "cancelling";
   }
 
+  /** 同步 controller 的共享投影；重连后保留未决审批，终态不伪造决策。 */
+  syncPermissions(entries: readonly ClientPermission[]): readonly LogMutation[] {
+    const mutations: LogMutation[] = [];
+    for (const entry of entries) {
+      this.#permissions.apply(entry.request);
+      if (entry.resolution !== undefined) this.#permissions.apply(entry.resolution);
+      else if (entry.status === "closed")
+        this.#permissions.close(entry.request.payload.permissionRequestId);
+    }
+    this.#renderPermissions(mutations);
+    return mutations;
+  }
+
+  /** 移动审批焦点，只循环可用选项，不提交请求。 */
+  movePermission(delta: number): readonly LogMutation[] {
+    const permission = this.snapshot().permission;
+    if (permission === undefined) return [];
+    const choices = allowedChoices(permission);
+    this.#permissionSelection =
+      choices[
+        (choices.indexOf(this.#permissionSelection) + delta + choices.length) % choices.length
+      ] ?? "allow_once";
+    const mutations: LogMutation[] = [];
+    this.#renderPermissions(mutations);
+    return mutations;
+  }
+
+  /** 标记正在发送，防止重复按键；只有权威事件才能结束审批。 */
+  beginPermission(decision: PermissionDecision): ClientPermission | undefined {
+    const permission = this.snapshot().permission;
+    if (
+      permission === undefined ||
+      this.#run === "cancelling" ||
+      this.#connection !== "connected" ||
+      !allowedChoices(permission).includes(decision)
+    )
+      return undefined;
+    const id = permission.request.payload.permissionRequestId;
+    if (this.#permissionSending.has(id)) return undefined;
+    this.#permissionSelection = decision;
+    this.#permissionSending.add(id);
+    this.#permissionErrors.delete(id);
+    return permission;
+  }
+
+  /** 发送失败或 Core 判定过期时释放交互；accepted 继续等待 journal。 */
+  finishPermission(id: string, outcome?: string, error?: string): readonly LogMutation[] {
+    if (outcome !== "accepted") this.#permissionSending.delete(id);
+    if (outcome === "already_resolved" || outcome === "not_found") this.#permissions.close(id);
+    if (error !== undefined) this.#permissionErrors.set(id, error);
+    const mutations: LogMutation[] = [];
+    this.#renderPermissions(mutations);
+    return mutations;
+  }
+
+  /** 按审批 identity 更新同一内联块，不随 replay 追加重复行。 */
+  #renderPermissions(mutations: LogMutation[]): void {
+    const active = this.snapshot().permission;
+    if (active !== undefined && !allowedChoices(active).includes(this.#permissionSelection))
+      this.#permissionSelection = "allow_once";
+    for (const entry of this.#permissions.snapshot) {
+      const key = entry.request.payload.permissionRequestId;
+      const text = formatPermissionBlock(
+        entry,
+        this.#permissionSelection,
+        this.#permissionSending.has(key),
+        this.#permissionErrors.get(key),
+      );
+      const id = this.#permissionLines.get(key);
+      if (id === undefined) this.#permissionLines.set(key, this.#append(mutations, "info", text));
+      else this.#replace(mutations, id, "info", text);
+    }
+  }
+
   /** 应用 SessionController 的已校验事件。 */
   apply(event: SessionControllerEvent): readonly LogMutation[] {
     const mutations: LogMutation[] = [];
-    if (event.type === "controller.status") this.#connection = event.status;
-    else if (event.type === "session.attached") {
+    if (event.type === "controller.status") {
+      this.#connection = event.status;
+      if (event.status !== "connected") this.#permissionSending.clear();
+    } else if (event.type === "session.attached") {
       this.#session = event.session;
       this.#readOnly = event.session.mode === "one_shot" || event.session.status === "corrupted";
       this.#run = event.session.status === "running" ? "running" : "idle";
@@ -244,6 +337,7 @@ export class TuiModel {
   #applyRunEvent(event: AgentEvent, mutations: LogMutation[]): void {
     if (event.sequence <= (this.#runSequences.get(event.runId) ?? 0)) return;
     this.#runSequences.set(event.runId, event.sequence);
+    if (this.#permissions.apply(event)) this.#renderPermissions(mutations);
     switch (event.type) {
       case "run.started":
         this.#run = "running";
@@ -354,6 +448,10 @@ export class TuiModel {
     reason: string | undefined,
     mutations: LogMutation[],
   ): void {
+    for (const entry of this.#permissions.snapshot)
+      if (entry.request.runId === runId)
+        this.#permissions.close(entry.request.payload.permissionRequestId);
+    this.#renderPermissions(mutations);
     const symbol = status === "succeeded" ? "✓" : status === "cancelled" ? "⊘" : "✗";
     const text = `[TURN] ${symbol} ${status} ${shortId(runId)}${reason === undefined ? "" : ` (${reason})`}`;
     const id = this.#turnLines.get(runId);

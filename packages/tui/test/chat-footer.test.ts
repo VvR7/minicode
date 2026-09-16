@@ -9,6 +9,8 @@ import {
 
 const snapshot: TuiSnapshot = {
   connection: "connected",
+  permission: undefined,
+  permissionSelection: "allow_once",
   run: "idle",
   session: undefined,
   activeRunId: undefined,

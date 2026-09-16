@@ -1,10 +1,11 @@
-import type { AgentEvent, CoreEndpoint } from "@minicode/protocol";
 import {
   AgentRunClient,
   type AgentRunClientResult,
   type AgentRunConnector,
 } from "@minicode/client";
+import type { AgentEvent, CoreEndpoint } from "@minicode/protocol";
 import { formatEndpoint } from "@minicode/protocol";
+import { ApprovalQueue, type PermissionPrompt, promptPermission } from "./permission-prompt.ts";
 
 /** 把文本写到 stdout / stderr 的输出接口，测试可注入捕获 buffer。 */
 export type GoalOutputSink = (text: string) => void;
@@ -112,7 +113,6 @@ export class GoalEventReducer {
           ],
         };
       case "permission.requested":
-        // 本 Issue 只接入协议事件；CLI 的交互式响应由后续 client/CLI Issue 实现。
         return { stderr: [`permission requested for ${event.payload.name}`] };
       case "permission.resolved":
         return {
@@ -185,6 +185,10 @@ export function exitCodeForResult(
 }
 
 export interface GoalCommandOptions {
+  /** 默认要求 stdin/stderr 都是 TTY；无交互终端时自动 deny_once。 */
+  readonly interactive?: boolean;
+  /** 可注入四选一审批输入；输出始终不进入 assistant stdout。 */
+  readonly permissionPrompt?: PermissionPrompt;
   readonly goal: string;
   readonly workspaceRoot: string;
   readonly endpoint: CoreEndpoint;
@@ -213,6 +217,14 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
   const reducer = new GoalEventReducer();
   let cancelledByUser = false;
   const client = new AgentRunClient();
+  const interactive =
+    options.interactive ?? (process.stdin.isTTY === true && process.stderr.isTTY === true);
+  const approvals = new ApprovalQueue({
+    prompt: interactive ? (options.permissionPrompt ?? promptPermission) : async () => "deny_once",
+    respond: (request, decision) =>
+      client.respondPermission(request.payload.permissionRequestId, decision),
+    write: writeStderr,
+  });
 
   const result = await client.run(
     {
@@ -242,13 +254,17 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
         }
       },
       onStatus: (status) => {
+        approvals.setConnected(status.state === "connected");
         // 用户 Ctrl-C 由共享客户端触发，据此区分用户取消与 core 关停取消。
         if (status.state === "cancelling") {
           cancelledByUser = true;
+          approvals.close();
         }
       },
+      onPermissions: (permissions) => approvals.update(permissions),
     },
   );
+  approvals.close();
 
   // 只在共享客户端无法自行给出更具体退出码的生命周期错误上补充 stderr 说明。
   if (result.kind === "connect-failed") {

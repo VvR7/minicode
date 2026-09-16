@@ -1,25 +1,28 @@
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import {
-  BoxRenderable,
-  TextareaRenderable,
-  TextRenderable,
-  createCliRenderer,
-  type CliRenderer,
-  type KeyEvent,
-} from "@opentui/core";
-import {
+  type ClientPermission,
   SessionController,
   type SessionControllerConnector,
   type SessionControllerEvent,
 } from "@minicode/client";
 import {
+  type CoreEndpoint,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   MAX_SESSION_MESSAGE_CHARS,
-  type CoreEndpoint,
+  type PermissionDecision,
+  type PermissionRespondResult,
   type SessionListResult,
   type SessionSummary,
 } from "@minicode/protocol";
-import { resolve } from "node:path";
-import { realpathSync } from "node:fs";
+import {
+  BoxRenderable,
+  type CliRenderer,
+  createCliRenderer,
+  type KeyEvent,
+  TextareaRenderable,
+  TextRenderable,
+} from "@opentui/core";
 
 import { TuiModel } from "./model.ts";
 import type { TuiLaunchMode } from "./options.ts";
@@ -28,13 +31,14 @@ import {
   createSelectorState,
   formatSelector,
   reduceSelector,
+  type SelectorState,
   setSelectorSessions,
   sortSessions,
-  type SelectorState,
 } from "./selector.ts";
+import { formatContext, formatModel, formatRuntime } from "./widgets/chat-footer.ts";
 import { EventLog } from "./widgets/event-log.ts";
 import { formatChatHelp, SELECTOR_HELP } from "./widgets/help-bar.ts";
-import { formatContext, formatModel, formatRuntime } from "./widgets/chat-footer.ts";
+import { PERMISSION_CHOICES } from "./widgets/permission-block.ts";
 
 /** 渲染器工厂：真实终端走 createCliRenderer，测试可注入 headless renderer。 */
 export type RendererFactory = () => Promise<CliRenderer>;
@@ -51,6 +55,11 @@ export interface TuiSessionController {
   }): Promise<SessionListResult>;
   sendMessage(content: string): Promise<unknown>;
   cancelActiveRun(): Promise<unknown>;
+  respondPermission(
+    runId: string,
+    permissionRequestId: string,
+    decision: PermissionDecision,
+  ): Promise<PermissionRespondResult>;
   dispose(): Promise<void>;
 }
 
@@ -68,6 +77,7 @@ export interface TuiAppOptions {
   /** 测试注入 controller；consumer 必须接收全部服务端事件。 */
   readonly createController?: (
     consumer: (event: SessionControllerEvent) => void,
+    onPermissions: (permissions: readonly ClientPermission[]) => void,
   ) => TuiSessionController;
 }
 
@@ -116,6 +126,7 @@ export class TuiApp {
     let screen: "chat" | "selector" = options.mode.kind === "sessions" ? "selector" : "chat";
     let selector: SelectorState = createSelectorState();
     let operationPending = false;
+    let closing = false;
     let exitCode = 0;
     let resolveQuit: (() => void) | undefined;
     const quit = new Promise<void>((resolveQuitPromise) => {
@@ -230,6 +241,7 @@ export class TuiApp {
 
     /** 根据屏幕和模型状态刷新状态、帮助、计数与输入可见性。 */
     const updateChrome = (): void => {
+      if (closing) return;
       const snapshot = model.snapshot();
       const length = input.plainText.length;
       const remaining = MAX_SESSION_MESSAGE_CHARS - length;
@@ -256,14 +268,22 @@ export class TuiApp {
 
     /** 唯一 controller consumer：同步归约后增量刷新视图。 */
     const consume = (event: SessionControllerEvent): void => {
+      if (closing) return;
       log.apply(model.apply(event));
       updateChrome();
     };
+    /** 接收共享审批投影，补充 RPC 过期及重连后的 UI 状态。 */
+    const consumePermissions = (entries: readonly ClientPermission[]): void => {
+      if (closing) return;
+      log.apply(model.syncPermissions(entries));
+      updateChrome();
+    };
     controller =
-      options.createController?.(consume) ??
+      options.createController?.(consume, consumePermissions) ??
       new SessionController({
         endpoint: options.endpoint,
         onEvent: consume,
+        onPermissions: consumePermissions,
         ...(options.connect === undefined ? {} : { connect: options.connect }),
         ...(options.reconnectDelayMs === undefined
           ? {}
@@ -285,6 +305,32 @@ export class TuiApp {
       updateChrome();
       await controller?.attach(session.sessionId);
       updateChrome();
+    };
+
+    /** 发送审批，不阻塞事件消费，也不乐观替换已决块。 */
+    const respondPermission = (decision: PermissionDecision): void => {
+      const permission = model.beginPermission(decision);
+      if (permission === undefined || controller === undefined) return;
+      const id = permission.request.payload.permissionRequestId;
+      log.apply(model.syncPermissions([]));
+      updateChrome();
+      void controller
+        .respondPermission(permission.request.runId, id, decision)
+        .then((result) => {
+          if (!closing) log.apply(model.finishPermission(id, result.outcome));
+        })
+        .catch(
+          (error) =>
+            !closing &&
+            log.apply(
+              model.finishPermission(
+                id,
+                undefined,
+                error instanceof Error ? error.message : "approval failed",
+              ),
+            ),
+        )
+        .finally(updateChrome);
     };
 
     /** 按当前选择页过滤开关重新分页加载。 */
@@ -473,6 +519,23 @@ export class TuiApp {
       } else if (key.name === "end" && key.ctrl) {
         key.preventDefault();
         log.scrollToBottom();
+      } else if (snapshot.permission !== undefined && snapshot.run !== "cancelling") {
+        key.preventDefault();
+        if (key.ctrl || key.meta || key.option) return;
+        if (key.name === "up" || key.name === "down" || key.name === "tab") {
+          log.apply(
+            model.movePermission(key.name === "up" || (key.name === "tab" && key.shift) ? -1 : 1),
+          );
+          updateChrome();
+        } else if (["return", "enter", "kpenter"].includes(key.name))
+          respondPermission(snapshot.permissionSelection);
+        else {
+          const index = (
+            { "1": 0, y: 0, "2": 1, a: 1, "3": 2, n: 2, "4": 3, d: 3 } as Record<string, number>
+          )[key.name];
+          const decision = index === undefined ? undefined : PERMISSION_CHOICES[index];
+          if (decision !== undefined) respondPermission(decision);
+        }
       } else if (
         snapshot.run !== "idle" &&
         (key.name === "return" || key.name === "enter" || key.name === "kpenter")
@@ -531,6 +594,7 @@ export class TuiApp {
       await quit;
       return exitCode;
     } finally {
+      closing = true;
       renderer.keyInput.off("keypress", onKeyPress);
       try {
         await controller.dispose();

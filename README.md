@@ -11,7 +11,7 @@ TUI 前端、类型化 IPC、事件流、工具与权限系统、任务规划、
 Stage3 的 Core 权限层已接入：`write`／`edit` 及非白名单 `bash` 会挂起等待
 `permission.respond`。`mc --goal` 在交互终端支持允许／拒绝一次及 session 内 always 决策；
 没有交互 TTY 时自动拒绝一次。审批与进度写 stderr，assistant 输出仍写 stdout。
-TUI 审批界面尚待后续开发，当前 TUI 遇到审批时可以取消 run。
+TUI 在 transcript 内展示审批摘要，支持方向键／Tab 加 Enter，以及 1–4 快捷键；Ctrl-C 仍可取消 run。
 详细行为见 [Core 工具权限生命周期](STAGE3_PERMISSIONS.md)。
 
 ## 环境要求

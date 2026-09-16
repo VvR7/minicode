@@ -40,6 +40,15 @@ session/连接状态、上下文占用和当前模型。Assistant 内容按 Mark
 运行中输入被冻结，直到 Core 发布权威终态。用户消息只有在 Core 返回 accepted 后才进入
 transcript。普通 `q` 是输入字符。
 
+## 权限审批
+
+`PERMISSION` 内联块显示工具、风险类别和有界参数摘要。`↑/↓` 或 Tab 选择，Enter 提交；
+`1/y` 允许一次、`2/a` 始终允许、`3/n` 拒绝一次、`4/d` 始终拒绝。
+Always 仅作用于本 session 的同类风险；复合风险会禁用这两个选项。
+提交后等待 Core 的权威决策，不提前收起审批。其他窗口先作出的决定也会同步显示。
+断线时暂停响应，重连恢复未决审批；发送失败展示错误，不自动重发。Ctrl-C 仍可取消
+运行，PgUp/PgDn 仍可查看摘要和 transcript。
+
 ## 上下文与标记
 
 左下角 `context used/limit percent` 表示最近一次模型调用结束后的实际上下文占用，其中 used

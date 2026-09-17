@@ -1,5 +1,7 @@
 import { dirname, join } from "node:path";
 import type { Environment, RunId, SessionId, TaskGraphSnapshot } from "@minicode/protocol";
+import { composeSystemPrompt } from "../agent/system-prompt.ts";
+import { loadContextFiles, type ContextFiles } from "../memory/context-loader.ts";
 import { ExecutionContext } from "../agent/context.ts";
 import { AgentLoop, DEFAULT_SYSTEM_PROMPT } from "../agent/loop.ts";
 import type { EventBus } from "../events/event-bus.ts";
@@ -36,10 +38,11 @@ export const SESSION_NOTES_HEADING = "Session Notes";
 const LLM_MODEL_ENV_KEY = "LLM_MODEL";
 
 /** 把本轮开始前读取的 notes 快照追加到基础 system prompt。 */
-export function buildRunSystemPrompt(notes: string): string {
-  return notes.length === 0
-    ? DEFAULT_SYSTEM_PROMPT
-    : `${DEFAULT_SYSTEM_PROMPT}\n\n${SESSION_NOTES_HEADING}:\n${notes}`;
+export function buildRunSystemPrompt(
+  notes: string,
+  files: ContextFiles = { global: "", project: "" },
+): string {
+  return composeSystemPrompt(DEFAULT_SYSTEM_PROMPT, files, notes);
 }
 
 /**
@@ -237,9 +240,18 @@ export class AgentRunner {
     }
     registry.register(createNoteSaveTool(noteStore));
 
+    // 编排层传入的完整快照直接复用；直接调用 Runner 时也加载同样的两处规则。
+    const systemPrompt =
+      request.systemPrompt ??
+      buildRunSystemPrompt(
+        (await nodeSessionStorage.readFile(
+          join(this.#homeDirectory, "sessions", request.sessionId, "notes.md"),
+        )) ?? "",
+        await loadContextFiles(this.#homeDirectory, request.workspaceRoot),
+      );
     const invoker = new ToolInvoker(registry, { permissions: this.#permissions });
     const loop = new AgentLoop(provider, registry, invoker, this.#bus, {
-      ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
+      systemPrompt,
       ...(request.trace === undefined ? {} : { trace: request.trace }),
       contextWindowTokens: contextBudgetConfig.value.contextWindowTokens,
     });

@@ -1,3 +1,4 @@
+import { AnthropicAdapter } from "../../src/llm/anthropic-adapter.ts";
 import { describe, expect, test } from "bun:test";
 import {
   Compactor,
@@ -181,6 +182,27 @@ describe("compaction generation", () => {
     expect(result?.checkpoint.summary).toContain("latest intent");
     expect(result?.entries[0]?.metadata?.kind).toBe("fallback");
   });
+  test("real adapter HTTP overflow triggers fallback without repeating the summary", async () => {
+    let calls = 0;
+    const provider = new AnthropicAdapter(
+      { apiKey: "test", baseUrl: "https://example.test", model: "test" },
+      async () => {
+        calls += 1;
+        return new Response(
+          JSON.stringify({
+            error: { type: "invalid_request_error", message: "prompt is too long" },
+          }),
+          { status: 400 },
+        );
+      },
+    );
+    const result = await new Compactor(provider, config, 500).compact(
+      options([entry("old", "old", "user", RUN_B), entry("u", "recent".repeat(100))]),
+    );
+    expect(result?.checkpoint.kind).toBe("fallback");
+    expect(calls).toBe(1);
+  });
+
   test("cancelled summaries are neither retried nor committed", async () => {
     const provider = new FakeProvider([{ error: new LlmError("aborted", "cancelled") }]);
     await expect(

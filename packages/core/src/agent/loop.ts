@@ -1,4 +1,4 @@
-import type { AgentEvent } from "@minicode/protocol";
+import type { AgentEvent, CompactionReason } from "@minicode/protocol";
 import { LlmError } from "../llm/errors.ts";
 import type { LlmProvider } from "../llm/provider.ts";
 import type { LlmContentPart, LlmResponse, LlmStreamEvent } from "../llm/types.ts";
@@ -8,6 +8,16 @@ import type { ToolInvoker } from "../tools/invoker.ts";
 import type { RunCompletion } from "../run/completion.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
 import type { ExecutionContext, FailedReason, RunFinishReason } from "./context.ts";
+
+import type { ContextEntry } from "../compact/types.ts";
+import type { CompactionConfig } from "../session/compaction-config.ts";
+
+export type ContextCompactionHook = (
+  entries: readonly ContextEntry[],
+  tokensBefore: number,
+  reason: CompactionReason,
+  signal: AbortSignal,
+) => Promise<readonly ContextEntry[] | undefined>;
 
 /** 默认系统提示词；Agent 层负责，provider 不内置默认 prompt。 */
 export const DEFAULT_SYSTEM_PROMPT =
@@ -38,6 +48,8 @@ export interface AgentLoopOptions {
   readonly trace?: TraceRecorder;
   /** Core 采用的模型上下文窗口，用于向前端发布当前占用比例。 */
   readonly contextWindowTokens?: number;
+  readonly compactionConfig?: CompactionConfig;
+  readonly compact?: ContextCompactionHook;
 }
 
 /** EventBus 发布失败（如 event_store_error）时抛出，由 run 映射为结构化失败。 */
@@ -76,6 +88,8 @@ export class AgentLoop {
   readonly #maxAttempts: number | undefined;
   readonly #trace: TraceRecorder | undefined;
   readonly #contextWindowTokens: number | undefined;
+  readonly #compactionConfig: CompactionConfig | undefined;
+  readonly #compact: ContextCompactionHook | undefined;
 
   constructor(
     provider: LlmProvider,
@@ -93,6 +107,8 @@ export class AgentLoop {
     this.#maxAttempts = options.maxAttempts;
     this.#trace = options.trace;
     this.#contextWindowTokens = options.contextWindowTokens;
+    this.#compactionConfig = options.compactionConfig;
+    this.#compact = options.compact;
   }
 
   /** 执行直到终止；同一 signal 贯穿 LLM 与工具调用。返回结构化 RunCompletion，不发布 run.finished。 */
@@ -127,6 +143,8 @@ export class AgentLoop {
             outcome = "cancelled";
           } else {
             context.markFailed(this.#mapError(error));
+            if (error instanceof LlmError && error.code === "context_limit_exceeded")
+              context.failureCode = error.code;
             outcome = "failed";
           }
         }
@@ -165,7 +183,30 @@ export class AgentLoop {
       true,
     );
 
-    const response = await this.#consumeStream(context, signal);
+    const config = this.#compactionConfig;
+    if (
+      config?.enabled &&
+      this.#contextWindowTokens !== undefined &&
+      context.contextTokens(this.#systemPrompt, this.#registry.toolSchemas()) >
+        this.#contextWindowTokens - config.reserveTokens
+    ) {
+      await this.#compactContext(context, "threshold", signal);
+    }
+    let response: LlmResponse;
+    try {
+      response = await this.#consumeStream(context, signal);
+    } catch (error) {
+      if (
+        !signal.aborted &&
+        config?.enabled &&
+        error instanceof LlmError &&
+        error.code === "context_limit_exceeded"
+      ) {
+        await this.#compactContext(context, "context_error", signal);
+        // 仅重试本次普通请求，不增加 step，也不重放已经执行的工具。
+        response = await this.#consumeStream(context, signal);
+      } else throw error;
+    }
 
     await this.#publish(
       context,
@@ -190,6 +231,7 @@ export class AgentLoop {
       parts.push({ type: "tool_use", id: call.id, name: call.name, input: call.input });
     }
     context.addAssistantMessage(parts);
+    context.anchorUsage(response.usage);
 
     switch (response.finishReason) {
       case "end_turn":
@@ -211,6 +253,23 @@ export class AgentLoop {
         context.markFailed("invalid_llm_response");
         return "failed";
     }
+  }
+
+  /** 外层持久化成功后才安装新视图；没有可淘汰消息时明确报超限。 */
+  async #compactContext(
+    context: ExecutionContext,
+    reason: CompactionReason,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const entries = await this.#compact?.(
+      context.contextEntries,
+      context.contextTokens(this.#systemPrompt, this.#registry.toolSchemas()),
+      reason,
+      signal,
+    );
+    if (entries === undefined)
+      throw new LlmError("context_limit_exceeded", "no context can be compacted");
+    context.replaceContext(entries);
   }
 
   /** 消费 provider 流，把 text_delta / retrying 事件转换为 IPC 事件，返回 completed 响应。 */
@@ -411,6 +470,7 @@ export class AgentLoop {
       steps: context.step,
       usage: context.usage,
       messages: context.runMessages(),
+      messageIds: context.runMessageIds(),
       model: context.model,
     };
     switch (context.status) {
@@ -423,7 +483,10 @@ export class AgentLoop {
           ...base,
           status: "failed",
           reason: context.reason ?? "internal_error",
-          error: this.#safeError(context.reason ?? "internal_error"),
+          error:
+            context.failureCode === undefined
+              ? this.#safeError(context.reason ?? "internal_error")
+              : { code: context.failureCode, message: "context cannot fit after compaction" },
         };
       case "running":
         // 防御：极端情况下（如 run.started 未发布成功）仍以失败收尾。
@@ -450,6 +513,7 @@ export class AgentLoop {
       switch (error.code) {
         case "config_error":
           return "config_error";
+        case "context_limit_exceeded":
         case "timeout":
           return "llm_error";
         case "invalid_response":

@@ -248,6 +248,8 @@ describe("SessionManager accepted state machine", () => {
       environment: {
         ...ENVIRONMENT,
         LLM_CONTEXT_WINDOW_TOKENS: "100",
+        MINICODE_COMPACTION_RESERVE_TOKENS: "20",
+        MINICODE_COMPACTION_KEEP_RECENT_TOKENS: "20",
         LLM_MAX_OUTPUT_TOKENS: "10",
       },
       estimator: () => 100,
@@ -1091,5 +1093,157 @@ describe("SessionManager restart reconciliation", () => {
     expect(unwrapResult(await conflictManager.get(conflictSession.meta.sessionId)).status).toBe(
       "corrupted",
     );
+  });
+});
+
+/** 准备一轮可压缩原文与当前模型摘要服务，验证会话编排和 journal 的真实组合。 */
+async function compactionHarness(summaryError = false, block?: Promise<void>) {
+  const { Compactor } = await import("../../src/compact/compactor.ts");
+  const { FakeProvider, textResponse } = await import("../agent/test-helpers.ts");
+  const { LlmError } = await import("../../src/llm/errors.ts");
+  const provider = new FakeProvider(
+    summaryError
+      ? [{ error: new LlmError("context_limit_exceeded", "summary overflow") }]
+      : [{ response: textResponse("checkpoint") }],
+  );
+  const environment = {
+    ...ENVIRONMENT,
+    MINICODE_COMPACTION_KEEP_RECENT_TOKENS: "100",
+    MINICODE_COMPACTION_ENABLED: "false",
+  };
+  const stub = new StubRunner(async (request) => ({
+    completion: {
+      status: "succeeded",
+      reason: "completed",
+      finalText: "answer",
+      steps: 1,
+      usage: EMPTY_USAGE,
+      model: "test-model",
+      messages: [
+        { role: "user", content: [{ type: "text", text: request.goal }] },
+        { role: "assistant", content: [{ type: "text", text: "answer".repeat(100) }] },
+      ],
+    },
+  }));
+  const compactor = new Compactor(
+    provider,
+    { enabled: false, reserveTokens: 16384, keepRecentTokens: 100 },
+    4096,
+  );
+  const started = Promise.withResolvers<void>();
+  const runner: SessionRunExecutor = {
+    run: stub.run.bind(stub),
+    async compact(options) {
+      started.resolve();
+      await block;
+      return compactor.compact(options);
+    },
+  };
+  const h = createHarness(runner, { environment, newId: () => crypto.randomUUID() });
+  await h.manager.ready();
+  const created = await h.manager.create("/workspace");
+  if (!created.ok) throw new Error("create failed");
+  const sessionId = created.value.sessionId;
+  const prepared = await h.manager.prepareMessage({
+    sessionId,
+    clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+    content: "original intention ".repeat(1000),
+  });
+  if (!prepared.ok) throw new Error("prepare failed");
+  prepared.value.activate();
+  await waitFor(() => h.manager.activeCount === 0);
+  return { ...h, sessionId, provider, started };
+}
+
+describe("SessionManager compaction lifecycle", () => {
+  test("manual focus works with automatic compaction disabled, preserves audit and durable events", async () => {
+    const h = await compactionHarness();
+    const result = await h.manager.compact(h.sessionId, "focus on intent");
+    expect(result.ok && result.value.status).toBe("compacted");
+    expect(JSON.stringify(h.provider.calls)).toContain("focus on intent");
+    const loaded = await h.store.load(h.sessionId);
+    if (!loaded.ok) throw new Error("load failed");
+    expect(loaded.value.turns[0]?.messages[0]?.content[0]).toEqual({
+      type: "text",
+      text: "original intention ".repeat(1000),
+    });
+    expect(loaded.value.compactions).toHaveLength(1);
+    expect(loaded.value.sessionEvents.slice(-2).map((event) => event.type)).toEqual([
+      "session.compaction_started",
+      "session.compaction_finished",
+    ]);
+    expect(loaded.value.compactions[0]?.checkpoint.tokensAfter).toBeGreaterThan(100);
+    await h.manager.shutdown();
+  });
+
+  test("manual compaction excludes concurrent messages and other compactions", async () => {
+    const gate = Promise.withResolvers<void>();
+    const h = await compactionHarness(false, gate.promise);
+    const compacting = h.manager.compact(h.sessionId);
+    await h.started.promise;
+    const message = await h.manager.prepareMessage({
+      sessionId: h.sessionId,
+      clientMessageId: CLIENT_MESSAGE_B as ClientMessageId,
+      content: "next",
+    });
+    expect(!message.ok && message.error.code).toBe("session_busy");
+    const second = await h.manager.compact(h.sessionId);
+    expect(!second.ok && second.error.code).toBe("session_busy");
+    gate.resolve();
+    expect((await compacting).ok).toBe(true);
+    await h.manager.shutdown();
+  });
+
+  test("summary overflow persists the explicit fallback", async () => {
+    const h = await compactionHarness(true);
+    const result = await h.manager.compact(h.sessionId);
+    expect(result.ok && result.value.result?.kind).toBe("fallback");
+    const loaded = await h.store.load(h.sessionId);
+    expect(loaded.ok && loaded.value.compactions[0]?.checkpoint.kind).toBe("fallback");
+    await h.manager.shutdown();
+  });
+
+  test("checkpoint write failure emits failed and preserves the previous model context", async () => {
+    const h = await compactionHarness();
+    const originalAppend = h.storage.appendLine.bind(h.storage);
+    h.storage.appendLine = async (path, line) => {
+      if (line.includes('"kind":"context.compacted"')) throw new Error("checkpoint unavailable");
+      await originalAppend(path, line);
+    };
+    const result = await h.manager.compact(h.sessionId);
+    expect(result.ok).toBe(false);
+    const loaded = await h.store.load(h.sessionId);
+    if (!loaded.ok) throw new Error("load failed");
+    expect(loaded.value.compactions).toHaveLength(0);
+    expect(loaded.value.sessionEvents.at(-1)?.type).toBe("session.compaction_failed");
+    await h.manager.shutdown();
+  });
+
+  test("small history is unchanged and active run rejects manual compression", async () => {
+    const gate = Promise.withResolvers<void>();
+    const stub = new StubRunner(async (request) => {
+      await gate.promise;
+      return completionFor(request);
+    });
+    const h = createHarness(stub);
+    await h.manager.ready();
+    const created = await h.manager.create("/workspace");
+    if (!created.ok) throw new Error("create failed");
+    expect(await h.manager.compact(created.value.sessionId)).toEqual({
+      ok: true,
+      value: { sessionId: created.value.sessionId, status: "unchanged" },
+    });
+    const prepared = await h.manager.prepareMessage({
+      sessionId: created.value.sessionId,
+      clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+      content: "new request",
+    });
+    if (!prepared.ok) throw new Error("prepare failed");
+    prepared.value.activate();
+    const result = await h.manager.compact(created.value.sessionId);
+    expect(!result.ok && result.error.code).toBe("session_busy");
+    gate.resolve();
+    await waitFor(() => h.manager.activeCount === 0);
+    await h.manager.shutdown();
   });
 });

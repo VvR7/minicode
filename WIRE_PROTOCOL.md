@@ -64,7 +64,8 @@
 - Durable session.compaction_started/finished/failed events share the session sequence domain.
 - Context message metadata is optional for old history; summary and fallback kinds identify
   compaction messages. Provider messages exclude this metadata.
-- These contracts are additive; execution and persistence are delivered by the Stage4 Core issues.
+- Core implements persisted incremental checkpoints, automatic threshold/context-error compaction,
+  and idle manual compaction. TUI exposes `/compact [focus]`; CLI reports automatic progress on stderr.
 
 ## Sessions
 

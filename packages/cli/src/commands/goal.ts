@@ -253,6 +253,15 @@ export async function runGoalCommand(options: GoalCommandOptions): Promise<numbe
           writeStderr(`${line}\n`);
         }
       },
+      onCompaction: (event) => {
+        if (event.type === "session.compaction_started") writeStderr("[context] compacting...\n");
+        else if (event.type === "session.compaction_finished") {
+          const result = event.payload.result;
+          writeStderr(
+            `[context] ${result.tokensBefore} → ${result.tokensAfter} tokens${result.kind === "fallback" ? "; earlier dialogue hidden without summary" : "; compacted"}\n`,
+          );
+        } else writeStderr(`[context] ${event.payload.message}\n`);
+      },
       onStatus: (status) => {
         approvals.setConnected(status.state === "connected");
         // 用户 Ctrl-C 由共享客户端触发，据此区分用户取消与 core 关停取消。

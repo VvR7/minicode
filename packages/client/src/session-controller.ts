@@ -11,6 +11,7 @@ import type {
   PermissionRespondResult,
   RunId,
   SessionEvent,
+  SessionCompactResult,
   SessionId,
   SessionListParams,
   SessionListResult,
@@ -33,6 +34,9 @@ import {
   PermissionRespondParamsSchema,
   PermissionRespondResultSchema,
   SESSION_CREATE_METHOD,
+  SESSION_COMPACT_METHOD,
+  SessionCompactParamsSchema,
+  SessionCompactResultSchema,
   SESSION_GET_HISTORY_METHOD,
   SESSION_LIST_METHOD,
   SESSION_SEND_MESSAGE_METHOD,
@@ -45,6 +49,16 @@ import {
 } from "@minicode/protocol";
 import { NdjsonRpcConnection, RpcClientError } from "./ndjson-rpc-client.ts";
 import { type ClientPermission, PermissionState } from "./permission-state.ts";
+
+export type SessionCompactionEvent = Extract<
+  SessionEvent,
+  {
+    type:
+      | "session.compaction_started"
+      | "session.compaction_finished"
+      | "session.compaction_failed";
+  }
+>;
 
 /** SessionController 对 TUI 输出的唯一、已校验且去重的事件流。 */
 export type SessionControllerEvent =
@@ -61,6 +75,7 @@ export type SessionControllerEvent =
       readonly userMessage: string;
     }
   | { readonly type: "run.event"; readonly event: AgentEvent }
+  | { readonly type: "session.compaction"; readonly event: SessionCompactionEvent }
   | {
       readonly type: "turn.committed";
       readonly sessionId: SessionId;
@@ -233,6 +248,22 @@ export class SessionController {
     }
   }
 
+  /** 在当前会话请求独立压缩；断线不重复发起摘要，后续进度由会话事件恢复。 */
+  async compact(focus?: string): Promise<SessionCompactResult> {
+    const params = SessionCompactParamsSchema.parse({
+      sessionId: this.#requiredSessionId(),
+      ...(focus === undefined ? {} : { focus }),
+    });
+    const connection = await this.#waitForConnection();
+    const response = await connection.request(
+      SESSION_COMPACT_METHOD,
+      params,
+      SessionCompactResultSchema,
+      { timeoutMs: 300000 },
+    );
+    return response.result;
+  }
+
   /** 取消当前权威 active run；没有 active run 时返回 already_finished。 */
   async cancelActiveRun(): Promise<AgentCancelResult> {
     const activeRun = this.#activeRun;
@@ -385,7 +416,8 @@ export class SessionController {
     const history = historyResponse.result;
     const subscribed = await connection.request(
       SESSION_SUBSCRIBE_METHOD,
-      { sessionId, afterSequence: Math.max(this.#sessionCursor, history.throughSessionSequence) },
+      // history 只包含 turn；从已消费 cursor 回放才能恢复独立压缩事件与占用。
+      { sessionId, afterSequence: this.#sessionCursor },
       SessionSubscribeResultSchema,
     );
     this.#session = history.session;
@@ -400,7 +432,6 @@ export class SessionController {
         await this.#commitTurn(pendingCommit);
       }
     }
-    this.#sessionCursor = Math.max(this.#sessionCursor, history.throughSessionSequence);
 
     const runsToObserve = new Map<RunId, ActiveRun>();
     for (const turn of history.turns) {
@@ -584,7 +615,7 @@ export class SessionController {
   async #applySessionEvent(event: SessionEvent): Promise<void> {
     if (this.#session === undefined || event.sessionId !== this.#session.sessionId) return;
     if (event.sessionSequence <= this.#sessionCursor) return;
-    if (event.type === "session.turn_accepted") {
+    if (event.type === "session.turn_accepted" && !this.#committedTurns.has(event.payload.turnId)) {
       this.#activeRun = { turnId: event.payload.turnId, runId: event.payload.runId };
       await this.#observeRun(event.payload.turnId, event.payload.runId);
       if (!this.#knownTurns.has(event.payload.turnId)) {
@@ -607,6 +638,13 @@ export class SessionController {
         return;
       }
       await this.#commitTurn(event);
+    }
+    if (
+      event.type === "session.compaction_started" ||
+      event.type === "session.compaction_finished" ||
+      event.type === "session.compaction_failed"
+    ) {
+      await this.#emit({ type: "session.compaction", event });
     }
     this.#sessionCursor = event.sessionSequence;
   }

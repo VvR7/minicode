@@ -676,3 +676,69 @@ describe("AgentRunClient", () => {
     expect(result.kind).toBe("internal-error");
   });
 });
+
+describe("AgentRunClient session compaction replay", () => {
+  test("uses an independent cursor across reconnect and deduplicates session progress", async () => {
+    const first = new FakeConnection(),
+      second = new FakeConnection();
+    const sessionSubscription = "950e8400-e29b-41d4-a716-446655440002";
+    const compactionId = "950e8400-e29b-41d4-a716-446655440003";
+    const started = {
+      sessionId,
+      sessionSequence: 1,
+      timestamp: "2026-09-17T00:00:00.000Z",
+      durable: true,
+      type: "session.compaction_started",
+      payload: { compactionId, reason: "threshold", tokensBefore: 90000 },
+    };
+    const pushSession = (connection: FakeConnection, pushed: unknown) =>
+      connection.emit({
+        jsonrpc: "2.0",
+        method: "event.push",
+        params: { subscriptionId: sessionSubscription, event: pushed },
+      });
+    first.requestHandler = (method, params) => {
+      if (method === "session.subscribe") {
+        pushSession(first, started);
+        pushSession(first, started);
+        setTimeout(() => first.close(), 0);
+        return { result: { subscriptionId: sessionSubscription, sessionId, latestSequence: 1 } };
+      }
+      return defaultHandler(method, params);
+    };
+    second.requestHandler = (method, params) => {
+      if (method === "session.subscribe") {
+        expect(Reflect.get(params, "afterSequence")).toBe(1);
+        pushSession(second, started);
+        pushSession(second, {
+          ...started,
+          sessionSequence: 2,
+          type: "session.compaction_failed",
+          payload: { compactionId, reason: "threshold", code: "summary_failed", message: "failed" },
+        });
+        second.emit(
+          pushNotification(subscriptionId, { ...runFinished(), sessionId, runId, sequence: 1 }),
+        );
+        return { result: { subscriptionId: sessionSubscription, sessionId, latestSequence: 2 } };
+      }
+      return defaultHandler(method, params);
+    };
+    const sequence = connectSequence([first, second]);
+    const { callbacks } = collectCallbacks();
+    const progress: string[] = [];
+    callbacks.onCompaction = (event) => progress.push(event.type);
+    const result = await new AgentRunClient().run(
+      {
+        goal: "goal",
+        workspaceRoot: "/workspace",
+        endpoint,
+        connect: sequence.connect,
+        reconnectDelayMs: 0,
+      },
+      callbacks,
+    );
+    expect(result.kind).toBe("finished");
+    expect(progress).toEqual(["session.compaction_started", "session.compaction_failed"]);
+    expect(first.listenerCount + second.listenerCount).toBe(0);
+  });
+});

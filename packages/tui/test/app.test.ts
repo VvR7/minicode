@@ -30,6 +30,7 @@ const summary: SessionSummary = {
 /** 可编程 controller，用于只测试 TUI 状态机而不重复测试 IPC。 */
 class FakeController implements TuiSessionController {
   readonly sent: string[] = [];
+  readonly compactFocus: (string | undefined)[] = [];
   cancelCalls = 0;
   disposeCalls = 0;
   createCalls = 0;
@@ -72,6 +73,11 @@ class FakeController implements TuiSessionController {
   /** 记录提交，不生成乐观事件。 */
   async sendMessage(content: string): Promise<void> {
     this.sent.push(content);
+  }
+  /** 记录手动 focus，不生成聊天消息。 */
+  async compact(focus?: string) {
+    this.compactFocus.push(focus);
+    return { sessionId: summary.sessionId, status: "unchanged" as const };
   }
   /** 记录取消次数。 */
   async cancelActiveRun(): Promise<void> {
@@ -690,6 +696,64 @@ describe("TuiApp permission keyboard", () => {
       status: "cancelled",
       reason: "cancelled",
     });
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
+});
+
+describe("TUI manual compaction", () => {
+  test("routes slash focus without creating a user message", async () => {
+    const { setup, controller, code } = await start();
+    await setup.mockInput.typeText("/compact preserve next steps");
+    setup.mockInput.pressEnter();
+    await setup.waitForFrame((frame) => frame.includes("context does not need compaction"));
+    expect(controller.compactFocus).toEqual(["preserve next steps"]);
+    expect(controller.sent).toEqual([]);
+    await exit(setup);
+    expect(await code).toBe(0);
+  });
+
+  test("session progress updates occupancy, shows fallback and blocks submissions", async () => {
+    const { setup, controller, code } = await start();
+    const compactionId = "950e8400-e29b-41d4-a716-446655440008";
+    controller.emit({
+      type: "session.compaction",
+      event: {
+        sessionId,
+        sessionSequence: 1,
+        timestamp: "2026-09-17T00:00:00.000Z",
+        durable: true,
+        type: "session.compaction_started",
+        payload: { compactionId, reason: "manual", tokensBefore: 90000 },
+      },
+    });
+    await setup.waitForFrame((frame) => frame.includes("compacting"));
+    await setup.mockInput.typeText("ignored while busy");
+    setup.mockInput.pressEnter();
+    expect(controller.sent).toEqual([]);
+    controller.emit({
+      type: "session.compaction",
+      event: {
+        sessionId,
+        sessionSequence: 2,
+        timestamp: "2026-09-17T00:00:00.000Z",
+        durable: true,
+        type: "session.compaction_finished",
+        payload: {
+          reason: "manual",
+          result: {
+            compactionId,
+            kind: "fallback",
+            firstKeptMessageId: "kept",
+            tokensBefore: 90000,
+            tokensAfter: 20000,
+          },
+        },
+      },
+    });
+    await setup.waitForFrame(
+      (frame) => frame.includes("context 20k/100k") && frame.includes("hidden without summary"),
+    );
     await exit(setup);
     expect(await code).toBe(0);
   });

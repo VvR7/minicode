@@ -34,5 +34,5 @@ export function formatRuntime(snapshot: TuiSnapshot): string {
       ? "session --------"
       : `session ${shortId(snapshot.session.sessionId)}`;
   const notice = snapshot.notice === undefined ? "" : ` · ${snapshot.notice}`;
-  return `${session} · ${snapshot.connection} · ${snapshot.readOnly ? "read-only" : snapshot.run}${notice}`;
+  return `${session} · ${snapshot.connection} · ${snapshot.readOnly ? "read-only" : snapshot.compacting ? "compacting" : snapshot.run}${notice}`;
 }

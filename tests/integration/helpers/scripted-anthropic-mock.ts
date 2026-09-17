@@ -31,15 +31,21 @@ export interface ScriptedToolCall {
 }
 
 export type ScriptedReply =
-  | { readonly kind: "tools"; readonly calls: readonly ScriptedToolCall[] }
+  | {
+      readonly kind: "tools";
+      readonly calls: readonly ScriptedToolCall[];
+      readonly inputTokens?: number;
+    }
   | {
       readonly kind: "text";
       readonly chunks: readonly string[];
+      /** 可指定真实 usage，用于验证按单次调用占用触发压缩。 */
+      readonly inputTokens?: number;
       /** 在发送完 afterChunks 个 delta 后暂停响应。 */
       readonly barrier?: TestBarrier;
       readonly afterChunks?: number;
     }
-  | { readonly kind: "error"; readonly status?: number };
+  | { readonly kind: "error"; readonly status?: number; readonly message?: string };
 
 export interface ScriptedAnthropicServer {
   readonly url: string;
@@ -56,12 +62,12 @@ function encodeEvent(event: Record<string, unknown>): Uint8Array {
 }
 
 /** 每次 provider 调用的稳定 usage 头。 */
-function messageStart(): Record<string, unknown> {
+function messageStart(inputTokens = 10): Record<string, unknown> {
   return {
     type: "message_start",
     message: {
       usage: {
-        input_tokens: 10,
+        input_tokens: inputTokens,
         cache_read_input_tokens: null,
         cache_creation_input_tokens: null,
       },
@@ -70,8 +76,8 @@ function messageStart(): Record<string, unknown> {
 }
 
 /** 构造包含一个或多个工具调用的完整 SSE 响应。 */
-function toolResponse(calls: readonly ScriptedToolCall[]): Response {
-  const events: Record<string, unknown>[] = [messageStart()];
+function toolResponse(calls: readonly ScriptedToolCall[], inputTokens = 10): Response {
+  const events: Record<string, unknown>[] = [messageStart(inputTokens)];
   calls.forEach((call, index) => {
     events.push({
       type: "content_block_start",
@@ -106,7 +112,7 @@ function textResponse(reply: Extract<ScriptedReply, { kind: "text" }>): Response
   const body = new ReadableStream<Uint8Array>({
     /** 顺序推送 delta，并在指定切点等待 barrier。 */
     async start(controller) {
-      controller.enqueue(encodeEvent(messageStart()));
+      controller.enqueue(encodeEvent(messageStart(reply.inputTokens ?? 10)));
       controller.enqueue(
         encodeEvent({
           type: "content_block_start",
@@ -161,10 +167,12 @@ export function startScriptedAnthropicMock(
       const reply = await handler(body, callCount);
       if (reply.kind === "error")
         return Response.json(
-          { error: { message: "scripted provider failure" } },
+          { error: { message: reply.message ?? "scripted provider failure" } },
           { status: reply.status ?? 500 },
         );
-      return reply.kind === "tools" ? toolResponse(reply.calls) : textResponse(reply);
+      return reply.kind === "tools"
+        ? toolResponse(reply.calls, reply.inputTokens)
+        : textResponse(reply);
     },
   });
   if (server.port === undefined) throw new Error("scripted mock did not bind a port");

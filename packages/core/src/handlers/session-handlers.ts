@@ -1,6 +1,8 @@
 import {
   JsonRpcErrorCode,
   SESSION_CREATE_METHOD,
+  SESSION_COMPACT_METHOD,
+  SessionCompactParamsSchema,
   SESSION_GET_HISTORY_METHOD,
   SESSION_GET_METHOD,
   SESSION_LIST_METHOD,
@@ -71,6 +73,29 @@ function acceptedInvocation(
     afterResponseSent: (sent) =>
       prepared.recordResponseSent(context.connection.id, requestId, sent),
   };
+}
+
+/** session.compact：空闲会话独立压缩，不创建普通 turn。 */
+export class SessionCompactHandler extends RpcMethodHandler {
+  readonly method = SESSION_COMPACT_METHOD;
+  readonly paramsSchema = SessionCompactParamsSchema;
+  readonly #manager: SessionManager;
+
+  /** 保存会话编排依赖。 */
+  constructor(manager: SessionManager) {
+    super();
+    this.#manager = manager;
+  }
+
+  /** 校验 focus 并映射 busy、超窗与摘要失败。 */
+  async invoke(rawParams: unknown): Promise<RpcMethodInvocation> {
+    const params = this.paramsSchema.safeParse(rawParams);
+    if (!params.success) return { kind: "invalid-params" };
+    const result = await this.#manager.compact(params.data.sessionId, params.data.focus);
+    return result.ok
+      ? { kind: "success", result: result.value }
+      : sessionFailureInvocation(result.error);
+  }
 }
 
 /** session.create：创建当前 workspace 的持久 chat session。 */

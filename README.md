@@ -169,3 +169,7 @@ LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run 
 - [Stage3 验证矩阵](STAGE3_TEST_MATRIX.md)
 - [TUI 使用说明](TUI.md)
 - [Wire protocol](WIRE_PROTOCOL.md)
+
+TUI 可在空闲会话输入 `/compact` 或 `/compact 保留下一步任务`，后面的文字作为摘要 focus。
+压缩期间其他窗口也会显示进度并阻止提交；摘要超窗的 fallback 会明确显示早期对话已隐藏且未摘要。
+压缩完成后 footer 更新当前上下文占用，完整原文仍可审计。CLI 自动压缩进度输出到 stderr。

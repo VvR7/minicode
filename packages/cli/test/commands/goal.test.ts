@@ -276,3 +276,104 @@ describe("runGoalCommand", () => {
     expect(cancelRequests).toBe(1);
   });
 });
+
+describe("CLI compaction channel", () => {
+  test("prints compaction progress only on stderr and keeps answer stdout", async () => {
+    const stdout: string[] = [],
+      stderr: string[] = [];
+    const listeners = new Set<
+      (notification: import("@minicode/protocol").JsonRpcNotificationEnvelope) => void
+    >();
+    const runSubscription = "950e8400-e29b-41d4-a716-446655440001";
+    const sessionSubscription = "950e8400-e29b-41d4-a716-446655440002";
+    const compactionId = "950e8400-e29b-41d4-a716-446655440003";
+    const emit = (subscriptionId: string, pushed: unknown) => {
+      for (const listener of listeners)
+        listener({
+          jsonrpc: "2.0",
+          method: "event.push",
+          params: { subscriptionId, event: pushed },
+        });
+    };
+    const connection = {
+      request: async (method: string) => {
+        if (method === "agent.run")
+          return {
+            result: { status: "accepted", sessionId, runId, subscriptionId: runSubscription },
+          };
+        if (method === "session.subscribe") {
+          setTimeout(() => {
+            const base = { sessionId, timestamp: "2026-09-17T00:00:00.000Z", durable: true };
+            emit(sessionSubscription, {
+              ...base,
+              sessionSequence: 1,
+              type: "session.compaction_started",
+              payload: { compactionId, reason: "threshold", tokensBefore: 90000 },
+            });
+            emit(sessionSubscription, {
+              ...base,
+              sessionSequence: 2,
+              type: "session.compaction_finished",
+              payload: {
+                reason: "threshold",
+                result: {
+                  compactionId,
+                  kind: "fallback",
+                  firstKeptMessageId: "kept",
+                  tokensBefore: 90000,
+                  tokensAfter: 20000,
+                },
+              },
+            });
+            emit(runSubscription, event("llm.text_delta", { text: "answer" }, 1));
+            emit(
+              runSubscription,
+              event(
+                "run.finished",
+                {
+                  status: "succeeded",
+                  reason: "completed",
+                  finalText: "answer",
+                  steps: 1,
+                  usage: {
+                    inputTokens: 1,
+                    outputTokens: 1,
+                    cacheReadInputTokens: 0,
+                    cacheCreationInputTokens: 0,
+                  },
+                },
+                2,
+              ),
+            );
+          }, 0);
+          return { result: { subscriptionId: sessionSubscription, sessionId, latestSequence: 2 } };
+        }
+        throw new Error("unexpected method");
+      },
+      onNotification: (
+        listener: (notification: import("@minicode/protocol").JsonRpcNotificationEnvelope) => void,
+      ) => {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+      },
+      waitUntilClosed: () => new Promise<void>(() => {}),
+      close: () => {},
+    } as unknown as NdjsonRpcConnection;
+    expect(
+      await runGoalCommand({
+        goal: "goal",
+        workspaceRoot: "/workspace",
+        endpoint: { host: "127.0.0.1", port: 7437 },
+        connect: async () => connection,
+        stdout: (text) => stdout.push(text),
+        stderr: (text) => stderr.push(text),
+      }),
+    ).toBe(0);
+    expect(stdout.join("")).toBe("answer");
+    expect(stderr.join("")).toContain("[context] compacting...");
+    expect(stderr.join("")).toContain(
+      "90000 → 20000 tokens; earlier dialogue hidden without summary",
+    );
+    expect(listeners.size).toBe(0);
+  });
+});

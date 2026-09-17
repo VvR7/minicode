@@ -1,4 +1,8 @@
-import type { SessionControllerEvent, SessionControllerStatus } from "@minicode/client";
+import type {
+  SessionControllerEvent,
+  SessionControllerStatus,
+  SessionCompactionEvent,
+} from "@minicode/client";
 import { type ClientPermission, PermissionState } from "@minicode/client";
 import type {
   AgentEvent,
@@ -46,6 +50,7 @@ export type LogMutation =
 export interface TuiSnapshot {
   readonly connection: SessionControllerStatus;
   readonly run: RunState;
+  readonly compacting: boolean;
   readonly session: SessionSummary | undefined;
   readonly activeRunId: string | undefined;
   readonly readOnly: boolean;
@@ -91,6 +96,8 @@ function historyBlock(block: HistoryContent): { kind: LogKind; text: string } {
 export class TuiModel {
   #connection: SessionControllerStatus = "connecting";
   #run: RunState = "idle";
+  #compacting = false;
+  #compactionSequence = 0;
   #session: SessionSummary | undefined;
   #activeRunId: string | undefined;
   #readOnly = false;
@@ -134,6 +141,7 @@ export class TuiModel {
     return {
       connection: this.#connection,
       run: this.#run,
+      compacting: this.#compacting,
       session: this.#session,
       activeRunId: this.#activeRunId,
       readOnly: this.#readOnly,
@@ -151,6 +159,8 @@ export class TuiModel {
   reset(readOnly = false): readonly LogMutation[] {
     const removed = this.#lines.map((line) => line.id);
     this.#run = "idle";
+    this.#compacting = false;
+    this.#compactionSequence = 0;
     this.#session = undefined;
     this.#activeRunId = undefined;
     this.#readOnly = readOnly;
@@ -277,8 +287,35 @@ export class TuiModel {
       this.#run = "running";
       this.#activeRunId = event.runId;
     } else if (event.type === "run.event") this.#applyRunEvent(event.event, mutations);
+    else if (event.type === "session.compaction") this.#applyCompaction(event.event, mutations);
     else this.#finishTurn(event.runId, event.status, event.reason, mutations);
     return mutations;
+  }
+
+  /** 会话压缩不产生 assistant delta 或普通 turn；更新进度与 footer 的当前占用。 */
+  #applyCompaction(event: SessionCompactionEvent, mutations: LogMutation[]): void {
+    if (
+      event.sessionId !== this.#session?.sessionId ||
+      event.sessionSequence <= this.#compactionSequence
+    )
+      return;
+    this.#compactionSequence = event.sessionSequence;
+    if (event.type === "session.compaction_started") {
+      this.#compacting = true;
+      this.#append(mutations, "info", "[CONTEXT] compacting...");
+    } else if (event.type === "session.compaction_finished") {
+      this.#compacting = false;
+      const result = event.payload.result;
+      this.#contextUsedTokens = result.tokensAfter;
+      this.#append(
+        mutations,
+        "info",
+        `[CONTEXT] ${result.tokensBefore} → ${result.tokensAfter} tokens${result.kind === "fallback" ? "; earlier dialogue hidden without summary" : "; compacted"}`,
+      );
+    } else {
+      this.#compacting = false;
+      this.#append(mutations, "error", `[CONTEXT] ${event.payload.message}`);
+    }
   }
 
   /** 添加明确的错误行。 */

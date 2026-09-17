@@ -94,7 +94,7 @@ describe("Stage3 builtin tools", () => {
     await writeFile(join(workspace, "large"), "中".repeat(100_000));
     const output = await tool.execute({ path: "large" }, context);
     expect(output.truncated).toBe(true);
-    expect(Buffer.byteLength(output.content)).toBeLessThanOrEqual(256 * 1024);
+    expect(Buffer.byteLength(output.content)).toBeLessThanOrEqual(50 * 1024);
   });
 
   test("edit rejects missing and ambiguous matches, then replaces all", async () => {
@@ -166,11 +166,58 @@ describe("Stage3 builtin tools", () => {
     );
   });
 
-  test("bash truncates merged output at 64 KiB", async () => {
+  test("bash truncates merged output at 50 KiB", async () => {
     const output = await new BashTool().execute({ command: "printf '%070000d' 0" }, context);
     expect(output.truncated).toBe(true);
     expect(output.outputBytes).toBe(70_000);
-    expect(Buffer.byteLength(output.content)).toBe(64 * 1024);
+    expect(Buffer.byteLength(output.content)).toBeLessThanOrEqual(50 * 1024);
+    expect(output.content).toContain("kept tail");
+  });
+
+  test("read reports default line truncation while explicit windows stay exact", async () => {
+    await writeFile(
+      join(workspace, "many-lines"),
+      Array.from({ length: 2001 }, (_, i) => `row-${i}`).join("\n"),
+    );
+    const tool = new ReadTool();
+    const output = await tool.execute({ path: "many-lines" }, context);
+    expect(output.truncated).toBe(true);
+    expect(output.content.startsWith("row-0\n")).toBe(true);
+    expect(output.content).not.toContain("row-2000");
+    expect(output.content.split("\n").length).toBeLessThanOrEqual(2000);
+    expect((await tool.execute({ path: "many-lines", offset: 2001 }, context)).content).toBe(
+      "row-2000",
+    );
+  });
+
+  test("bash retains the final error and exit status after multiple oversized chunks", async () => {
+    try {
+      await new BashTool().execute(
+        {
+          command:
+            "printf 'START'; printf '%070000d' 0; printf '%070000d' 1; printf '最终错误\\n' >&2; exit 7",
+        },
+        context,
+      );
+      throw new Error("expected command failure");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ToolError);
+      if (!(error instanceof ToolError)) throw error;
+      expect(error.output?.content.startsWith("[exit 7]\n")).toBe(true);
+      expect(error.output?.content.endsWith("最终错误")).toBe(true);
+      expect(error.output?.content).not.toContain("START");
+      expect(error.output?.content).not.toContain("�");
+      expect(error.output?.truncated).toBe(true);
+      expect(Buffer.byteLength(error.output?.content ?? "")).toBeLessThanOrEqual(50 * 1024);
+    }
+  });
+
+  test("bash line truncation keeps the last log lines", async () => {
+    const output = await new BashTool().execute({ command: "seq 1 3000" }, context);
+    expect(output.truncated).toBe(true);
+    expect(output.content.endsWith("3000")).toBe(true);
+    expect(output.content.split("\n").length).toBeLessThanOrEqual(2000);
+    expect(output.content).not.toContain("\n1\n");
   });
 
   test("bash honors the model timeout and does not retry", async () => {

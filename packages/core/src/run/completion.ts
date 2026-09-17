@@ -28,6 +28,7 @@ export interface RunCompletion {
   /** 本轮完整 provider-neutral 消息（用户/助手/工具结果），由编排层补齐身份后落盘。 */
   readonly messages: readonly LlmMessage[];
   readonly model: string;
+  readonly messageIds?: readonly string[];
   readonly taskGraph?: TaskGraphSnapshot;
   readonly error?: { readonly code: string; readonly message: string };
 }
@@ -38,9 +39,10 @@ export function toHistoryMessages(
   turnId: TurnId,
   runId: RunId,
   now: () => string = () => new Date().toISOString(),
+  messageIds?: readonly string[],
 ): HistoryMessage[] {
-  return messages.map((message) => ({
-    messageId: crypto.randomUUID(),
+  return messages.map((message, index) => ({
+    messageId: messageIds?.[index] ?? crypto.randomUUID(),
     turnId,
     runId,
     role: message.role,

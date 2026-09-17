@@ -3,7 +3,7 @@ import type { Environment, RunId, SessionId, TaskGraphSnapshot } from "@minicode
 import { composeSystemPrompt } from "../agent/system-prompt.ts";
 import { loadContextFiles, type ContextFiles } from "../memory/context-loader.ts";
 import { ExecutionContext } from "../agent/context.ts";
-import { AgentLoop, DEFAULT_SYSTEM_PROMPT } from "../agent/loop.ts";
+import { AgentLoop, DEFAULT_SYSTEM_PROMPT, type ContextCompactionHook } from "../agent/loop.ts";
 import type { EventBus } from "../events/event-bus.ts";
 import { AnthropicAdapter } from "../llm/anthropic-adapter.ts";
 import { loadLlmConfig } from "../llm/config.ts";
@@ -31,6 +31,8 @@ import { ToolRegistry } from "../tools/registry.ts";
 import type { Tool } from "../tools/types.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
 import type { RunCompletion } from "./completion.ts";
+import { Compactor, type CompactOptions, type ContextEntry } from "../compact/index.ts";
+import { loadCompactionConfig } from "../session/compaction-config.ts";
 import { PermissionManager } from "../permissions/manager.ts";
 
 /** 系统提示词中注入 notes 的固定区块标题。 */
@@ -102,6 +104,8 @@ export interface AgentRunRequest {
   readonly workspaceRoot: string;
   /** 已成功历史；Runner 会在其后追加本轮 goal。 */
   readonly history?: readonly LlmMessage[];
+  readonly contextEntries?: readonly ContextEntry[];
+  readonly compact?: ContextCompactionHook;
   /** 已包含本轮开始前 notes 快照的系统提示词。 */
   readonly systemPrompt?: string;
   /** 编排层注入的 run 级 trace；缺失时跳过 trace 记录。 */
@@ -178,6 +182,21 @@ export class AgentRunner {
     }
   }
 
+  /** 使用当前模型创建独立摘要调用；压缩的持久化由会话编排层负责。 */
+  async compact(options: CompactOptions) {
+    const llm = loadLlmConfig(this.#environment);
+    const budget = loadContextBudgetConfig(this.#environment);
+    if (!llm.ok) throw llm.error;
+    if (!budget.ok) throw budget.error;
+    const config = loadCompactionConfig(this.#environment, budget.value);
+    if (!config.ok) throw config.error;
+    return new Compactor(
+      this.#providerFactory(llm.value),
+      config.value,
+      budget.value.maxOutputTokens,
+    ).compact(options);
+  }
+
   /** 组装本轮隔离资源并驱动 AgentLoop，结束后读取最终任务图。 */
   async #run(
     request: AgentRunRequest,
@@ -190,6 +209,7 @@ export class AgentRunner {
       workspaceRoot: request.workspaceRoot,
       goal: request.goal,
       ...(request.history === undefined ? {} : { prefillMessages: request.history }),
+      ...(request.contextEntries === undefined ? {} : { prefillEntries: request.contextEntries }),
     });
     await this.#publishStarted(context);
     // 等待 RPC response 入队后才继续执行，既保证 durable start，又保持响应先于事件。
@@ -208,6 +228,12 @@ export class AgentRunner {
     }
     const contextBudgetConfig = loadContextBudgetConfig(this.#environment);
     if (!contextBudgetConfig.ok) {
+      context.markFailed("config_error");
+      return { completion: this.#completionFromContext(context) };
+    }
+
+    const compactionConfig = loadCompactionConfig(this.#environment, contextBudgetConfig.value);
+    if (!compactionConfig.ok) {
       context.markFailed("config_error");
       return { completion: this.#completionFromContext(context) };
     }
@@ -254,6 +280,8 @@ export class AgentRunner {
       systemPrompt,
       ...(request.trace === undefined ? {} : { trace: request.trace }),
       contextWindowTokens: contextBudgetConfig.value.contextWindowTokens,
+      compactionConfig: compactionConfig.value,
+      ...(request.compact === undefined ? {} : { compact: request.compact }),
     });
     const completion = await loop.run(context, externalSignal, true);
 
@@ -277,6 +305,7 @@ export class AgentRunner {
       steps: context.step,
       usage: context.usage,
       messages: context.runMessages(),
+      messageIds: context.runMessageIds(),
       model: context.model || this.#environment[LLM_MODEL_ENV_KEY] || "",
     };
     switch (context.status) {

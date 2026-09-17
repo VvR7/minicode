@@ -915,7 +915,9 @@ describe("Stage2 complete lifecycle", () => {
       {
         ...environment(mock.url, "summary"),
         LLM_CONTEXT_WINDOW_TOKENS: "100",
-        LLM_MAX_OUTPUT_TOKENS: "99",
+        MINICODE_COMPACTION_RESERVE_TOKENS: "20",
+        MINICODE_COMPACTION_KEEP_RECENT_TOKENS: "20",
+        LLM_MAX_OUTPUT_TOKENS: "10",
       },
     );
     const endpoint = app.start();

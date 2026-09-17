@@ -64,14 +64,12 @@ core 重启产生的 interrupted turn 仍在 history 中可审计，但不进入
 仅属于当前 run：`task_create`/`task_update` 生成 revision 单调递增的事件和 `tasks.json`，最终
 快照写入 HistoryTurn；下一轮创建新的空 TaskManager。
 
-预算在分配 turnId/runId 之前检查：
-
-```text
-estimated input + LLM_MAX_OUTPUT_TOKENS <= floor(LLM_CONTEXT_WINDOW_TOKENS * 0.9)
-```
-
-Core 只使用上下文窗口的 90% 作为安全预算。超限返回 `-32013 context_limit_exceeded`，不会调用
-provider，也不会创建 turn、run 或 run 目录。当前没有自动压缩。
+分配 turnId/runId 前检查不可压缩的 system prompt、工具定义与本轮提问是否能容纳最大输出。
+每次普通模型调用前，当 `contextTokens > contextWindow - reserveTokens` 时自动压缩；默认
+reserveTokens 为 16384，keepRecentTokens 为 20000。当前占用采用最近一次调用的输入、缓存与
+输出 usage 加后续消息估算；首次调用、压缩后及新 prompt 快照使用完整 UTF-8 字节 / 3 估算。
+普通调用遇到上下文超限时压缩并重试同一个调用一次，既不增加 step，也不重放工具；再次超限
+直接失败。压缩后保留内容仍无法容纳最大输出时返回明确的 context_limit_exceeded。
 
 ## 持久化与恢复
 
@@ -147,5 +145,4 @@ provider 仅接收 role/content。旧版无 compact 的日志仍按完整成功�
 
 恢复时倒序查找最新有效 compact，组装摘要与从该消息 ID 起的最近原文。手动 compact 立即有效；
 带 ownerRunId 的 run 内 compact 仅在所属 run 成功后有效，失败、取消或中断均回退此前有效记录。
-纯压缩服务不改写会话状态，调用方先保存 checkpoint，再替换模型上下文。自动调用与手动 IPC
-执行由后续 run 主流程 Issue 接入。
+纯压缩服务不改写会话状态，调用方先保存 checkpoint，再替换模型上下文。SessionManager 负责自动压缩与互斥的手动压缩，前端入口由客户端 Issue 接入。

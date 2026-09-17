@@ -1,3 +1,4 @@
+import { loadContextFiles, type ContextFiles } from "../memory/context-loader.ts";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type {
@@ -204,6 +205,18 @@ export class SessionStore {
     this.#homeDirectory = homeDirectory;
     this.#storage = storage;
     this.#now = now;
+  }
+
+  /** 通过同一存储依赖加载规则快照，测试与运行均不依赖 daemon 的 cwd。 */
+  async loadContextFiles(workspaceRoot: string): Promise<SessionStoreResult<ContextFiles>> {
+    try {
+      return {
+        ok: true,
+        value: await loadContextFiles(this.#homeDirectory, workspaceRoot, this.#storage),
+      };
+    } catch {
+      return { ok: false, error: { code: "io_error", message: "failed to read CONTEXT.md" } };
+    }
   }
 
   /** 计算单个 session 的全部固定路径；sessionId 必须是合法 UUID。 */

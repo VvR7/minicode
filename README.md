@@ -104,6 +104,13 @@ one-shot、Esc 退出。输入区中的普通 `q` 只是文本，不是退出键
 
 详细说明见 [TUI 使用说明](TUI.md)。
 
+## 用户维护的上下文
+
+每个 run 开始时读取 `MINICODE_HOME/CONTEXT.md`（默认 `~/.minicode/CONTEXT.md`）和
+当前 session 的 `workspaceRoot/CONTEXT.md`。提示词按基础规则、全局规则、项目规则和 session notes
+顺序组装；项目与全局规则冲突时项目规则优先。不搜索祖先或子目录。
+空文件和不存在的文件会跳过，其他读取错误会明确报错；修改将在下一次提问生效，运行中使用固定快照。
+
 ## 会话、任务与 Trace
 
 所有中间文件都位于 `MINICODE_HOME`，不会写进 workspace：

@@ -411,8 +411,10 @@ export class SessionManager {
     }
 
     const history = buildContextMessages(snapshot.turns);
-    const systemPrompt = buildRunSystemPrompt(snapshot.notes);
-    const baseSystemPrompt = buildRunSystemPrompt("");
+    const files = await this.#store.loadContextFiles(snapshot.meta.workspaceRoot);
+    if (!files.ok) return this.#internal("failed to read CONTEXT.md");
+    const systemPrompt = buildRunSystemPrompt(snapshot.notes, files.value);
+    const baseSystemPrompt = buildRunSystemPrompt("", files.value);
     const budgetConfig = loadContextBudgetConfig(this.#environment);
     if (!budgetConfig.ok) {
       return this.#internal("context budget configuration is invalid");

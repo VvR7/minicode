@@ -522,6 +522,61 @@ describe("SessionManager multi-turn context and terminal ownership", () => {
     });
   });
 
+  test("context file snapshots match admitted runs and refresh on the next turn", async () => {
+    const runner = new StubRunner(async (request) => completionFor(request));
+    const harness = createHarness(runner);
+    harness.storage.files.set(`${HOME}/CONTEXT.md`, "global-rule");
+    harness.storage.files.set("/workspace/CONTEXT.md", "project-before");
+    const session = unwrapResult(await harness.manager.create("/workspace"));
+    const first = unwrapResult(
+      await harness.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "first",
+      }),
+    );
+    harness.storage.files.set("/workspace/CONTEXT.md", "project-after");
+    first.activate();
+    await waitForIdle(harness.manager);
+    expect(runner.requests[0]?.systemPrompt).toContain("global-rule");
+    expect(runner.requests[0]?.systemPrompt).toContain("project-before");
+    expect(runner.requests[0]?.systemPrompt).not.toContain("project-after");
+    const second = unwrapResult(
+      await harness.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_B as ClientMessageId,
+        content: "second",
+      }),
+    );
+    second.activate();
+    await waitForIdle(harness.manager);
+    expect(runner.requests[1]?.systemPrompt).toContain("project-after");
+  });
+
+  test("unreadable context fails before allocating a run", async () => {
+    class UnreadableContextStorage extends MemorySessionStorage {
+      /** 仅模拟 CONTEXT.md 读取失败，历史恢复仍使用合法存储。 */
+      override async readFile(path: string): Promise<string | undefined> {
+        if (path.endsWith("/CONTEXT.md")) throw new Error("private path");
+        return super.readFile(path);
+      }
+    }
+    const runner = new StubRunner(async (request) => completionFor(request));
+    const harness = createHarness(runner, { storage: new UnreadableContextStorage() });
+    const session = unwrapResult(await harness.manager.create("/workspace"));
+    const prepared = await harness.manager.prepareMessage({
+      sessionId: session.sessionId,
+      clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+      content: "first",
+    });
+    expect(prepared).toMatchObject({
+      ok: false,
+      error: { code: "internal_error", message: "failed to read CONTEXT.md" },
+    });
+    expect(runner.requests).toHaveLength(0);
+    expect(unwrapResult(await harness.manager.getHistory(session.sessionId)).turns).toHaveLength(0);
+  });
+
   test("includes only succeeded history and the latest notes in later turns", async () => {
     let store: SessionStore;
     let invocation = 0;

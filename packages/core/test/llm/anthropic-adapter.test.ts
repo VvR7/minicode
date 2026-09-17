@@ -92,6 +92,21 @@ describe("request construction", () => {
     expect(body.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hello" }] }]);
   });
 
+  test("summary requests can lower output budget but cannot raise the configured cap", async () => {
+    for (const [requested, expected] of [
+      [100, 100],
+      [9000, 2048],
+    ] as const) {
+      const capture: Capture = {};
+      const adapter = new AnthropicAdapter(
+        { ...config, maxOutputTokens: 2048 },
+        captureFetch(capture, sseResponse(anthropicSseEvents({ text: "summary" }))),
+      );
+      await collect(adapter.stream([userMessage], { maxOutputTokens: requested }));
+      expect(requestBody(capture.init).max_tokens).toBe(expected);
+    }
+  });
+
   test("uses the configured maximum output token count", async () => {
     const capture: Capture = {};
     const adapter = new AnthropicAdapter(

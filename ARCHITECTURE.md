@@ -138,3 +138,14 @@ outcome 保持不变。当前没有 Trace viewer。
 已有 `agent.run`/`mc --goal` 调用保持 one-shot 兼容。多轮前端应迁移到 `session.create`、
 `session.sendMessage`、`session.getHistory`、`session.subscribe` 与 run subscription 组合，不应把
 one-shot session 当作可恢复 chat。
+
+## Stage4 compact journal
+
+`history.jsonl` 在既有 turn 记录之外追加 `context.compacted`，原始消息保持完整。记录包含摘要或
+fallback、首个保留消息 ID、触发原因、token 估算、摘要用量及文件清单。内部摘要消息带 metadata，
+provider 仅接收 role/content。旧版无 compact 的日志仍按完整成功历史恢复。
+
+恢复时倒序查找最新有效 compact，组装摘要与从该消息 ID 起的最近原文。手动 compact 立即有效；
+带 ownerRunId 的 run 内 compact 仅在所属 run 成功后有效，失败、取消或中断均回退此前有效记录。
+纯压缩服务不改写会话状态，调用方先保存 checkpoint，再替换模型上下文。自动调用与手动 IPC
+执行由后续 run 主流程 Issue 接入。

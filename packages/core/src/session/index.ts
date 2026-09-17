@@ -1,5 +1,7 @@
 export {
   buildContextMessages,
+  buildContextEntries,
+  latestCompaction,
   DEFAULT_SESSION_PAGE_SIZE,
   deriveTitle,
   MAX_SESSION_PAGE_SIZE,
@@ -73,3 +75,5 @@ export {
   DEFAULT_KEEP_RECENT_TOKENS,
 } from "./compaction-config.ts";
 export type { CompactionConfig } from "./compaction-config.ts";
+export { CompactionRecordSchema } from "./types.ts";
+export type { CompactionRecord } from "./types.ts";

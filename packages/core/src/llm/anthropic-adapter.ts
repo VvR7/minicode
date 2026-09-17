@@ -449,7 +449,10 @@ export class AnthropicAdapter implements LlmProvider {
       tools?: { name: string; description: string; input_schema: Record<string, unknown> }[];
     } = {
       model: this.#config.model,
-      max_tokens: this.#config.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
+      max_tokens: Math.min(
+        options.maxOutputTokens ?? this.#config.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
+        this.#config.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
+      ),
       stream: true,
       messages: toAnthropicMessages(messages),
     };

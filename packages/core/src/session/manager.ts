@@ -410,7 +410,7 @@ export class SessionManager {
       );
     }
 
-    const history = buildContextMessages(snapshot.turns);
+    const history = buildContextMessages(snapshot.turns, snapshot.compactions);
     const files = await this.#store.loadContextFiles(snapshot.meta.workspaceRoot);
     if (!files.ok) return this.#internal("failed to read CONTEXT.md");
     const systemPrompt = buildRunSystemPrompt(snapshot.notes, files.value);

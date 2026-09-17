@@ -839,6 +839,13 @@ export class SessionStore {
       if (event.sessionSequence !== latestSessionSequence + 1) {
         return this.#corrupt("session event sequence gap");
       }
+      // 压缩事件不引用 turn；仍必须通过身份与连续序号校验。
+      if (event.type !== "session.turn_accepted" && event.type !== "session.turn_finished") {
+        latestSessionSequence = event.sessionSequence;
+        updatedAt = latestTimestamp(updatedAt, event.timestamp);
+        events.push(event);
+        continue;
+      }
       const key = `${event.payload.turnId}:${event.payload.runId}`;
       const acceptedRecord = accepted.get(key);
       const completion = completedByKey.get(key);

@@ -552,7 +552,10 @@ export class SessionController {
     if (!parsed.success || this.#session === undefined) return;
     const { subscriptionId, event } = parsed.data.params;
     if (subscriptionId === this.#sessionSubscriptionId && isSessionEvent(event)) {
-      if (this.#pendingCommits.size > 0 && !this.#pendingCommits.has(event.payload.runId)) {
+      if (
+        this.#pendingCommits.size > 0 &&
+        (!("runId" in event.payload) || !this.#pendingCommits.has(event.payload.runId))
+      ) {
         this.#deferredSessionEvents.push(event);
         return;
       }
@@ -594,8 +597,9 @@ export class SessionController {
         this.#knownTurns.add(event.payload.turnId);
       }
     } else if (
-      !this.#committedTurns.has(event.payload.turnId) ||
-      this.#pendingCommits.has(event.payload.runId)
+      event.type === "session.turn_finished" &&
+      (!this.#committedTurns.has(event.payload.turnId) ||
+        this.#pendingCommits.has(event.payload.runId))
     ) {
       const observation = this.#runs.get(event.payload.runId);
       if (observation !== undefined && !observation.finished) {

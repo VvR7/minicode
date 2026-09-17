@@ -65,3 +65,11 @@ export type {
   TurnAcceptedRecord,
   TurnCompletedRecord,
 } from "./types.ts";
+
+export {
+  loadCompactionConfig,
+  CompactionConfigSchema,
+  DEFAULT_RESERVE_TOKENS,
+  DEFAULT_KEEP_RECENT_TOKENS,
+} from "./compaction-config.ts";
+export type { CompactionConfig } from "./compaction-config.ts";

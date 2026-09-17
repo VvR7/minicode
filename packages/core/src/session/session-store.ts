@@ -1,3 +1,6 @@
+import { applyCompaction, toProviderMessages } from "../compact/compactor.ts";
+import type { ContextEntry, CompactionCheckpoint } from "../compact/types.ts";
+import { CompactionRecordSchema, type CompactionRecord } from "./types.ts";
 import { loadContextFiles, type ContextFiles } from "../memory/context-loader.ts";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
@@ -173,18 +176,54 @@ function toLlmPart(block: HistoryTurn["messages"][number]["content"][number]): L
 }
 
 /** 把全部 includedInContext=true 的历史 turn 映射为下一轮 LLM 上下文消息。 */
-export function buildContextMessages(turns: readonly HistoryTurn[]): readonly LlmMessage[] {
-  const messages: LlmMessage[] = [];
-  for (const turn of turns) {
-    // protocol 的 HistoryTurnSchema 已保证 includedInContext 只出现在 succeeded 且配对完整的 turn 上。
-    if (!turn.includedInContext) {
-      continue;
-    }
-    for (const message of turn.messages) {
-      messages.push({ role: message.role, content: message.content.map(toLlmPart) });
-    }
-  }
-  return messages;
+export function buildContextMessages(
+  turns: readonly HistoryTurn[],
+  compactions: readonly CompactionRecord[] = [],
+): readonly LlmMessage[] {
+  return toProviderMessages(buildContextEntries(turns, compactions));
+}
+
+/** 找最新有效 compact，不让失败/取消/中断 run 的摘要进入下一轮。 */
+export function latestCompaction(
+  turns: readonly HistoryTurn[],
+  compactions: readonly CompactionRecord[],
+): CompactionRecord | undefined {
+  return [...compactions]
+    .reverse()
+    .find(
+      (record) =>
+        record.ownerRunId === undefined ||
+        turns.some(
+          (turn) =>
+            turn.runId === record.ownerRunId &&
+            turn.includedInContext &&
+            turn.status === "succeeded",
+        ),
+    );
+}
+
+/** 身份保留到压缩层，发送 provider 时才剥离；原始审计列表始终不变。 */
+export function buildContextEntries(
+  turns: readonly HistoryTurn[],
+  compactions: readonly CompactionRecord[] = [],
+): readonly ContextEntry[] {
+  const entries = turns
+    .filter((turn) => turn.includedInContext && turn.status === "succeeded")
+    .flatMap((turn) =>
+      turn.messages.map((message) => ({
+        messageId: message.messageId,
+        runId: message.runId,
+        role: message.role,
+        content: message.content.map(toLlmPart),
+      })),
+    );
+  const latest = latestCompaction(turns, compactions);
+  if (latest === undefined) return entries;
+  const start = entries.findIndex(
+    (entry) => entry.messageId === latest.checkpoint.firstKeptMessageId,
+  );
+  if (start < 0) throw new Error("compact references missing retained message");
+  return applyCompaction(latest.checkpoint, entries.slice(start));
 }
 
 /**
@@ -291,6 +330,7 @@ export class SessionStore {
         pendingInterruptions: [],
         sessionEvents: [],
         notes: "",
+        compactions: [],
       },
     };
   }
@@ -481,6 +521,58 @@ export class SessionStore {
         };
       },
     );
+  }
+
+  /** 追加 checkpoint 并 fsync，不修改任何原始 turn 内容。 */
+  async appendCompaction(
+    sessionId: SessionId,
+    checkpoint: CompactionCheckpoint,
+    ownerRunId?: RunId,
+  ): Promise<SessionStoreResult<void>> {
+    return this.#withSessionLock(sessionId, async () => {
+      const loaded = await this.load(sessionId);
+      if (!loaded.ok) return loaded;
+      if (
+        loaded.value.compactions.some(
+          (record) => record.checkpoint.compactionId === checkpoint.compactionId,
+        )
+      )
+        return { ok: false, error: { code: "invalid_input", message: "duplicate compact id" } };
+      if (
+        ownerRunId !== undefined
+          ? !loaded.value.turns.some(
+              (turn) => turn.runId === ownerRunId && turn.status === "running",
+            )
+          : loaded.value.activeRun !== undefined ||
+            !buildContextEntries(loaded.value.turns, loaded.value.compactions).some(
+              (entry) => entry.messageId === checkpoint.firstKeptMessageId,
+            )
+      )
+        return {
+          ok: false,
+          error: { code: "invalid_input", message: "invalid compact boundary or owner" },
+        };
+      const parsed = CompactionRecordSchema.safeParse({
+        schemaVersion: SESSION_SCHEMA_VERSION,
+        recordId: crypto.randomUUID(),
+        sessionId,
+        timestamp: this.#now(),
+        kind: "context.compacted",
+        checkpoint,
+        ...(ownerRunId === undefined ? {} : { ownerRunId }),
+      });
+      if (!parsed.success)
+        return { ok: false, error: { code: "invalid_input", message: "invalid compact record" } };
+      try {
+        await this.#storage.appendLine(
+          this.#paths(sessionId).history,
+          `${JSON.stringify(parsed.data)}\n`,
+        );
+        return { ok: true, value: undefined };
+      } catch {
+        return { ok: false, error: { code: "io_error", message: "failed to persist compact" } };
+      }
+    });
   }
 
   /**
@@ -741,6 +833,7 @@ export class SessionStore {
       }
       recordIds.add(record.recordId);
       updatedAt = latestTimestamp(updatedAt, record.timestamp);
+      if (record.kind === "context.compacted") continue;
       const key = `${record.turnId}:${record.runId}`;
       if (record.kind === "turn.accepted") {
         if (accepted.has(key)) {
@@ -837,6 +930,15 @@ export class SessionStore {
       });
     }
 
+    const compactions = history.filter(
+      (record): record is CompactionRecord => record.kind === "context.compacted",
+    );
+    try {
+      buildContextEntries(turns, compactions);
+    } catch {
+      return this.#corrupt("compact references missing retained message");
+    }
+
     let latestSessionSequence = 0;
     const eventRecordIds = new Set<string>();
     const events: SessionEvent[] = [];
@@ -905,6 +1007,7 @@ export class SessionStore {
         pendingInterruptions,
         sessionEvents: events,
         notes,
+        compactions,
       },
     };
   }

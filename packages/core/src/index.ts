@@ -14,3 +14,4 @@ export * from "./tasks/index.ts";
 export * from "./tools/index.ts";
 export * from "./trace/index.ts";
 export * from "./transport/ndjson-server.ts";
+export * from "./compact/index.ts";

@@ -10,7 +10,8 @@ export type LlmErrorCode =
   | "unavailable"
   | "timeout"
   | "aborted"
-  | "invalid_response";
+  | "invalid_response"
+  | "context_limit_exceeded";
 
 /** 首 delta 前允许有限重试的瞬时失败类别。 */
 const RETRYABLE_CODES: ReadonlySet<LlmErrorCode> = new Set<LlmErrorCode>([

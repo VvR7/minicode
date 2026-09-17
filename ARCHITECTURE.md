@@ -145,4 +145,11 @@ provider 仅接收 role/content。旧版无 compact 的日志仍按完整成功�
 
 恢复时倒序查找最新有效 compact，组装摘要与从该消息 ID 起的最近原文。手动 compact 立即有效；
 带 ownerRunId 的 run 内 compact 仅在所属 run 成功后有效，失败、取消或中断均回退此前有效记录。
-纯压缩服务不改写会话状态，调用方先保存 checkpoint，再替换模型上下文。SessionManager 负责自动压缩与互斥的手动压缩，前端入口由客户端 Issue 接入。
+纯压缩服务不改写会话状态，调用方先保存 checkpoint，再替换模型上下文。SessionManager 负责
+自动压缩与互斥的手动压缩，客户端暴露 typed compact，TUI 提供 `/compact [focus]`，CLI 观察自动进度。
+
+`ExecutionContext` 分别维护当前 provider 消息和带稳定 ID 的 run 原文审计；压缩后仅更新前者，
+`RunCompletion.messageIds` 确保后者终态提交时的身份与 checkpoint 引用一致。Compactor 只生成结果，
+SessionManager 负责执行权、不可容纳校验、journal 和独立会话压缩事件。SessionController 附着时
+从已成功消费的 session cursor 回放，避免只依靠 turn history 水位漏掉压缩进度。完整流程与配置
+见 [Stage4 上下文管理](STAGE4_CONTEXT.md)。

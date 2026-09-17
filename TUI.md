@@ -33,11 +33,12 @@ session/连接状态、上下文占用和当前模型。Assistant 内容按 Mark
 | `Ctrl+Enter` | 插入换行 |
 | `Ctrl-C` | 有草稿时清空；无草稿且运行中时取消；空闲时提示使用 `/exit` |
 | `/new` | 空闲时创建并切换到同 workspace 的新 chat |
+| `/compact [focus]` | 空闲时压缩上下文，focus 指定摘要方向，不创建 user turn |
 | `/exit` | 空闲时退出；运行中先要求取消 |
 | `PgUp` / `PgDn` | 滚动一个 viewport |
 | `Ctrl+Home` / `Ctrl+End` | 跳到 transcript 开头/末尾 |
 
-运行中输入被冻结，直到 Core 发布权威终态。用户消息只有在 Core 返回 accepted 后才进入
+运行或压缩期间输入被冻结，直到 Core 发布权威终态或压缩结果。用户消息只有在 Core 返回 accepted 后才进入
 transcript。普通 `q` 是输入字符。
 
 ## 权限审批
@@ -72,7 +73,21 @@ cancelled outcome。不同 session 不共享 transcript 或 busy/cancel 状态�
 Core 暂时断开时 workspace 行右侧显示 reconnecting，恢复后从最后成功消费的 cursor 继续。无法一致恢复的
 session 会变为 corrupted，只能查询诊断，不能继续提交。
 
+## 上下文压缩
+
+每次普通模型调用前会按配置自动压缩；遇到明确的模型上下文错误后压缩并重试同一次调用一次。
+空闲 chat 可以输入 `/compact` 或 `/compact 保留下一步任务`，手动 focus 同时作用于历史与 run
+前缀摘要。操作期间 workspace 行显示 compacting，其他窗口同步 CONTEXT 进度并阻止提交。
+没有可淘汰消息时提示无需压缩；摘要失败会展示错误，保持已有模型视图。
+
+完成后左下角更新摘要后的估算占用，后续普通 usage 会再次更新它。fallback 明确显示
+`earlier dialogue hidden without summary`，表示早期原文已从模型视图隐藏而未成功摘要；原始审计
+仍完整保存在 history.jsonl。摘要文本不会伪装为助手回答，也不会替换 transcript 中的原文。
+
+规则加载、预算约束、恢复和验证矩阵见 [Stage4 上下文管理](STAGE4_CONTEXT.md)。
+
 ## CLI 边界
 
 `mc --goal <text>` 创建隐藏于默认 chat 列表的 one-shot session，仅用于单轮测试和 Stage1 回归。
-它不是多轮 CLI；需要对话、恢复和 session selector 时使用 TUI。
+它不是多轮 CLI；需要对话、恢复和 session selector 时使用 TUI。CLI 自动压缩进度写 stderr，
+回答输出保持在 stdout；没有新增 CLI 手动压缩入口。

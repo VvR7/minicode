@@ -17,6 +17,9 @@ export interface Environment {
   readonly MINICODE_CORE_PORT?: string;
   readonly MINICODE_HOME?: string;
   readonly MINICODE_LOG_LEVEL?: string;
+  readonly MINICODE_COMPACTION_ENABLED?: string;
+  readonly MINICODE_COMPACTION_RESERVE_TOKENS?: string;
+  readonly MINICODE_COMPACTION_KEEP_RECENT_TOKENS?: string;
   readonly LLM_API_KEY?: string;
   readonly LLM_BASE_URL?: string;
   readonly LLM_MODEL?: string;

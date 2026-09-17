@@ -53,8 +53,8 @@ export class IpcSessionBroadcaster {
           params: { subscriptionId, event },
         } as const;
         const sending = connection.sendNotification(notification);
-        const runId = event.payload.runId;
-        const trace = this.#traces?.get(sessionId, runId);
+        const trace =
+          "runId" in event.payload ? this.#traces?.get(sessionId, event.payload.runId) : undefined;
         trace?.record({
           source: "CORE",
           target: "CLIENT",

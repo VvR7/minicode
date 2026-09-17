@@ -21,6 +21,8 @@ import {
   PongResultSchema,
   PermissionRespondRequestSchema,
   PermissionRespondSuccessResponseSchema,
+  SessionCompactRequestSchema,
+  SessionCompactSuccessResponseSchema,
   SessionCreateRequestSchema,
   SessionCreateSuccessResponseSchema,
   SessionEventSchema,
@@ -63,6 +65,8 @@ export function renderWireProtocol(): string {
     schemaBlock("EventUnsubscribeRequest", EventUnsubscribeRequestSchema),
     schemaBlock("EventUnsubscribeSuccessResponse", EventUnsubscribeSuccessResponseSchema),
     schemaBlock("SessionSummary", SessionSummarySchema),
+    schemaBlock("SessionCompactRequest", SessionCompactRequestSchema),
+    schemaBlock("SessionCompactSuccessResponse", SessionCompactSuccessResponseSchema),
     schemaBlock("SessionCreateRequest", SessionCreateRequestSchema),
     schemaBlock("SessionCreateSuccessResponse", SessionCreateSuccessResponseSchema),
     schemaBlock("SessionGetRequest", SessionGetRequestSchema),
@@ -138,6 +142,16 @@ export function renderWireProtocol(): string {
 - workspaceRoot is a relative-path base, not a filesystem sandbox: absolute/external symlink paths
   are permitted. Bash classification is heuristic, not a shell parser or security isolation layer.
   See [Stage3 permissions](STAGE3_PERMISSIONS.md) and [test matrix](STAGE3_TEST_MATRIX.md).
+
+## Stage4 compaction contracts
+
+- \`session.compact\` accepts a session ID and optional focus, without creating a turn.
+- A compacted result identifies a summary or fallback checkpoint and the first retained message;
+  unchanged results omit the checkpoint. Busy sessions reject manual compaction.
+- Durable session.compaction_started/finished/failed events share the session sequence domain.
+- Context message metadata is optional for old history; summary and fallback kinds identify
+  compaction messages. Provider messages exclude this metadata.
+- These contracts are additive; execution and persistence are delivered by the Stage4 Core issues.
 
 ## Sessions
 

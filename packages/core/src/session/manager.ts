@@ -919,6 +919,8 @@ export class SessionManager {
     const acceptedSequence = new Map<string, number>();
     const finishedSequence = new Map<string, number>();
     for (const event of snapshot.sessionEvents) {
+      if (event.type !== "session.turn_accepted" && event.type !== "session.turn_finished")
+        continue;
       const turn = turns.get(event.payload.turnId);
       if (turn === undefined || event.payload.runId !== turn.runId) {
         return false;

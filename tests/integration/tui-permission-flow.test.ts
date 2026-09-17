@@ -12,7 +12,7 @@ import { CoreApp } from "../../packages/core/src/index.ts";
 import { TuiApp } from "../../packages/tui/src/app.ts";
 import { startScriptedAnthropicMock } from "./helpers/scripted-anthropic-mock.ts";
 
-/** 等待真实 socket 通知推进，避免 headless frame 等待代替网络等待。 */
+/** 等待 socket 通知或异步渲染推进，并以真实时间上限保证失败后可清理。 */
 async function waitFor(condition: () => boolean): Promise<void> {
   const deadline = performance.now() + 3000;
   while (!condition()) {
@@ -102,7 +102,11 @@ test("TUI restores pending approval after real reconnect and keyboard approval e
     expect(permissions[0]?.status).toBe("resolved");
     expect(permissions[0]?.resolution?.payload.decision).toBe("allow_once");
     expect(await readFile(join(workspaceRoot, "approved.txt"), "utf8")).toBe("approved content");
-    await setup.waitForFrame((frame) => frame.includes("done") && frame.includes("Allow once"));
+    // renderer 暂时 idle 不代表 Markdown worker 已完成；让出事件循环等待最终字符帧。
+    await waitFor(() => {
+      const frame = setup.captureCharFrame();
+      return frame.includes("done") && frame.includes("Allow once");
+    });
     await setup.mockInput.typeText("/exit");
     setup.mockInput.pressEnter();
     expect(await code).toBe(0);

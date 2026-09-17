@@ -337,6 +337,8 @@ export class AgentRunClient {
               runFinished.resolve();
             }
           });
+          // run listener 已就绪便开放审批响应；独立会话订阅不得延迟已附着状态。
+          if (runIdentity !== undefined) this.#attached = { connection, identity: runIdentity };
           if (callbacks.onCompaction !== undefined && runIdentity !== undefined) {
             let sessionSubscriptionId: SubscriptionId | undefined;
             const queued: unknown[] = [];
@@ -379,7 +381,6 @@ export class AgentRunClient {
             for (const notification of queued) consumeSession(notification);
           }
           // listener 已注册、精确订阅已建立，重连后再次展示未处理审批。
-          if (runIdentity !== undefined) this.#attached = { connection, identity: runIdentity };
           callbacks.onPermissions?.(this.permissions);
           await Promise.race([
             runFinished.promise,

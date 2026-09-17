@@ -742,3 +742,43 @@ describe("AgentRunClient session compaction replay", () => {
     expect(first.listenerCount + second.listenerCount).toBe(0);
   });
 });
+
+test("approval stays responsive while the independent session subscription is pending", async () => {
+  const connection = new FakeConnection();
+  const sessionGate = Promise.withResolvers<unknown>();
+  const sessionRequested = Promise.withResolvers<void>();
+  connection.requestHandler = (method, params) => {
+    if (method === "session.subscribe") {
+      sessionRequested.resolve();
+      return sessionGate.promise;
+    }
+    if (method === "permission.respond") return { result: { outcome: "accepted" } };
+    return defaultHandler(method, params);
+  };
+  const client = new AgentRunClient();
+  const { callbacks } = collectCallbacks();
+  callbacks.onCompaction = () => {};
+  const running = client.run(
+    {
+      goal: "goal",
+      workspaceRoot: "/workspace",
+      endpoint,
+      connect: async () => connection as unknown as NdjsonRpcConnection,
+    },
+    callbacks,
+  );
+  await sessionRequested.promise;
+  connection.emit(pushNotification(subscriptionId, permissionRequest));
+  expect(
+    await client.respondPermission(permissionRequest.payload.permissionRequestId, "allow_once"),
+  ).toEqual({ outcome: "accepted" });
+  sessionGate.resolve({
+    result: {
+      subscriptionId: "950e8400-e29b-41d4-a716-446655440001",
+      sessionId,
+      latestSequence: 0,
+    },
+  });
+  connection.emit(pushNotification(subscriptionId, runFinished()));
+  expect((await running).kind).toBe("finished");
+});

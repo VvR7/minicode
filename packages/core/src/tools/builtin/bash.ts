@@ -4,8 +4,10 @@ import { z } from "zod";
 import { classifyBashCommand } from "../bash-policy.ts";
 import { ToolError, type Tool, type ToolExecutionContext, type ToolOutput } from "../types.ts";
 
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "../output-budget.ts";
+
 const MAX_COMMAND_CHARS = 8 * 1024;
-const MAX_BASH_OUTPUT_BYTES = 64 * 1024;
+const MAX_BASH_OUTPUT_BYTES = DEFAULT_MAX_BYTES;
 const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
 
 export const BashParamsSchema = z.strictObject({
@@ -26,7 +28,7 @@ export class BashTool implements Tool<BashParams> {
     return (params.timeout ?? DEFAULT_BASH_TIMEOUT_SECONDS) * 1000;
   }
 
-  /** 拒绝固定危险命令后启动隔离进程组，并输出最多 64 KiB 的合并 stdout/stderr。 */
+  /** 拒绝固定危险命令后启动隔离进程组，并输出最多 2000 行 / 50 KiB 的合并 stdout/stderr。 */
   async execute(params: BashParams, context: ToolExecutionContext): Promise<ToolOutput> {
     if (classifyBashCommand(params.command).decision === "deny") {
       throw new ToolError("permission_denied", "dangerous command denied by policy");
@@ -63,61 +65,55 @@ export class BashTool implements Tool<BashParams> {
 
     if (context.signal.aborted) throw new ToolError("tool_cancelled", "tool call cancelled");
     if (spawnError) throw new ToolError("io_error", "failed to execute bash");
-    const output = collector.text();
-    if (code !== 0) {
-      const prefix = `[exit ${code ?? "signal"}]\n`;
-      const outputLimit = MAX_BASH_OUTPUT_BYTES - Buffer.byteLength(prefix);
-      const content = prefix + collector.text(outputLimit);
-      throw new ToolError("command_failed", content, {
-        output: {
-          content,
-          truncated: collector.totalBytes > outputLimit,
-          outputBytes: collector.totalBytes + Buffer.byteLength(prefix),
-        },
-      });
-    }
-    return {
-      content: output.length === 0 ? "[no output]" : output,
-      truncated: collector.truncated,
-      outputBytes: collector.totalBytes,
+    const prefix = code !== 0 ? `[exit ${code ?? "signal"}]\n` : "";
+    const limited = truncateTail(
+      collector.text(),
+      DEFAULT_MAX_LINES - (prefix ? 1 : 0),
+      MAX_BASH_OUTPUT_BYTES - Buffer.byteLength(prefix),
+      collector.truncated,
+    );
+    const output = {
+      ...limited,
+      content: prefix + (limited.content || (prefix ? "" : "[no output]")),
+      outputBytes: collector.totalBytes + Buffer.byteLength(prefix),
     };
+    if (code !== 0) throw new ToolError("command_failed", output.content, { output });
+    return output;
   }
 }
 
 /** 有界收集子进程输出，同时持续排空 pipe 防止子进程阻塞。 */
 class OutputCollector {
   readonly #limit: number;
-  readonly #chunks: Buffer[] = [];
-  #keptBytes = 0;
+  #tail = Buffer.alloc(0);
   totalBytes = 0;
 
-  /** 创建只保留指定字节前缀的输出收集器。 */
+  /** 创建只保留指定字节尾部的输出收集器。 */
   constructor(limit: number) {
     this.#limit = limit;
   }
 
-  /** 记录原始字节数，并只保留结果上限内的前缀。 */
+  /** 持续消费所有输出，内存只保留最近 limit 字节。 */
   append(chunk: Buffer): void {
     this.totalBytes += chunk.byteLength;
-    const remaining = this.#limit - this.#keptBytes;
-    if (remaining <= 0) return;
-    const kept = chunk.subarray(0, remaining);
-    this.#chunks.push(kept);
-    this.#keptBytes += kept.byteLength;
+    if (chunk.byteLength >= this.#limit) {
+      this.#tail = Buffer.from(chunk.subarray(chunk.byteLength - this.#limit));
+    } else {
+      const joined = Buffer.concat([this.#tail, chunk]);
+      this.#tail = Buffer.from(joined.subarray(Math.max(0, joined.byteLength - this.#limit)));
+    }
   }
 
-  /** 以替换模式解码输出，避免任意命令字节破坏工具调用。 */
-  text(limit = this.#limit): string {
-    const decoded = new TextDecoder().decode(Buffer.concat(this.#chunks), {
-      stream: this.truncated,
-    });
-    const encoded = new TextEncoder().encode(decoded);
-    return new TextDecoder().decode(encoded.slice(0, limit), {
-      stream: encoded.byteLength > limit,
-    });
+  /** 跳过被截断的 UTF-8 起始片段，再解码任意命令输出。 */
+  text(): string {
+    let start = 0;
+    if (this.truncated) {
+      while (start < this.#tail.length && ((this.#tail[start] ?? 0) & 0xc0) === 0x80) start += 1;
+    }
+    return new TextDecoder().decode(this.#tail.subarray(start));
   }
 
-  /** 指示原始输出是否超过 64 KiB。 */
+  /** 指示流式收集阶段是否已经丢弃前部输出。 */
   get truncated(): boolean {
     return this.totalBytes > this.#limit;
   }

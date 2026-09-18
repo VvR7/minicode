@@ -10,6 +10,12 @@ if (marker)
 for await (const line of createInterface({ input: process.stdin })) {
   const request = JSON.parse(line) as { id?: number; method: string; params?: { cursor?: string } };
   if (request.id === undefined) continue;
+  if (request.method === "tools/list" && request.params?.cursor === "") {
+    process.stdout.write(
+      `${JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32602, message: "empty cursor forbidden" } })}\n`,
+    );
+    continue;
+  }
   let result: unknown;
   if (request.method === "initialize")
     result = {

@@ -83,6 +83,7 @@ export class CoreApp {
       bus: eventBus,
       homeDirectory: this.#config.homeDirectory,
       permissions,
+      mcp: this.#mcp,
     });
     const manager = new SessionManager({
       store: sessionStore,

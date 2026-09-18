@@ -22,6 +22,12 @@ test("official SDK discovers all stdio/HTTP pages, sends headers and closes owne
         params?: { cursor?: string };
       };
       if (body.id === undefined) return new Response(null, { status: 202 });
+      if (body.method === "tools/list" && body.params?.cursor === "")
+        return Response.json({
+          jsonrpc: "2.0",
+          id: body.id,
+          error: { code: -32602, message: "empty cursor forbidden" },
+        });
       const result =
         body.method === "initialize"
           ? {
@@ -69,6 +75,56 @@ test("official SDK discovers all stdio/HTTP pages, sends headers and closes owne
   } finally {
     await manager.close();
     await http.stop(true);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("real Core preflight initializes workspace MCP and shutdown reaps the same connection", async () => {
+  const { CoreApp } = await import("../../packages/core/src/index.ts");
+  const { NdjsonRpcConnection } = await import("../../packages/client/src/index.ts");
+  const {
+    SESSION_CREATE_METHOD,
+    SessionCreateResultSchema,
+    SESSION_SEND_MESSAGE_METHOD,
+    SessionSendMessageResultSchema,
+  } = await import("../../packages/protocol/src/index.ts");
+  const root = await mkdtemp(join(tmpdir(), "minicode-core-mcp-"));
+  const workspace = join(root, "workspace");
+  const directory = join(workspace, ".minicode");
+  await mkdir(directory, { recursive: true });
+  const marker = join(root, "project-process.json");
+  await writeFile(
+    join(directory, "config.toml"),
+    `[[mcp.servers]]\nname="local"\ntransport="stdio"\ncommand=${JSON.stringify(process.execPath)}\nargs=[${JSON.stringify(join(import.meta.dir, "fixtures/mcp-stdio.ts"))},${JSON.stringify(marker)}]\n`,
+  );
+  const app = new CoreApp(
+    { host: "127.0.0.1", port: 0, logLevel: "error", homeDirectory: join(root, "home") },
+    { MINICODE_TRACE_ENABLED: "false" },
+  );
+  const connection = await NdjsonRpcConnection.connect(app.start());
+  try {
+    const session = await connection.request(
+      SESSION_CREATE_METHOD,
+      { workspaceRoot: workspace },
+      SessionCreateResultSchema,
+    );
+    await connection.request(
+      SESSION_SEND_MESSAGE_METHOD,
+      {
+        sessionId: session.result.session.sessionId,
+        clientMessageId: crypto.randomUUID(),
+        content: "test preflight",
+      },
+      SessionSendMessageResultSchema,
+    );
+    const processInfo = JSON.parse(await readFile(marker, "utf8")) as { pid: number; cwd: string };
+    expect(processInfo.cwd).toBe(workspace);
+    connection.close();
+    await app.stop();
+    expect(() => process.kill(processInfo.pid, 0)).toThrow();
+  } finally {
+    connection.close();
+    await app.stop();
     await rm(root, { recursive: true, force: true });
   }
 });

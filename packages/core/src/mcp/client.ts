@@ -22,7 +22,10 @@ export type McpClientFactory = (config: McpServerConfig, workspaceRoot: string) 
 
 /** 使用官方 v2 SDK 创建 transport，不把服务器 stderr 输出到 daemon 日志。 */
 export const createMcpClient: McpClientFactory = (config, workspaceRoot) => {
-  const client = new Client({ name: "minicode", version: "0.1.0" }, { capabilities: {} });
+  const client = new Client(
+    { name: "minicode", version: "0.1.0" },
+    { capabilities: {}, listMaxPages: Number.MAX_SAFE_INTEGER },
+  );
   const transport =
     config.transport === "stdio"
       ? new StdioClientTransport({
@@ -45,16 +48,9 @@ export const createMcpClient: McpClientFactory = (config, workspaceRoot) => {
     async connect(signal) {
       await client.connect(transport, { signal, timeout: 10000 });
     },
-    // SDK 无 cursor 的 listTools 会聚合分页；显式逐页没有固定页数上限。
+    // 官方 SDK 聚合分页；首次请求省略 cursor，避免把空串作为 opaque cursor。
     async listTools(signal) {
-      const tools: McpToolDefinition[] = [];
-      let cursor: string | undefined;
-      do {
-        const page = await client.listTools({ cursor: cursor ?? "" }, { signal, timeout: 10000 });
-        tools.push(...page.tools);
-        cursor = page.nextCursor;
-      } while (cursor !== undefined);
-      return tools;
+      return (await client.listTools(undefined, { signal, timeout: 10000 })).tools;
     },
     async callTool(name, args, signal) {
       return client.callTool({ name, arguments: args }, { signal, timeout: 10000 });

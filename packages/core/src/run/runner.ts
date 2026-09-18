@@ -1,3 +1,4 @@
+import { workspaceMcpTools } from "../mcp/tool.ts";
 import type { McpServerManager } from "../mcp/server-manager.ts";
 import { dirname, join } from "node:path";
 import type { Environment, RunId, SessionId, TaskGraphSnapshot } from "@minicode/protocol";
@@ -175,8 +176,9 @@ export class AgentRunner {
 
   /** 在 preflight 前准备能力快照；后续扩展在此接入 workspace 的 skills/MCP。 */
   async prepareSnapshot(request: RunSnapshotRequest): Promise<RunSnapshot> {
-    // 在真实工作区首次 preflight 时初始化连接，工具适配在后续阶段接入。
-    await this.#mcp?.forWorkspace(request.workspaceRoot);
+    const mcp = this.#mcp
+      ? workspaceMcpTools(await this.#mcp.forWorkspace(request.workspaceRoot))
+      : [];
     const loaded = await loadSystemPrompt(
       DEFAULT_SYSTEM_PROMPT,
       request.files,
@@ -184,7 +186,18 @@ export class AgentRunner {
       this.#homeDirectory,
       request.workspaceRoot,
     );
-    return createRunSnapshot(loaded.systemPrompt, runToolSchemas(), loaded.skillCatalog);
+    return createRunSnapshot(
+      loaded.systemPrompt,
+      [
+        ...runToolSchemas(),
+        ...mcp.map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.llmInputSchema,
+        })),
+      ],
+      loaded.skillCatalog,
+    );
   }
 
   /** 执行一次隔离 run；任何组装异常都收敛为包含本轮用户消息的安全终态。 */
@@ -302,6 +315,10 @@ export class AgentRunner {
     }
     registry.register(createNoteSaveTool(noteStore));
     registry.register(createListSubagentTool());
+    if (this.#mcp) {
+      for (const tool of workspaceMcpTools(await this.#mcp.forWorkspace(request.workspaceRoot)))
+        registry.register(tool);
+    }
 
     // 编排层传入的完整快照直接复用；直接调用 Runner 时也加载同样的两处规则。
     const systemPrompt =

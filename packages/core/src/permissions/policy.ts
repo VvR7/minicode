@@ -1,8 +1,11 @@
-import type { PermissionRequestSummary, PermissionRiskCategory } from "@minicode/protocol";
+import { redact } from "../trace/redact.ts";
+import type { PermissionRequestSummary } from "@minicode/protocol";
 import { classifyBashCommand, type BashPolicyResult } from "../tools/bash-policy.ts";
 
 /** 仅对已通过工具 schema 校验的参数做纯策略判断，不访问缓存或文件系统。 */
 export function evaluatePermission(name: string, params: unknown): BashPolicyResult {
+  if (name.startsWith("mcp__"))
+    return { decision: "ask", riskCategories: ["mcp"], cacheable: true };
   if (name === "bash") return classifyBashCommand((params as { command: string }).command);
   if (name === "write" || name === "edit") {
     return { decision: "ask", riskCategories: [name], cacheable: true };
@@ -13,6 +16,15 @@ export function evaluatePermission(name: string, params: unknown): BashPolicyRes
 
 /** 生成有界审批展示信息，避免完整文件内容进入持久事件。 */
 export function permissionSummary(name: string, params: unknown): PermissionRequestSummary {
+  if (name.startsWith("mcp__")) {
+    const parts = name.slice(5).split("__");
+    return {
+      kind: "mcp",
+      server: parts.shift() ?? "",
+      tool: parts.join("__"),
+      paramsPreview: JSON.stringify(redact(params)).slice(0, 1024),
+    };
+  }
   const data = params as {
     command: string;
     timeout?: number;
@@ -63,4 +75,4 @@ export interface PermissionScope {
   readonly toolCallId: string;
 }
 
-export type PermissionCache = Map<PermissionRiskCategory, boolean>;
+export type PermissionCache = Map<string, boolean>;

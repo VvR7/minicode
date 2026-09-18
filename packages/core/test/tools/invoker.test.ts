@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { z } from "zod";
 import { ToolInvoker } from "../../src/tools/invoker.ts";
 import { ToolRegistry } from "../../src/tools/registry.ts";
@@ -219,6 +219,38 @@ describe("ToolInvoker retry", () => {
 });
 
 describe("ToolInvoker timeout and abort", () => {
+  test("explicit null timeout creates no timer but still responds to external cancellation", async () => {
+    const started = Promise.withResolvers<void>();
+    const tool: Tool = {
+      name: "wait",
+      description: "",
+      inputSchema: z.strictObject({}),
+      timeoutMs: () => null,
+      execute: () => {
+        started.resolve();
+        return new Promise(() => {});
+      },
+    };
+    const controller = new AbortController();
+    const timerSpy = spyOn(globalThis, "setTimeout");
+    try {
+      const pending = invokerWith(tool, { timeoutMs: 1 }).invoke(
+        "wait",
+        {},
+        context(controller.signal),
+      );
+      await started.promise;
+      expect(timerSpy).not.toHaveBeenCalled();
+      controller.abort();
+      const result = await pending;
+      expect(result.result.failure).toEqual({ category: "cancelled", errorCode: "tool_cancelled" });
+      expect(result.attempts).toBe(1);
+    } finally {
+      controller.abort();
+      timerSpy.mockRestore();
+    }
+  });
+
   test("times out a hanging tool", async () => {
     const tool: Tool = {
       name: "slow",

@@ -12,8 +12,56 @@ import {
   toolResponse,
 } from "../agent/test-helpers.ts";
 import { HangProvider, environmentWithLlm, environmentWithoutLlm } from "./test-helpers.ts";
+import { createRunSnapshot } from "../../src/run/snapshot.ts";
 
 describe("AgentRunner", () => {
+  test("uses the prepared prompt/schema snapshot for every model step", async () => {
+    const workspace = await createTempWorkspace();
+    try {
+      const provider = new FakeProvider([
+        { response: toolResponse([toolCall("read-1", "read", { path: "missing.txt" })]) },
+        { response: textResponse("done") },
+      ]);
+      const runner = new AgentRunner({
+        environment: environmentWithLlm(),
+        bus: createBus(),
+        homeDirectory: workspace,
+        providerFactory: () => provider,
+      });
+      const prepared = await runner.prepareSnapshot({
+        workspaceRoot: workspace,
+        notes: "snapshot note",
+        files: { global: "global", project: "project" },
+      });
+      const snapshot = createRunSnapshot(
+        prepared.systemPrompt,
+        prepared.toolSchemas.map((tool) => ({
+          ...tool,
+          description: `${tool.description} (snapshot)`,
+        })),
+      );
+      const outcome = await runner.run(
+        {
+          sessionId: SESSION_A,
+          runId: RUN_A,
+          goal: "inspect",
+          workspaceRoot: workspace,
+          systemPrompt: "stale legacy prompt",
+          snapshot,
+        },
+        new AbortController().signal,
+      );
+      expect(outcome.completion.status).toBe("succeeded");
+      expect(provider.calls).toHaveLength(2);
+      for (const call of provider.calls) {
+        expect(call.options?.system).toBe(snapshot.systemPrompt);
+        expect(call.options?.toolSchemas).toBe(snapshot.toolSchemas);
+      }
+    } finally {
+      await cleanupTempWorkspace(workspace);
+    }
+  });
+
   test("fails with config_error and keeps the daemon alive when LLM config is missing", async () => {
     const workspace = await createTempWorkspace();
     try {

@@ -1,16 +1,15 @@
 import type { AgentEvent, CompactionReason } from "@minicode/protocol";
+import type { ContextEntry } from "../compact/types.ts";
+import type { EventBus } from "../events/event-bus.ts";
 import { LlmError } from "../llm/errors.ts";
 import type { LlmProvider } from "../llm/provider.ts";
-import type { LlmContentPart, LlmResponse, LlmStreamEvent } from "../llm/types.ts";
-import type { EventBus } from "../events/event-bus.ts";
-import type { ToolRegistry } from "../tools/registry.ts";
-import type { ToolInvoker } from "../tools/invoker.ts";
+import type { LlmContentPart, LlmResponse, LlmStreamEvent, LlmToolSchema } from "../llm/types.ts";
 import type { RunCompletion } from "../run/completion.ts";
+import type { CompactionConfig } from "../session/compaction-config.ts";
+import type { ToolInvoker } from "../tools/invoker.ts";
+import type { ToolRegistry } from "../tools/registry.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
 import type { ExecutionContext, FailedReason, RunFinishReason } from "./context.ts";
-
-import type { ContextEntry } from "../compact/types.ts";
-import type { CompactionConfig } from "../session/compaction-config.ts";
 
 export type ContextCompactionHook = (
   entries: readonly ContextEntry[],
@@ -40,6 +39,8 @@ type EventDescriptor = Omit<
 
 export interface AgentLoopOptions {
   readonly systemPrompt?: string;
+  /** 和接受请求前预算检查一致的固定工具目录。 */
+  readonly toolSchemas?: readonly LlmToolSchema[];
   /** 传给 provider 的单次调用超时毫秒数。 */
   readonly timeoutMs?: number;
   /** 传给 provider 的首 delta 前最大尝试次数。 */
@@ -80,7 +81,7 @@ function now(): string {
  */
 export class AgentLoop {
   readonly #provider: LlmProvider;
-  readonly #registry: ToolRegistry;
+  readonly #toolSchemas: readonly LlmToolSchema[];
   readonly #invoker: ToolInvoker;
   readonly #bus: EventBus;
   readonly #systemPrompt: string;
@@ -91,6 +92,7 @@ export class AgentLoop {
   readonly #compactionConfig: CompactionConfig | undefined;
   readonly #compact: ContextCompactionHook | undefined;
 
+  /** 保存本轮提示词、工具目录及执行依赖；循环中不重新发现能力。 */
   constructor(
     provider: LlmProvider,
     registry: ToolRegistry,
@@ -99,7 +101,7 @@ export class AgentLoop {
     options: AgentLoopOptions = {},
   ) {
     this.#provider = provider;
-    this.#registry = registry;
+    this.#toolSchemas = options.toolSchemas ?? registry.toolSchemas();
     this.#invoker = invoker;
     this.#bus = bus;
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
@@ -187,7 +189,7 @@ export class AgentLoop {
     if (
       config?.enabled &&
       this.#contextWindowTokens !== undefined &&
-      context.contextTokens(this.#systemPrompt, this.#registry.toolSchemas()) >
+      context.contextTokens(this.#systemPrompt, this.#toolSchemas) >
         this.#contextWindowTokens - config.reserveTokens
     ) {
       await this.#compactContext(context, "threshold", signal);
@@ -263,7 +265,7 @@ export class AgentLoop {
   ): Promise<void> {
     const entries = await this.#compact?.(
       context.contextEntries,
-      context.contextTokens(this.#systemPrompt, this.#registry.toolSchemas()),
+      context.contextTokens(this.#systemPrompt, this.#toolSchemas),
       reason,
       signal,
     );
@@ -285,7 +287,7 @@ export class AgentLoop {
         provider: this.#provider.providerName,
         systemPrompt: this.#systemPrompt,
         messages: context.messages,
-        tools: this.#registry.toolSchemas(),
+        tools: this.#toolSchemas,
       },
     });
     let response: LlmResponse | undefined;
@@ -365,7 +367,7 @@ export class AgentLoop {
   #stream(context: ExecutionContext, signal: AbortSignal): AsyncIterable<LlmStreamEvent> {
     return this.#provider.stream(context.messages, {
       system: this.#systemPrompt,
-      toolSchemas: this.#registry.toolSchemas(),
+      toolSchemas: this.#toolSchemas,
       signal,
       ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }),
       ...(this.#maxAttempts === undefined ? {} : { maxAttempts: this.#maxAttempts }),

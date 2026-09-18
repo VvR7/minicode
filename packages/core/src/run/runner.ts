@@ -27,6 +27,7 @@ import {
   TaskListParamsSchema,
   TaskUpdateParamsSchema,
 } from "../tasks/tools.ts";
+import { createListSubagentTool, ListSubagentParamsSchema } from "../subagents/list-tool.ts";
 import type { TaskStorage } from "../tasks/types.ts";
 import { builtinTools } from "../tools/builtin/index.ts";
 import { ToolInvoker } from "../tools/invoker.ts";
@@ -54,6 +55,11 @@ export function buildRunSystemPrompt(
  */
 export function runToolSchemas(): readonly LlmToolSchema[] {
   const dynamic = [
+    {
+      name: "list_subagent",
+      description: createListSubagentTool().description,
+      inputSchema: ListSubagentParamsSchema,
+    },
     {
       name: "task_create",
       description:
@@ -295,6 +301,7 @@ export class AgentRunner {
       registry.register(tool);
     }
     registry.register(createNoteSaveTool(noteStore));
+    registry.register(createListSubagentTool());
 
     // 编排层传入的完整快照直接复用；直接调用 Runner 时也加载同样的两处规则。
     const systemPrompt =

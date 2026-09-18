@@ -192,3 +192,16 @@ description: 解释项目代码
 项目技能按 `name` 覆盖全局技能，无效文件跳过并显示诊断。每轮运行重新发现，system prompt 只列出名称、描述和路径。
 
 TUI 输入 `/skill`，或运行 `mc --goal "/skill"` 列出目录，不调用模型。`/skill explain [参数]` 将正文及参数加入本轮用户消息；未知技能在创建轮次前拒绝。展开内容计入上下文预算并持久保存在模型历史中，后续修改技能文件不会改变历史。技能不会改变工具权限。
+
+## 子 Agent 类型
+
+主 Agent 通过 `list_subagent` 实时发现可用类型。内置 `planner` 和 `reviewer` 仅允许 `read`，返回文本计划或审核结果；`executor` 可以读写文件、运行 Shell 并管理自己的任务。项目 `.minicode/agents/<name>.toml` 覆盖同名内置类型，文件名决定名称：
+
+```toml
+[agent]
+description = "读取并分析项目"
+system_prompt = "阅读相关文件并返回分析结果。"
+allowed_tools = ["read"]
+```
+
+三个字段均必填，`allowed_tools = []` 表示无工具。白名单使用完整工具名称（包括 `mcp__<server>__<tool>`），未知工具或嵌套委派工具会被拒绝。类型使用父 Agent 的模型。

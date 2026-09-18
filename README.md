@@ -176,3 +176,19 @@ LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run 
 - [Stage4 上下文管理与验证矩阵](STAGE4_CONTEXT.md)
 - [TUI 使用说明](TUI.md)
 - [Wire protocol](WIRE_PROTOCOL.md)
+
+## Skills
+
+技能从项目 `.minicode/skills/<目录>/SKILL.md` 和全局 `$MINICODE_HOME/skills/<目录>/SKILL.md` 发现（默认 `~/.minicode/skills`）。文件以 YAML frontmatter 开头：
+
+```markdown
+---
+name: explain
+description: 解释项目代码
+---
+阅读相关代码，说明调用过程。
+```
+
+项目技能按 `name` 覆盖全局技能，无效文件跳过并显示诊断。每轮运行重新发现，system prompt 只列出名称、描述和路径。
+
+TUI 输入 `/skill`，或运行 `mc --goal "/skill"` 列出目录，不调用模型。`/skill explain [参数]` 将正文及参数加入本轮用户消息；未知技能在创建轮次前拒绝。展开内容计入上下文预算并持久保存在模型历史中，后续修改技能文件不会改变历史。技能不会改变工具权限。

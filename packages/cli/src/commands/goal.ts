@@ -1,3 +1,4 @@
+import { listSkills, formatSkills, NdjsonRpcConnection } from "@minicode/client";
 import {
   AgentRunClient,
   type AgentRunClientResult,
@@ -217,6 +218,23 @@ export interface GoalCommandOptions {
 export async function runGoalCommand(options: GoalCommandOptions): Promise<number> {
   const writeStdout: GoalOutputSink = options.stdout ?? ((text) => process.stdout.write(text));
   const writeStderr: GoalOutputSink = options.stderr ?? ((text) => process.stderr.write(text));
+
+  if (options.goal.trim() === "/skill") {
+    let connection: NdjsonRpcConnection | undefined;
+    try {
+      connection = await (options.connect ?? NdjsonRpcConnection.connect)(options.endpoint);
+      const result = await listSkills(connection, options.workspaceRoot);
+      writeStdout(`${formatSkills(result)}\n`);
+      for (const diagnostic of result.diagnostics)
+        writeStderr(`${diagnostic.path}: ${diagnostic.message}\n`);
+      return 0;
+    } catch (error) {
+      writeStderr(`error: ${error instanceof Error ? error.message : "skill list failed"}\n`);
+      return 2;
+    } finally {
+      connection?.close();
+    }
+  }
 
   const reducer = new GoalEventReducer();
   let cancelledByUser = false;

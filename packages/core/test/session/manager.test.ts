@@ -1378,3 +1378,109 @@ describe("SessionManager prepared capability snapshots", () => {
     }
   });
 });
+
+describe("SessionManager skill admission", () => {
+  test("unknown skills and expanded content budgets reject before ID allocation", async () => {
+    const catalog = {
+      skills: [
+        {
+          name: "large",
+          description: "large",
+          path: "/skills/large/SKILL.md",
+          body: "x".repeat(20000),
+        },
+      ],
+      diagnostics: [],
+    };
+    const snapshot = createRunSnapshot("rules", [], catalog);
+    const stub = new StubRunner(async (request) => completionFor(request));
+    let allocations = 0;
+    const h = createHarness(
+      { run: stub.run.bind(stub), prepareSnapshot: async () => snapshot },
+      {
+        environment: {
+          ...ENVIRONMENT,
+          LLM_CONTEXT_WINDOW_TOKENS: "4096",
+          LLM_MAX_OUTPUT_TOKENS: "1024",
+          MINICODE_COMPACTION_RESERVE_TOKENS: "1024",
+          MINICODE_COMPACTION_KEEP_RECENT_TOKENS: "1000",
+        },
+        newId: () => {
+          allocations++;
+          return crypto.randomUUID();
+        },
+      },
+    );
+    try {
+      await h.manager.ready();
+      const session = unwrapResult(await h.manager.create("/workspace"));
+      const unknown = await h.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "/skill missing",
+      });
+      expect(!unknown.ok && unknown.error.code).toBe("invalid_params");
+      const large = await h.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_B as ClientMessageId,
+        content: "/skill large",
+      });
+      expect(!large.ok && large.error.code).toBe("context_limit_exceeded");
+      expect(allocations).toBe(0);
+      expect(unwrapResult(await h.store.load(session.sessionId)).turns).toHaveLength(0);
+    } finally {
+      await h.manager.shutdown();
+    }
+  });
+
+  test("raw command remains idempotent while expanded body persists through reload", async () => {
+    let body = "first body";
+    let discoveries = 0;
+    const stub = new StubRunner(async (request) => {
+      const outcome = completionFor(request);
+      return {
+        completion: {
+          ...outcome.completion,
+          messages: [
+            { role: "user", content: [...(request.userContent ?? [])] },
+            { role: "assistant", content: [{ type: "text", text: "done" }] },
+          ],
+        },
+      };
+    });
+    const h = createHarness({
+      run: stub.run.bind(stub),
+      prepareSnapshot: async () => {
+        discoveries++;
+        return createRunSnapshot("rules", [], {
+          skills: [{ name: "demo", description: "demo", path: "/skills/demo/SKILL.md", body }],
+          diagnostics: [],
+        });
+      },
+    });
+    try {
+      await h.manager.ready();
+      const session = unwrapResult(await h.manager.create("/workspace"));
+      const input = {
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "/skill demo args",
+      };
+      const prepared = unwrapResult(await h.manager.prepareMessage(input));
+      body = "changed body";
+      expect(unwrapResult(await h.manager.prepareMessage(input)).idempotent).toBe(true);
+      prepared.activate();
+      await waitForIdle(h.manager);
+      expect(stub.requests[0]?.goal).toBe(input.content);
+      expect(JSON.stringify(stub.requests[0]?.userContent)).toContain("first body");
+      expect(unwrapResult(await h.manager.prepareMessage(input)).idempotent).toBe(true);
+      expect(discoveries).toBe(1);
+      const restored = new SessionStore(HOME, h.storage);
+      const turns = unwrapResult(await restored.load(session.sessionId)).turns;
+      expect(JSON.stringify(turns[0]?.messages)).toContain("first body");
+      expect(JSON.stringify(turns[0]?.messages)).not.toContain("changed body");
+    } finally {
+      await h.manager.shutdown();
+    }
+  });
+});

@@ -70,6 +70,13 @@ class FakeController implements TuiSessionController {
       ),
     };
   }
+  /** 模拟技能目录，不提交消息。 */
+  async listSkills() {
+    return {
+      skills: [{ name: "demo", description: "示例技能", path: "/skills/demo/SKILL.md" }],
+      diagnostics: [],
+    };
+  }
   /** 记录提交，不生成乐观事件。 */
   async sendMessage(content: string): Promise<void> {
     this.sent.push(content);
@@ -757,4 +764,18 @@ describe("TUI manual compaction", () => {
     await exit(setup);
     expect(await code).toBe(0);
   });
+});
+
+test("/skill displays local directory without creating a chat message", async () => {
+  const { setup, controller, code } = await start();
+  await setup.mockInput.typeText("/skill");
+  setup.mockInput.pressEnter();
+  await setup.waitForFrame((frame) => frame.includes("demo: 示例技能"));
+  expect(controller.sent).toEqual([]);
+  await setup.mockInput.typeText("/skill demo args");
+  setup.mockInput.pressEnter();
+  await setup.waitForFrame(() => controller.sent.length === 1);
+  expect(controller.sent).toEqual(["/skill demo args"]);
+  await exit(setup);
+  expect(await code).toBe(0);
 });

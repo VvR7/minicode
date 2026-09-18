@@ -4,7 +4,7 @@ import type { RunState } from "../model.ts";
 export function formatChatHelp(run: RunState, readOnly: boolean): string {
   if (readOnly) return "read-only audit  /exit exit  PgUp/PgDn scroll";
   if (run === "running" || run === "cancelling") return "Ctrl+C cancel  PgUp/PgDn scroll";
-  return "Enter send  Ctrl+Enter newline  /compact [focus]  /new new chat  /exit exit";
+  return "Enter send  Ctrl+Enter newline  /skill [name args]  /compact [focus]  /new new chat  /exit exit";
 }
 
 /** 选择页固定帮助栏。 */

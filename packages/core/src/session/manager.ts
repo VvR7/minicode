@@ -1,3 +1,4 @@
+import { expandSkillCommand } from "../skills/command.ts";
 import type {
   AgentCancelResult,
   AgentEvent,
@@ -106,6 +107,7 @@ interface ActiveExecution {
   readonly runId: RunId;
   readonly clientMessageId: ClientMessageId;
   readonly userMessage: string;
+  readonly userContent?: readonly import("../llm/types.ts").LlmContentPart[];
   readonly workspaceRoot: string;
   readonly history: readonly LlmMessage[];
   readonly contextEntries: readonly ContextEntry[];
@@ -594,6 +596,9 @@ export class SessionManager {
       notes: snapshot.notes,
       files: files.value,
     });
+    const expanded = expandSkillCommand(content, runSnapshot.skillCatalog);
+    if (!expanded.ok)
+      return this.#failure("invalid_params", expanded.message, snapshot.meta.sessionId);
     const budgetConfig = loadContextBudgetConfig(this.#environment);
     if (!budgetConfig.ok) {
       return this.#internal("context budget configuration is invalid");
@@ -604,7 +609,7 @@ export class SessionManager {
     const fixedTokens =
       this.#estimator(runSnapshot.systemPrompt) +
       this.#estimator(runSnapshot.toolSchemas) +
-      this.#estimator(content);
+      this.#estimator(expanded.userContent ?? content);
     if (fixedTokens + budgetConfig.value.maxOutputTokens > budgetConfig.value.contextWindowTokens) {
       return this.#failure(
         "context_limit_exceeded",
@@ -646,6 +651,7 @@ export class SessionManager {
       runId,
       clientMessageId,
       userMessage: content,
+      ...(expanded.userContent === undefined ? {} : { userContent: expanded.userContent }),
       workspaceRoot: snapshot.meta.workspaceRoot,
       history,
       contextEntries: buildContextEntries(snapshot.turns, snapshot.compactions),
@@ -769,6 +775,7 @@ export class SessionManager {
           sessionId: execution.sessionId,
           runId: execution.runId,
           goal: execution.userMessage,
+          ...(execution.userContent === undefined ? {} : { userContent: execution.userContent }),
           workspaceRoot: execution.workspaceRoot,
           history: execution.history,
           contextEntries: execution.contextEntries,

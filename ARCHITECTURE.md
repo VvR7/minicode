@@ -1,4 +1,4 @@
-# 架构与持久化（Stage2 / Stage3）
+# 架构与持久化（Stage2–Stage5）
 
 ## 进程与数据流
 
@@ -153,3 +153,20 @@ provider 仅接收 role/content。旧版无 compact 的日志仍按完整成功�
 SessionManager 负责执行权、不可容纳校验、journal 和独立会话压缩事件。SessionController 附着时
 从已成功消费的 session cursor 回放，避免只依靠 turn history 水位漏掉压缩进度。完整流程与配置
 见 [Stage4 上下文管理](STAGE4_CONTEXT.md)。
+
+
+## Stage5 扩展与子执行隔离
+
+父 run 的预检能力快照包含实际 Skills、规则与 MCP 工具 Schema，并复用于模型调用及压缩。
+MCP 连接由 Core 管理，按工作区隔离，配置和发现结果固定至 daemon 重启。外部工具进入
+标准参数校验、审批和批次调度，Always 仅缓存 session + 完整 MCP 工具名。
+
+子 Agent 由最新类型文件限定 system prompt 和完整工具白名单，拥有父目录下独立的
+childRunId、历史、任务、私有 notes、压缩、Trace 和事件审计，不创建主 session turn。
+父流只发布生命周期摘要及带子身份的审批。后台 Registry 只属于一个父 run，查询验证归属，
+结果通过普通上下文恰好一次交付；父结束前等待并调用模型综合，失败或取消时排空子执行。
+重启只将未结束子记录标 interrupted，不恢复后台任务或审批。
+
+工具批次全为 parallel 时先顺序准备审批再并发执行，任何 serial 工具则整批串行；
+模型结果保留请求顺序，终态事件按完成顺序发布。完整配置、持久目录与验证说明见
+[Stage5 扩展能力](STAGE5_EXTENSIONS.md)。

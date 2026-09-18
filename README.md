@@ -21,6 +21,8 @@ Stage4 上下文管理已接入：每次模型调用前按需生成可恢复的�
 模型超窗时压缩后重试一次。完整历史保持可审计，压缩事件与占用在多窗口同步。
 默认 reserve 为 16384 token、近期原文保留目标为 20000 token。详见 [Stage4 上下文管理](STAGE4_CONTEXT.md)。
 
+Stage5 已接入 Skills、同步/后台子 Agent、MCP 外部工具及工具批次并行。配置示例、隔离边界和完整验证矩阵见 [Stage5 扩展能力](STAGE5_EXTENSIONS.md)。
+
 ## 环境要求
 
 - macOS 或 Linux
@@ -169,11 +171,12 @@ LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run 
 
 ## 文档
 
-- [架构与持久化（Stage2 / Stage3）](ARCHITECTURE.md)
+- [架构与持久化（Stage2–Stage5）](ARCHITECTURE.md)
 - [Stage2 验证矩阵](STAGE2_TEST_MATRIX.md)
 - [Stage3 权限与工具](STAGE3_PERMISSIONS.md)
 - [Stage3 验证矩阵](STAGE3_TEST_MATRIX.md)
 - [Stage4 上下文管理与验证矩阵](STAGE4_CONTEXT.md)
+- [Stage5 扩展能力、配置与验证矩阵](STAGE5_EXTENSIONS.md)
 - [TUI 使用说明](TUI.md)
 - [Wire protocol](WIRE_PROTOCOL.md)
 

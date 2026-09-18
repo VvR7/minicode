@@ -104,9 +104,8 @@ export class TraceWriter {
     const worker = this.#workerPromise ?? Promise.resolve();
     this.#stopPromise = new Promise<TraceShutdownReport>((resolve) => {
       const timeout = setTimeout(() => {
-        this.#timedOut = true;
+        this.#markTimedOut();
         this.#abandoned = true;
-        this.#timedOutPendingRecords = this.#queue.length + this.#inFlightRecords;
         this.#abortController.abort();
         this.#wake();
         void this.#handle?.close().catch(() => {});
@@ -164,7 +163,7 @@ export class TraceWriter {
         continue;
       }
       if (this.#stopped && Date.now() >= this.#stopDeadline) {
-        this.#timedOut = true;
+        this.#markTimedOut();
         break;
       }
       const record = this.#queue.shift() as TraceRecordInput;
@@ -355,6 +354,13 @@ export class TraceWriter {
       this.#wakeResolve = resolve;
     });
     this.#wakeResolve = null;
+  }
+
+  /** 两条超时路径共用首次待刷数量快照，避免后续 I/O 收尾改变报告。 */
+  #markTimedOut(): void {
+    if (this.#timedOut) return;
+    this.#timedOutPendingRecords = this.#queue.length + this.#inFlightRecords;
+    this.#timedOut = true;
   }
 
   /** 组装 shutdown 诊断报告。 */

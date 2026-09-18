@@ -172,9 +172,12 @@ export function renderWireProtocol(): string {
 - Core prepares a fixed system prompt/tool-schema snapshot before allocating turn/run IDs, then
   reuses it for the provider, tracing, and compaction budget checks. Tools may export an original
   JSON Schema while retaining local Zod validation.
-- Tools may declare serial/parallel execution mode (default parallel). This foundation keeps the
-  existing sequential loop; batch scheduling is delivered separately. An explicit null execution
-  timeout disables only the tool timer, preserving external cancellation and provider timeouts.
+- Tools may declare serial/parallel execution mode (default parallel). All-parallel batches complete
+  argument validation and approval in request order before Promise.all execution; any serial tool
+  makes the whole batch sequential. Failed calls remain independent observations, and results keep
+  request order even when completion events arrive out of order. Infrastructure failure cancels and
+  drains the batch. An explicit null execution timeout disables only the tool timer, preserving
+  external cancellation and provider timeouts.
 
 ## Sessions
 

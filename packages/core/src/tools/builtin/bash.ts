@@ -18,6 +18,7 @@ export type BashParams = z.infer<typeof BashParamsSchema>;
 
 /** 通过 `/bin/bash -lc` 执行命令，合并输出并在取消/超时时终止整个进程组。 */
 export class BashTool implements Tool<BashParams> {
+  readonly executeMode = "serial" as const;
   readonly name = "bash";
   readonly description =
     "Run a command with /bin/bash -lc. timeout is 1..120 seconds and defaults to 120.";

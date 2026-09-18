@@ -13,6 +13,7 @@ export type EditParams = z.infer<typeof EditParamsSchema>;
 
 /** 对 UTF-8 文件执行精确文本替换，并复用 write 的原子提交。 */
 export class EditTool implements Tool<EditParams> {
+  readonly executeMode = "serial" as const;
   readonly name = "edit";
   readonly description =
     "Atomically replace an exact text fragment. A non-unique match requires replaceAll=true.";

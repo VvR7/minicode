@@ -15,9 +15,11 @@ export type NoteSaveParams = z.infer<typeof NoteSaveParamsSchema>;
 export function createNoteSaveTool(noteStore: NoteStore): Tool<NoteSaveParams> {
   return {
     name: "note_save",
+    executeMode: "serial",
     description:
       "Persist a note to the session notes. Notes are injected into future turns' context.",
     inputSchema: NoteSaveParamsSchema,
+    /** 将本次笔记写入绑定的存储，不与其他写入并行。 */
     async execute(params) {
       const result = await noteStore.append(params.content);
       if (!result.ok) {

@@ -8,6 +8,9 @@ export const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
 /** 工具调用的默认最大尝试次数。 */
 export const DEFAULT_TOOL_MAX_ATTEMPTS = 3;
 
+/** 单个工具参与模型回复批次时的调度模式；省略时按 parallel 处理。 */
+export type ToolExecuteMode = "serial" | "parallel";
+
 /** 工具执行时的隔离上下文。 */
 export interface ToolExecutionContext {
   /** 已 realpath 化的 workspace 绝对路径。 */
@@ -145,8 +148,11 @@ export interface Tool<Params = Record<string, unknown>> {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: z.ZodType<Params>;
-  /** 返回该次调用的执行超时；省略时使用统一 10 秒。 */
-  timeoutMs?(params: Params): number;
+  readonly executeMode?: ToolExecuteMode;
+  /** 外部工具保留原始 JSON Schema；本地参数校验仍由 inputSchema 承担。 */
+  readonly llmInputSchema?: Record<string, unknown>;
+  /** 省略时使用统一 10 秒；null 表示只响应调用方取消，不设置执行定时器。 */
+  timeoutMs?(params: Params): number | null;
   /** 返回产出；失败抛 ToolError。 */
   execute(params: Params, context: ToolExecutionContext): Promise<ToolOutput> | ToolOutput;
 }

@@ -1,3 +1,6 @@
+import type { PermissionManager } from "../permissions/manager.ts";
+import type { PermissionScope } from "../permissions/policy.ts";
+import type { ToolRegistry } from "./registry.ts";
 import {
   DEFAULT_TOOL_MAX_ATTEMPTS,
   DEFAULT_TOOL_TIMEOUT_MS,
@@ -9,9 +12,6 @@ import {
   type ToolResult,
   type ToolRetry,
 } from "./types.ts";
-import type { ToolRegistry } from "./registry.ts";
-import type { PermissionManager } from "../permissions/manager.ts";
-import type { PermissionScope } from "../permissions/policy.ts";
 
 const DEFAULT_RETRY_DELAYS_MS = [2_000, 4_000] as const;
 
@@ -212,11 +212,16 @@ export class ToolInvoker {
     const controller = new AbortController();
     let timedOut = false;
     const onExternalAbort = (): void => controller.abort();
-    const timeoutMs = tool.timeoutMs?.(parsed.data) ?? this.#timeoutMs;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutMs);
+    // null 是显式无限等待，不能用 ?? 把它还原成默认超时。
+    const requestedTimeout = tool.timeoutMs?.(parsed.data);
+    const timeoutMs = requestedTimeout === undefined ? this.#timeoutMs : requestedTimeout;
+    const timer =
+      timeoutMs === null
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+          }, timeoutMs);
     if (context.signal.aborted) {
       controller.abort();
     } else {
@@ -310,7 +315,7 @@ export class ToolInvoker {
         permissionSource,
       );
     } finally {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       context.signal.removeEventListener("abort", onExternalAbort);
     }
   }

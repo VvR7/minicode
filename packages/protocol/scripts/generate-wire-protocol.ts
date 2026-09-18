@@ -15,12 +15,12 @@ import {
   JsonRpcNotificationEnvelopeSchema,
   JsonRpcRequestEnvelopeSchema,
   MAX_JSON_RPC_FRAME_BYTES,
+  PermissionRespondRequestSchema,
+  PermissionRespondSuccessResponseSchema,
   PingParamsSchema,
   PingRequestSchema,
   PingSuccessResponseSchema,
   PongResultSchema,
-  PermissionRespondRequestSchema,
-  PermissionRespondSuccessResponseSchema,
   SessionCompactRequestSchema,
   SessionCompactSuccessResponseSchema,
   SessionCreateRequestSchema,
@@ -37,6 +37,8 @@ import {
   SessionSubscribeRequestSchema,
   SessionSubscribeSuccessResponseSchema,
   SessionSummarySchema,
+  SkillListRequestSchema,
+  SkillListSuccessResponseSchema,
 } from "../src/index.ts";
 
 const outputUrl = new URL("../../../WIRE_PROTOCOL.md", import.meta.url);
@@ -59,6 +61,8 @@ export function renderWireProtocol(): string {
     schemaBlock("AgentCancelSuccessResponse", AgentCancelSuccessResponseSchema),
     schemaBlock("PermissionRespondRequest", PermissionRespondRequestSchema),
     schemaBlock("PermissionRespondSuccessResponse", PermissionRespondSuccessResponseSchema),
+    schemaBlock("SkillListRequest", SkillListRequestSchema),
+    schemaBlock("SkillListSuccessResponse", SkillListSuccessResponseSchema),
     schemaBlock("AgentEvent", AgentEventSchema),
     schemaBlock("EventSubscribeRequest", EventSubscribeRequestSchema),
     schemaBlock("EventSubscribeSuccessResponse", EventSubscribeSuccessResponseSchema),
@@ -153,6 +157,24 @@ export function renderWireProtocol(): string {
   compaction messages. Provider messages exclude this metadata.
 - Core implements persisted incremental checkpoints, automatic threshold/context-error compaction,
   and idle manual compaction. TUI exposes \`/compact [focus]\`; CLI reports automatic progress on stderr.
+
+## Stage5 extension contracts
+
+- \`skill.list\` defines a workspace-scoped catalog response with name, description, SKILL.md path,
+  and bounded diagnostics. Handler registration and command expansion arrive with Skills support;
+  this contract alone does not enable the method on Core.
+- Durable \`subagent.started\` / \`subagent.finished\` events belong to the parent session/run and carry
+  the isolated childRunId, profile name, background flag, and bounded terminal summary. Child task
+  events do not belong to the parent's task graph.
+- Permission summaries support MCP server/tool identity and a bounded, publisher-redacted parameter
+  preview. Requested/resolved events may carry childRunId without changing the parent run scope.
+  Legacy events without childRunId remain valid. MCP approval policy is implemented with MCP tools.
+- Core prepares a fixed system prompt/tool-schema snapshot before allocating turn/run IDs, then
+  reuses it for the provider, tracing, and compaction budget checks. Tools may export an original
+  JSON Schema while retaining local Zod validation.
+- Tools may declare serial/parallel execution mode (default parallel). This foundation keeps the
+  existing sequential loop; batch scheduling is delivered separately. An explicit null execution
+  timeout disables only the tool timer, preserving external cancellation and provider timeouts.
 
 ## Sessions
 

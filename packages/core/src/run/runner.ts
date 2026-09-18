@@ -1,23 +1,24 @@
 import { dirname, join } from "node:path";
 import type { Environment, RunId, SessionId, TaskGraphSnapshot } from "@minicode/protocol";
-import { composeSystemPrompt } from "../agent/system-prompt.ts";
-import { loadContextFiles, type ContextFiles } from "../memory/context-loader.ts";
+import { z } from "zod";
 import { ExecutionContext } from "../agent/context.ts";
-import { AgentLoop, DEFAULT_SYSTEM_PROMPT, type ContextCompactionHook } from "../agent/loop.ts";
+import { AgentLoop, type ContextCompactionHook, DEFAULT_SYSTEM_PROMPT } from "../agent/loop.ts";
+import { composeSystemPrompt } from "../agent/system-prompt.ts";
+import { type CompactOptions, Compactor, type ContextEntry } from "../compact/index.ts";
 import type { EventBus } from "../events/event-bus.ts";
 import { AnthropicAdapter } from "../llm/anthropic-adapter.ts";
-import { loadLlmConfig } from "../llm/config.ts";
 import type { LlmConfig } from "../llm/config.ts";
+import { loadLlmConfig } from "../llm/config.ts";
 import type { LlmProvider } from "../llm/provider.ts";
-import type { LlmMessage } from "../llm/types.ts";
-import type { LlmToolSchema } from "../llm/types.ts";
-import { z } from "zod";
-import { createNoteSaveTool, NoteSaveParamsSchema } from "../session/note-tool.ts";
+import type { LlmMessage, LlmToolSchema } from "../llm/types.ts";
+import { type ContextFiles, loadContextFiles } from "../memory/context-loader.ts";
+import { PermissionManager } from "../permissions/manager.ts";
+import { loadCompactionConfig } from "../session/compaction-config.ts";
 import { loadContextBudgetConfig } from "../session/context-budget.ts";
+import { createNoteSaveTool, NoteSaveParamsSchema } from "../session/note-tool.ts";
 import { NoteStore } from "../session/notes.ts";
 import { nodeSessionStorage } from "../session/storage.ts";
-import { TaskManager, nodeTaskStorage, tasksPath } from "../tasks/task-store.ts";
-import type { TaskStorage } from "../tasks/types.ts";
+import { nodeTaskStorage, TaskManager, tasksPath } from "../tasks/task-store.ts";
 import {
   createTaskTools,
   TaskCreateParamsSchema,
@@ -25,15 +26,14 @@ import {
   TaskListParamsSchema,
   TaskUpdateParamsSchema,
 } from "../tasks/tools.ts";
+import type { TaskStorage } from "../tasks/types.ts";
 import { builtinTools } from "../tools/builtin/index.ts";
 import { ToolInvoker } from "../tools/invoker.ts";
 import { ToolRegistry } from "../tools/registry.ts";
 import type { Tool } from "../tools/types.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
 import type { RunCompletion } from "./completion.ts";
-import { Compactor, type CompactOptions, type ContextEntry } from "../compact/index.ts";
-import { loadCompactionConfig } from "../session/compaction-config.ts";
-import { PermissionManager } from "../permissions/manager.ts";
+import { createRunSnapshot, type RunSnapshot, type RunSnapshotRequest } from "./snapshot.ts";
 
 /** 系统提示词中注入 notes 的固定区块标题。 */
 export const SESSION_NOTES_HEADING = "Session Notes";
@@ -97,6 +97,14 @@ export function runToolSchemas(): readonly LlmToolSchema[] {
   ];
 }
 
+/** 默认能力目录的快照入口，测试执行器与直接调用 Runner 使用相同组装规则。 */
+export function buildRunSnapshot(
+  notes: string,
+  files: ContextFiles = { global: "", project: "" },
+): RunSnapshot {
+  return createRunSnapshot(buildRunSystemPrompt(notes, files), runToolSchemas());
+}
+
 export interface AgentRunRequest {
   readonly sessionId: SessionId;
   readonly runId: RunId;
@@ -108,6 +116,8 @@ export interface AgentRunRequest {
   readonly compact?: ContextCompactionHook;
   /** 已包含本轮开始前 notes 快照的系统提示词。 */
   readonly systemPrompt?: string;
+  /** accepted 前准备的提示词与工具目录；提供时优先于旧 systemPrompt 字段。 */
+  readonly snapshot?: RunSnapshot;
   /** 编排层注入的 run 级 trace；缺失时跳过 trace 记录。 */
   readonly trace?: TraceRecorder;
 }
@@ -150,6 +160,11 @@ export class AgentRunner {
     this.#providerFactory = options.providerFactory ?? ((config) => new AnthropicAdapter(config));
     this.#taskStorage = options.taskStorage ?? nodeTaskStorage;
     this.#permissions = options.permissions ?? new PermissionManager(options.bus);
+  }
+
+  /** 在 preflight 前准备能力快照；后续扩展在此接入 workspace 的 skills/MCP。 */
+  async prepareSnapshot(request: RunSnapshotRequest): Promise<RunSnapshot> {
+    return buildRunSnapshot(request.notes, request.files);
   }
 
   /** 执行一次隔离 run；任何组装异常都收敛为包含本轮用户消息的安全终态。 */
@@ -268,6 +283,7 @@ export class AgentRunner {
 
     // 编排层传入的完整快照直接复用；直接调用 Runner 时也加载同样的两处规则。
     const systemPrompt =
+      request.snapshot?.systemPrompt ??
       request.systemPrompt ??
       buildRunSystemPrompt(
         (await nodeSessionStorage.readFile(
@@ -278,6 +294,7 @@ export class AgentRunner {
     const invoker = new ToolInvoker(registry, { permissions: this.#permissions });
     const loop = new AgentLoop(provider, registry, invoker, this.#bus, {
       systemPrompt,
+      toolSchemas: request.snapshot?.toolSchemas ?? registry.toolSchemas(),
       ...(request.trace === undefined ? {} : { trace: request.trace }),
       contextWindowTokens: contextBudgetConfig.value.contextWindowTokens,
       compactionConfig: compactionConfig.value,

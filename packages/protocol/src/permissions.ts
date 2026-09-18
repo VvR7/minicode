@@ -26,6 +26,7 @@ export const PermissionRiskCategorySchema = z.enum([
   "bash:network",
   "bash:process-execution",
   "bash:other",
+  "mcp",
 ]);
 export type PermissionRiskCategory = z.infer<typeof PermissionRiskCategorySchema>;
 
@@ -46,6 +47,13 @@ const PermissionPathSchema = z.string().min(1).max(MAX_PERMISSION_PATH_CHARS);
 
 /** 审批事件中的有界展示摘要；不承载完整 write 内容。 */
 export const PermissionRequestSummarySchema = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("mcp"),
+    server: z.string().min(1).max(128),
+    tool: z.string().min(1).max(128),
+    /** 发布方先脱敏再截断，协议不传递完整工具参数。 */
+    paramsPreview: z.string().max(MAX_PERMISSION_PREVIEW_CHARS),
+  }),
   z.strictObject({
     kind: z.literal("read"),
     path: PermissionPathSchema,

@@ -7,6 +7,13 @@ import type { LlmMessage } from "../../src/llm/types.ts";
 import type { AgentRunOutcome, AgentRunRequest } from "../../src/run/runner.ts";
 import { RunMetadataStore } from "../../src/run/metadata.ts";
 import {
+  createRunSnapshot,
+  type RunSnapshot,
+  type RunSnapshotRequest,
+} from "../../src/run/snapshot.ts";
+import { defaultContextBudgetEstimator } from "../../src/session/context-budget.ts";
+import { buildContextEntries } from "../../src/session/session-store.ts";
+import {
   SessionManager,
   type SessionManagerOptions,
   type SessionRunExecutor,
@@ -1097,7 +1104,11 @@ describe("SessionManager restart reconciliation", () => {
 });
 
 /** 准备一轮可压缩原文与当前模型摘要服务，验证会话编排和 journal 的真实组合。 */
-async function compactionHarness(summaryError = false, block?: Promise<void>) {
+async function compactionHarness(
+  summaryError = false,
+  block?: Promise<void>,
+  snapshot?: RunSnapshot,
+) {
   const { Compactor } = await import("../../src/compact/compactor.ts");
   const { FakeProvider, textResponse } = await import("../agent/test-helpers.ts");
   const { LlmError } = await import("../../src/llm/errors.ts");
@@ -1133,6 +1144,7 @@ async function compactionHarness(summaryError = false, block?: Promise<void>) {
   const started = Promise.withResolvers<void>();
   const runner: SessionRunExecutor = {
     run: stub.run.bind(stub),
+    ...(snapshot === undefined ? {} : { prepareSnapshot: async () => snapshot }),
     async compact(options) {
       started.resolve();
       await block;
@@ -1156,6 +1168,45 @@ async function compactionHarness(summaryError = false, block?: Promise<void>) {
 }
 
 describe("SessionManager compaction lifecycle", () => {
+  test("manual compaction includes prepared extension schemas in both before and after budgets", async () => {
+    const snapshot = createRunSnapshot("workspace-specific rules", [
+      {
+        name: "mcp__docs__search",
+        description: "external catalog",
+        inputSchema: { type: "object" },
+      },
+    ]);
+    const h = await compactionHarness(false, undefined, snapshot);
+    try {
+      const before = unwrapResult(await h.store.load(h.sessionId));
+      const fixedTokens =
+        defaultContextBudgetEstimator(snapshot.systemPrompt) +
+        defaultContextBudgetEstimator(snapshot.toolSchemas);
+      const entriesBefore = buildContextEntries(before.turns, before.compactions);
+      const result = unwrapResult(await h.manager.compact(h.sessionId));
+      expect(result.status).toBe("compacted");
+      const after = unwrapResult(await h.store.load(h.sessionId));
+      const started = after.sessionEvents.find(
+        (event) => event.type === "session.compaction_started",
+      );
+      expect(started?.payload.tokensBefore).toBe(
+        fixedTokens +
+          defaultContextBudgetEstimator(
+            entriesBefore.map(({ role, content }) => ({ role, content })),
+          ),
+      );
+      const entriesAfter = buildContextEntries(after.turns, after.compactions);
+      expect(result.result?.tokensAfter).toBe(
+        fixedTokens +
+          defaultContextBudgetEstimator(
+            entriesAfter.map(({ role, content }) => ({ role, content })),
+          ),
+      );
+    } finally {
+      await h.manager.shutdown();
+    }
+  });
+
   test("manual focus works with automatic compaction disabled, preserves audit and durable events", async () => {
     const h = await compactionHarness();
     const result = await h.manager.compact(h.sessionId, "focus on intent");
@@ -1245,5 +1296,85 @@ describe("SessionManager compaction lifecycle", () => {
     gate.resolve();
     await waitFor(() => h.manager.activeCount === 0);
     await h.manager.shutdown();
+  });
+});
+
+describe("SessionManager prepared capability snapshots", () => {
+  test("rejects oversized extension schemas before allocating turn/run identifiers", async () => {
+    const snapshot = createRunSnapshot("extension rules", [
+      { name: "external", description: "external tool", inputSchema: {} },
+    ]);
+    const stub = new StubRunner(async (request) => completionFor(request));
+    let allocations = 0;
+    const h = createHarness(
+      { run: stub.run.bind(stub), prepareSnapshot: async () => snapshot },
+      {
+        environment: {
+          ...ENVIRONMENT,
+          LLM_CONTEXT_WINDOW_TOKENS: "4096",
+          LLM_MAX_OUTPUT_TOKENS: "1024",
+          MINICODE_COMPACTION_RESERVE_TOKENS: "1024",
+          MINICODE_COMPACTION_KEEP_RECENT_TOKENS: "1000",
+        },
+        estimator: (value) => (value === snapshot.toolSchemas ? 4000 : 1),
+        newId: () => {
+          allocations += 1;
+          return crypto.randomUUID();
+        },
+      },
+    );
+    try {
+      await h.manager.ready();
+      const session = unwrapResult(await h.manager.create("/workspace"));
+      const result = await h.manager.prepareMessage({
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "small request",
+      });
+      expect(!result.ok && result.error.code).toBe("context_limit_exceeded");
+      expect(allocations).toBe(0);
+      expect(stub.requests).toHaveLength(0);
+      expect(unwrapResult(await h.store.load(session.sessionId)).turns).toHaveLength(0);
+    } finally {
+      await h.manager.shutdown();
+    }
+  });
+
+  test("passes the exact accepted snapshot to execution without rediscovery on duplicate requests", async () => {
+    const snapshot = createRunSnapshot("original capability snapshot", [
+      { name: "external", description: "accepted tool", inputSchema: {} },
+    ]);
+    const nextSnapshot = createRunSnapshot("changed catalog", []);
+    let currentSnapshot = snapshot;
+    const preparations: RunSnapshotRequest[] = [];
+    const stub = new StubRunner(async (request) => completionFor(request));
+    const h = createHarness({
+      run: stub.run.bind(stub),
+      async prepareSnapshot(request) {
+        preparations.push(request);
+        return currentSnapshot;
+      },
+    });
+    try {
+      await h.manager.ready();
+      const session = unwrapResult(await h.manager.create("/workspace"));
+      const input = {
+        sessionId: session.sessionId,
+        clientMessageId: CLIENT_MESSAGE_A as ClientMessageId,
+        content: "work",
+      };
+      const prepared = unwrapResult(await h.manager.prepareMessage(input));
+      currentSnapshot = nextSnapshot;
+      const duplicate = unwrapResult(await h.manager.prepareMessage(input));
+      expect(duplicate.idempotent).toBe(true);
+      expect(preparations).toHaveLength(1);
+      expect(preparations[0]?.workspaceRoot).toBe(session.workspaceRoot);
+      prepared.activate();
+      await waitForIdle(h.manager);
+      expect(stub.requests[0]?.snapshot).toBe(snapshot);
+      expect(stub.requests[0]?.systemPrompt).toBe(snapshot.systemPrompt);
+    } finally {
+      await h.manager.shutdown();
+    }
   });
 });

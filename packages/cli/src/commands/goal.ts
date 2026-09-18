@@ -78,6 +78,10 @@ export class GoalEventReducer {
     switch (event.type) {
       case "run.started":
         return { stderr: ["run started"] };
+      case "subagent.started":
+      case "subagent.finished":
+        // 协议先支持新事件，子 Agent 功能接入后再增加生命周期展示。
+        return { stderr: [] };
       case "llm.model_selected":
         return { stderr: [`model ${event.payload.model} (${event.payload.provider})`] };
       case "llm.text_delta":

@@ -31,6 +31,7 @@ export function runTraceDirectory(
   homeDirectory: string,
   sessionId: SessionId,
   runId: RunId,
+  parentRunId?: RunId,
 ): string {
   if (!isAbsolute(homeDirectory)) {
     throw new Error("trace home directory must be absolute");
@@ -38,7 +39,11 @@ export function runTraceDirectory(
   const safeSessionId = SessionIdSchema.parse(sessionId);
   const safeRunId = RunIdSchema.parse(runId);
   const home = resolve(homeDirectory);
-  const directory = join(home, "sessions", safeSessionId, "runs", safeRunId);
+  const root = join(home, "sessions", safeSessionId, "runs");
+  const directory =
+    parentRunId === undefined
+      ? join(root, safeRunId)
+      : join(root, RunIdSchema.parse(parentRunId), "subagents", safeRunId);
   const suffix = relative(home, directory);
   if (suffix.startsWith("..") || isAbsolute(suffix)) {
     throw new Error("trace directory escapes configured home");
@@ -57,6 +62,7 @@ export class TraceRecorder {
   readonly #writer: TraceWriter;
   readonly #now: () => string;
 
+  /** 为主 run 或嵌套子 run 创建独立的有界审计 writer。 */
   constructor(
     sessionId: SessionId,
     runId: RunId,
@@ -64,6 +70,7 @@ export class TraceRecorder {
     storage: TraceStorage,
     homeDirectory: string,
     now: () => string = () => new Date().toISOString(),
+    parentRunId?: RunId,
   ) {
     this.#sessionId = sessionId;
     this.#runId = runId;
@@ -73,7 +80,7 @@ export class TraceRecorder {
       runId,
       config,
       storage,
-      runTraceDirectory(homeDirectory, sessionId, runId),
+      runTraceDirectory(homeDirectory, sessionId, runId, parentRunId),
     );
     this.#now = now;
   }

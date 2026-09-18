@@ -225,3 +225,7 @@ Authorization = "Bearer ${MCP_TOKEN}"
 ```
 
 stdio 服务器以当前工作区为 cwd，支持 `env` 字符串表；命令、参数、环境变量、HTTP 地址及 headers 支持 `${ENV_NAME}` 引用。发现的工具使用 `mcp__<server>__<tool>` 名称，保留原始 JSON Schema 并在本地校验。外部工具默认需要审批，Always 决策只作用于当前 session 的完整工具名，重启不保留。工具调用遵循批次并行规则，不自动重试；文本与结构化结果进入模型上下文，图片、音频及嵌入资源以类型或地址摘要展示。
+
+主 Agent 可先用 `list_subagent` 查找类型，再调用 `spawn_agent({ name, goal, context? })` 同步委派。子 Agent 使用相同模型及工作区，继承本轮固定的规则和 Skills 目录，仅接收显式任务和上下文，不继承父历史或 session notes。每个子 Agent 最多执行 20 步，工具来自类型文件中的完整名称白名单，禁止嵌套委派。
+
+子历史、任务、私有 notes、压缩 checkpoint 和事件审计保存在 `sessions/<sessionId>/runs/<parentRunId>/subagents/<childRunId>/`。父事件流仅收到生命周期摘要和带子身份的审批，Always 缓存与父 session 共用；取消和停机会排空子执行，重启将未结束的子记录标记为 interrupted，不自动续跑。

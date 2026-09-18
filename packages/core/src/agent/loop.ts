@@ -49,6 +49,7 @@ type EventDescriptor = Omit<
 >;
 
 export interface AgentLoopOptions {
+  readonly permissionParentRunId?: string;
   readonly systemPrompt?: string;
   /** 和接受请求前预算检查一致的固定工具目录。 */
   readonly toolSchemas?: readonly LlmToolSchema[];
@@ -91,6 +92,7 @@ function now(): string {
  * 不直接创建 ExecutionContext，由上层（AgentRunner）注入。
  */
 export class AgentLoop {
+  readonly #permissionParentRunId: string | undefined;
   readonly #provider: LlmProvider;
   readonly #registry: ToolRegistry;
   readonly #toolSchemas: readonly LlmToolSchema[];
@@ -112,6 +114,7 @@ export class AgentLoop {
     bus: EventBus,
     options: AgentLoopOptions = {},
   ) {
+    this.#permissionParentRunId = options.permissionParentRunId;
     this.#provider = provider;
     this.#registry = registry;
     this.#toolSchemas = options.toolSchemas ?? registry.toolSchemas();
@@ -453,8 +456,10 @@ export class AgentLoop {
       {
         permissionScope: {
           sessionId: context.sessionId,
-          runId: context.runId,
-          toolCallId: call.id,
+          runId: this.#permissionParentRunId ?? context.runId,
+          ...(this.#permissionParentRunId === undefined ? {} : { childRunId: context.runId }),
+          toolCallId:
+            this.#permissionParentRunId === undefined ? call.id : `${context.runId}:${call.id}`,
         },
         onRetry: async (retry) => {
           await this.#publish(

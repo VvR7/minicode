@@ -1,3 +1,4 @@
+import type { McpServerManager } from "../mcp/server-manager.ts";
 import { dirname, join } from "node:path";
 import type { Environment, RunId, SessionId, TaskGraphSnapshot } from "@minicode/protocol";
 import { z } from "zod";
@@ -131,6 +132,7 @@ export interface AgentRunRequest {
 
 export interface AgentRunnerOptions {
   readonly permissions?: PermissionManager;
+  readonly mcp?: McpServerManager;
   readonly environment: Environment;
   readonly bus: EventBus;
   /** CoreConfig.homeDirectory，用于构造 run 目录、tasks.json 与 notes.md 路径。 */
@@ -158,9 +160,11 @@ export class AgentRunner {
   readonly #providerFactory: (config: LlmConfig) => LlmProvider;
   readonly #taskStorage: TaskStorage;
   readonly #permissions: PermissionManager;
+  readonly #mcp: McpServerManager | undefined;
 
   /** 保存 run 组装所需的环境、存储、事件与可注入依赖。 */
   constructor(options: AgentRunnerOptions) {
+    this.#mcp = options.mcp;
     this.#environment = options.environment;
     this.#bus = options.bus;
     this.#homeDirectory = options.homeDirectory;
@@ -171,6 +175,8 @@ export class AgentRunner {
 
   /** 在 preflight 前准备能力快照；后续扩展在此接入 workspace 的 skills/MCP。 */
   async prepareSnapshot(request: RunSnapshotRequest): Promise<RunSnapshot> {
+    // 在真实工作区首次 preflight 时初始化连接，工具适配在后续阶段接入。
+    await this.#mcp?.forWorkspace(request.workspaceRoot);
     const loaded = await loadSystemPrompt(
       DEFAULT_SYSTEM_PROMPT,
       request.files,

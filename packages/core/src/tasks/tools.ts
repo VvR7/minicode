@@ -85,6 +85,7 @@ type TaskGetParams = z.infer<typeof TaskGetParamsSchema>;
 function taskCreateTool(deps: TaskToolDependencies): Tool<TaskCreateParams> {
   return {
     name: "task_create",
+    executeMode: "serial",
     description:
       "Create a task in the run's task plan. Use for complex multi-step goals before starting work.",
     inputSchema: TaskCreateParamsSchema,
@@ -109,6 +110,7 @@ function taskCreateTool(deps: TaskToolDependencies): Tool<TaskCreateParams> {
 function taskUpdateTool(deps: TaskToolDependencies): Tool<TaskUpdateParams> {
   return {
     name: "task_update",
+    executeMode: "serial",
     description:
       "Update a task's subject, description, status, or dependencies. Provide at least one change.",
     inputSchema: TaskUpdateParamsSchema,

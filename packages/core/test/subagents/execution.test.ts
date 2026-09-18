@@ -20,6 +20,15 @@ import {
   type FakeTurn,
 } from "../agent/test-helpers.ts";
 import { environmentWithLlm } from "../run/test-helpers.ts";
+/** 等待实际条件，允许 CI 上 fsync 和覆盖率插桩的正常开销。 */
+async function waitFor(condition: () => boolean): Promise<void> {
+  const deadline = performance.now() + 3000;
+  while (!condition()) {
+    if (performance.now() > deadline) throw new Error("subagent condition timed out");
+    await Bun.sleep(1);
+  }
+}
+
 /** 建立父子共用工作区、独立 provider 和可选类型配置。 */
 async function fixture(
   childTurns: readonly FakeTurn[],
@@ -204,12 +213,7 @@ test("child approval uses parent channel and identity; parent always cache is sh
   );
   try {
     const pending = f.run();
-    for (
-      let i = 0;
-      i < 100 && !f.observed.events.some((e) => e.type === "permission.requested");
-      i++
-    )
-      await Bun.sleep(1);
+    await waitFor(() => f.observed.events.some((e) => e.type === "permission.requested"));
     const request = f.observed.events.find((e) => e.type === "permission.requested");
     expect(request?.type).toBe("permission.requested");
     if (request?.type !== "permission.requested") throw new Error("missing approval");
@@ -255,7 +259,7 @@ test("parent abort drains child approval and audit before returning", async () =
   try {
     const controller = new AbortController();
     const pending = f.run(controller.signal);
-    for (let i = 0; i < 100 && f.permissions.pendingCount === 0; i++) await Bun.sleep(1);
+    await waitFor(() => f.permissions.pendingCount > 0);
     expect(f.permissions.pendingCount).toBe(1);
     controller.abort();
     expect((await pending).completion.status).toBe("cancelled");

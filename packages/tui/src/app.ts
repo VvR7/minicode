@@ -1,3 +1,4 @@
+import { formatSkills } from "@minicode/client";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import {
@@ -53,6 +54,7 @@ export interface TuiSessionController {
     readonly cursor?: string;
     readonly limit?: number;
   }): Promise<SessionListResult>;
+  listSkills(): Promise<import("@minicode/protocol").SkillListResult>;
   sendMessage(content: string): Promise<unknown>;
   compact(focus?: string): Promise<import("@minicode/protocol").SessionCompactResult>;
   cancelActiveRun(): Promise<unknown>;
@@ -389,6 +391,23 @@ export class TuiApp {
       if (snapshot.readOnly) {
         model.setNotice("this session is read-only");
         updateChrome();
+        return;
+      }
+      if (content === "/skill") {
+        operationPending = true;
+        input.clear();
+        updateChrome();
+        try {
+          const result = await controller.listSkills();
+          log.apply(model.addInfo(formatSkills(result)));
+          for (const diagnostic of result.diagnostics)
+            log.apply(model.addError(`${diagnostic.path}: ${diagnostic.message}`));
+        } catch (error) {
+          log.apply(model.addError(error instanceof Error ? error.message : "skill list failed"));
+        } finally {
+          operationPending = false;
+          updateChrome();
+        }
         return;
       }
       if (content === "/compact" || content.startsWith("/compact ")) {

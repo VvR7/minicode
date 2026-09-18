@@ -3,7 +3,7 @@ import type { Environment, RunId, SessionId, TaskGraphSnapshot } from "@minicode
 import { z } from "zod";
 import { ExecutionContext } from "../agent/context.ts";
 import { AgentLoop, type ContextCompactionHook, DEFAULT_SYSTEM_PROMPT } from "../agent/loop.ts";
-import { composeSystemPrompt } from "../agent/system-prompt.ts";
+import { composeSystemPrompt, loadSystemPrompt } from "../agent/system-prompt.ts";
 import { type CompactOptions, Compactor, type ContextEntry } from "../compact/index.ts";
 import type { EventBus } from "../events/event-bus.ts";
 import { AnthropicAdapter } from "../llm/anthropic-adapter.ts";
@@ -109,6 +109,7 @@ export interface AgentRunRequest {
   readonly sessionId: SessionId;
   readonly runId: RunId;
   readonly goal: string;
+  readonly userContent?: readonly import("../llm/types.ts").LlmContentPart[];
   readonly workspaceRoot: string;
   /** 已成功历史；Runner 会在其后追加本轮 goal。 */
   readonly history?: readonly LlmMessage[];
@@ -164,7 +165,14 @@ export class AgentRunner {
 
   /** 在 preflight 前准备能力快照；后续扩展在此接入 workspace 的 skills/MCP。 */
   async prepareSnapshot(request: RunSnapshotRequest): Promise<RunSnapshot> {
-    return buildRunSnapshot(request.notes, request.files);
+    const loaded = await loadSystemPrompt(
+      DEFAULT_SYSTEM_PROMPT,
+      request.files,
+      request.notes,
+      this.#homeDirectory,
+      request.workspaceRoot,
+    );
+    return createRunSnapshot(loaded.systemPrompt, runToolSchemas(), loaded.skillCatalog);
   }
 
   /** 执行一次隔离 run；任何组装异常都收敛为包含本轮用户消息的安全终态。 */
@@ -223,6 +231,7 @@ export class AgentRunner {
       runId: request.runId,
       workspaceRoot: request.workspaceRoot,
       goal: request.goal,
+      ...(request.userContent === undefined ? {} : { userContent: request.userContent }),
       ...(request.history === undefined ? {} : { prefillMessages: request.history }),
       ...(request.contextEntries === undefined ? {} : { prefillEntries: request.contextEntries }),
     });
@@ -285,12 +294,16 @@ export class AgentRunner {
     const systemPrompt =
       request.snapshot?.systemPrompt ??
       request.systemPrompt ??
-      buildRunSystemPrompt(
-        (await nodeSessionStorage.readFile(
-          join(this.#homeDirectory, "sessions", request.sessionId, "notes.md"),
-        )) ?? "",
-        await loadContextFiles(this.#homeDirectory, request.workspaceRoot),
-      );
+      (
+        await this.prepareSnapshot({
+          notes:
+            (await nodeSessionStorage.readFile(
+              join(this.#homeDirectory, "sessions", request.sessionId, "notes.md"),
+            )) ?? "",
+          files: await loadContextFiles(this.#homeDirectory, request.workspaceRoot),
+          workspaceRoot: request.workspaceRoot,
+        })
+      ).systemPrompt;
     const invoker = new ToolInvoker(registry, { permissions: this.#permissions });
     const loop = new AgentLoop(provider, registry, invoker, this.#bus, {
       systemPrompt,

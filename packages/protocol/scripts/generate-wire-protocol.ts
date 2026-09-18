@@ -161,8 +161,10 @@ export function renderWireProtocol(): string {
 ## Stage5 extension contracts
 
 - \`skill.list\` defines a workspace-scoped catalog response with name, description, SKILL.md path,
-  and bounded diagnostics. Handler registration and command expansion arrive with Skills support;
-  this contract alone does not enable the method on Core.
+  and bounded diagnostics. Core discovers global MINICODE_HOME/skills and project .minicode/skills;
+  project metadata names override global names. Each run fixes the advertised catalog. CLI/TUI
+  \`/skill\` query this method without a model call; \`/skill <name> [arguments]\` preserves the raw
+  command and adds the fixed body and arguments to user content before context preflight.
 - Durable \`subagent.started\` / \`subagent.finished\` events belong to the parent session/run and carry
   the isolated childRunId, profile name, background flag, and bounded terminal summary. Child task
   events do not belong to the parent's task graph.

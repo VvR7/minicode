@@ -33,6 +33,7 @@ export interface ExecutionContextOptions {
   readonly runId: RunId;
   readonly workspaceRoot: string;
   readonly goal: string;
+  readonly userContent?: readonly LlmContentPart[];
   /** 已成功历史构成的 provider-neutral 消息；本轮用户消息会追加在其后。 */
   readonly prefillMessages?: readonly LlmMessage[];
   readonly prefillEntries?: readonly ContextEntry[];
@@ -82,7 +83,12 @@ export class ExecutionContext {
       []
     ).map((entry) => ({ ...entry, content: entry.content.map((part) => ({ ...part })) }));
     this.messages.push(...toProviderMessages(this.#entries));
-    this.#append({ role: "user", content: [{ type: "text", text: this.goal }] });
+    this.#append({
+      role: "user",
+      content: options.userContent
+        ? structuredClone([...options.userContent])
+        : [{ type: "text", text: this.goal }],
+    });
   }
 
   /** 当前状态是否已经进入终态。 */

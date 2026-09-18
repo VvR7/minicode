@@ -1,3 +1,4 @@
+import { SkillListHandler } from "./handlers/skill-list-handler.ts";
 import type { CoreEndpoint, Environment } from "@minicode/protocol";
 import { formatEndpoint, MINICODE_VERSION } from "@minicode/protocol";
 import type { CoreConfig } from "./config.ts";
@@ -92,6 +93,7 @@ export class CoreApp {
     });
     const dispatcher = createRpcDispatcher({
       handlers: [
+        new SkillListHandler(this.#config.homeDirectory),
         new PingHandler({ uptimeMs: () => performance.now() - this.#startedAt }),
         new PermissionRespondHandler(
           permissions,

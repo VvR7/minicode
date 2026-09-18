@@ -1,3 +1,4 @@
+import { listSkills } from "./skills.ts";
 import type {
   ActiveRun,
   AgentCancelResult,
@@ -246,6 +247,14 @@ export class SessionController {
         await this.#waitForConnection(connection);
       }
     }
+  }
+
+  /** 查询已附着会话工作区的技能目录，不创建聊天轮次。 */
+  async listSkills(): Promise<import("@minicode/protocol").SkillListResult> {
+    this.#requiredSessionId();
+    const session = this.#session;
+    if (!session) throw new Error("session is not attached");
+    return listSkills(await this.#waitForConnection(), session.workspaceRoot);
   }
 
   /** 在当前会话请求独立压缩；断线不重复发起摘要，后续进度由会话事件恢复。 */

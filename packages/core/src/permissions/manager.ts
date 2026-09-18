@@ -45,7 +45,11 @@ export class PermissionManager {
     const policy = evaluatePermission(name, params);
     if (policy.decision !== "ask")
       return { allowed: policy.decision === "allow", source: "policy" };
-    const risk = policy.cacheable ? policy.riskCategories[0] : undefined;
+    const risk = policy.cacheable
+      ? name.startsWith("mcp__")
+        ? name
+        : policy.riskCategories[0]
+      : undefined;
     const cached = risk === undefined ? undefined : this.#cache.get(scope.sessionId)?.get(risk);
     if (cached !== undefined) return { allowed: cached, source: "session_cache" };
 

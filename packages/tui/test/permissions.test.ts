@@ -94,3 +94,28 @@ test("cancellation blocks response and terminal state closes pending without a f
   model.reset();
   expect(model.snapshot().lines).toHaveLength(0);
 });
+
+test("MCP approvals replay and always scope shows the exact tool", () => {
+  const request = {
+    ...permissionRequest,
+    payload: {
+      ...permissionRequest.payload,
+      name: "mcp__demo__search",
+      riskCategories: ["mcp" as const],
+      summary: {
+        kind: "mcp" as const,
+        server: "demo",
+        tool: "search",
+        paramsPreview: '{"query":"hello","token":"[REDACTED]"}',
+      },
+    },
+  };
+  const model = new TuiModel();
+  model.syncPermissions([{ request, status: "pending" }]);
+  model.apply({ type: "run.event", event: request });
+  expect(model.snapshot().lines).toHaveLength(1);
+  expect(model.snapshot().lines[0]?.text).toContain("Always applies to mcp__demo__search");
+  expect(model.snapshot().lines[0]?.text).toContain("[REDACTED]");
+  model.apply({ type: "run.event", event: permissionResolved(request, "always_allow") });
+  expect(model.snapshot().permission).toBeUndefined();
+});

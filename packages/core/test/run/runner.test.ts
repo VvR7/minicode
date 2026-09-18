@@ -256,3 +256,84 @@ describe("AgentRunner", () => {
     }
   });
 });
+
+test("MCP preflight and execution share original schemas and approval lifecycle", async () => {
+  const { mkdir, writeFile } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const { McpServerManager } = await import("../../src/mcp/server-manager.ts");
+  const { PermissionManager } = await import("../../src/permissions/manager.ts");
+  const workspace = await createTempWorkspace();
+  const schema = {
+    type: "object" as const,
+    properties: { query: { type: "string" } },
+    required: ["query"],
+    additionalProperties: false,
+  };
+  let called = 0;
+  const mcp = new McpServerManager(workspace, {}, () => ({
+    async connect() {},
+    async close() {},
+    async listTools() {
+      return [{ name: "search", inputSchema: schema }];
+    },
+    async callTool() {
+      called++;
+      return { content: [{ type: "text", text: "search result" }] };
+    },
+  }));
+  try {
+    await mkdir(join(workspace, ".minicode"));
+    await writeFile(
+      join(workspace, ".minicode/config.toml"),
+      '[[mcp.servers]]\nname="demo"\ntransport="stdio"\ncommand="fixture"\n',
+    );
+    const bus = createBus();
+    const permissions = new PermissionManager(bus);
+    const { events, subscription } = await collectEvents(bus, SESSION_A, RUN_A);
+    const provider = new FakeProvider([
+      { response: toolResponse([toolCall("search", "mcp__demo__search", { query: "hello" })]) },
+      { response: textResponse("done") },
+    ]);
+    const runner = new AgentRunner({
+      environment: environmentWithLlm(),
+      bus,
+      permissions,
+      mcp,
+      homeDirectory: workspace,
+      providerFactory: () => provider,
+    });
+    const snapshot = await runner.prepareSnapshot({
+      workspaceRoot: workspace,
+      notes: "",
+      files: { global: "", project: "" },
+    });
+    expect(snapshot.toolSchemas.find((t) => t.name === "mcp__demo__search")?.inputSchema).toEqual(
+      schema,
+    );
+    const pending = runner.run(
+      { sessionId: SESSION_A, runId: RUN_A, goal: "search", workspaceRoot: workspace, snapshot },
+      new AbortController().signal,
+    );
+    for (let i = 0; i < 100 && !events.some((e) => e.type === "permission.requested"); i++)
+      await Bun.sleep(1);
+    const request = events.find((e) => e.type === "permission.requested");
+    expect(request?.type).toBe("permission.requested");
+    expect(called).toBe(0);
+    if (request?.type === "permission.requested")
+      await permissions.respond({
+        sessionId: SESSION_A,
+        runId: RUN_A,
+        permissionRequestId: request.payload.permissionRequestId,
+        decision: "allow_once",
+      });
+    expect((await pending).completion.status).toBe("succeeded");
+    expect(called).toBe(1);
+    expect(provider.calls).toHaveLength(2);
+    for (const call of provider.calls) expect(call.options?.toolSchemas).toBe(snapshot.toolSchemas);
+    expect(JSON.stringify(provider.calls[1]?.messages)).toContain("search result");
+    subscription.dispose();
+  } finally {
+    await mcp.close();
+    await cleanupTempWorkspace(workspace);
+  }
+});

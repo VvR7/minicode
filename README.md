@@ -205,3 +205,23 @@ allowed_tools = ["read"]
 ```
 
 三个字段均必填，`allowed_tools = []` 表示无工具。白名单使用完整工具名称（包括 `mcp__<server>__<tool>`），未知工具或嵌套委派工具会被拒绝。类型使用父 Agent 的模型。
+
+MCP 配置可写入 `~/.minicode/config.toml`（或 `MINICODE_HOME/config.toml`）及项目的 `.minicode/config.toml`。项目同名服务器覆盖全局配置；全局配置在 Core 启动时固定，项目配置在首次使用工作区时固定，修改后需重启 Core。
+
+```toml
+[[mcp.servers]]
+name = "local"
+transport = "stdio"
+command = "bun"
+args = ["/absolute/path/to/server.ts"]
+execute_mode = "parallel" # 可选，也可设为 serial
+
+[[mcp.servers]]
+name = "remote"
+transport = "http" # Streamable HTTP
+url = "http://127.0.0.1:8080/mcp"
+[mcp.servers.headers]
+Authorization = "Bearer ${MCP_TOKEN}"
+```
+
+stdio 服务器以当前工作区为 cwd，支持 `env` 字符串表；命令、参数、环境变量、HTTP 地址及 headers 支持 `${ENV_NAME}` 引用。发现的工具使用 `mcp__<server>__<tool>` 名称，保留原始 JSON Schema 并在本地校验。外部工具默认需要审批，Always 决策只作用于当前 session 的完整工具名，重启不保留。工具调用遵循批次并行规则，不自动重试；文本与结构化结果进入模型上下文，图片、音频及嵌入资源以类型或地址摘要展示。

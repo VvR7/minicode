@@ -1,3 +1,4 @@
+import { workspaceMcpTools } from "../../packages/core/src/mcp/tool.ts";
 import { expect, test } from "bun:test";
 import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -70,6 +71,18 @@ test("official SDK discovers all stdio/HTTP pages, sends headers and closes owne
     expect(
       await snapshot.servers[1]?.client.callTool("first", {}, new AbortController().signal),
     ).toMatchObject({ content: [{ type: "text", text: "http echo" }] });
+    const tools = workspaceMcpTools(snapshot);
+    const outputs = await Promise.all(
+      tools.map((tool) =>
+        tool.execute({}, { workspaceRoot: workspace, signal: new AbortController().signal }),
+      ),
+    );
+    expect(outputs.map((output) => output.content)).toEqual([
+      "echo",
+      "echo",
+      "http echo",
+      "http echo",
+    ]);
     await manager.close();
     expect(() => process.kill(processInfo.pid, 0)).toThrow();
   } finally {

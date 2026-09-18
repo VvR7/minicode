@@ -54,7 +54,7 @@ export function promptPermission(
     output.write(`\nPermission: ${JSON.stringify(request.payload.summary, null, 2)}\n`);
     if (request.payload.cacheable)
       output.write(
-        `Always applies to this session's category: ${request.payload.riskCategories.join(", ")}\n`,
+        `Always applies to this session's approval scope: ${request.payload.summary.kind === "mcp" ? request.payload.name : request.payload.riskCategories.join(", ")}\n`,
       );
     output.write(
       `1) allow once  2) always allow${request.payload.cacheable ? "" : " (unavailable)"}\n`,

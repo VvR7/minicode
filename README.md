@@ -6,7 +6,7 @@ TUI 前端、类型化 IPC、事件流、工具与权限系统、任务规划、
 
 当前版本实现了本地 coding agent 闭环：常驻 `mc-core`、一次性 `mc-ping`、用于单轮测试的
 `mc --goal`，以及支持持久多轮会话、恢复和多窗口同步的 `mc-tui`。Core 统一拥有 AgentLoop、
-历史、notes、run 级任务图、Trace 和事件流。
+历史、notes、run 级任务图、上下文压缩、Trace 和事件流。
 
 Stage3 的 Core 权限层已接入：`write`／`edit` 及非白名单 `bash` 会挂起等待
 `permission.respond`。`mc --goal` 在交互终端支持允许／拒绝一次及 session 内 always 决策；
@@ -16,6 +16,10 @@ TUI 在 transcript 内展示审批摘要，支持方向键／Tab 加 Enter，以
 再审批、执行和有限重试。workspace 不是沙箱：允许外部绝对路径和符号链接目标；
 Bash 权限规则是启发式检测，不能代替系统隔离。
 详细行为见 [Core 工具权限生命周期](STAGE3_PERMISSIONS.md)。
+
+Stage4 上下文管理已接入：每次模型调用前按需生成可恢复的增量摘要，TUI 支持 `/compact [focus]`，
+模型超窗时压缩后重试一次。完整历史保持可审计，压缩事件与占用在多窗口同步。
+默认 reserve 为 16384 token、近期原文保留目标为 20000 token。详见 [Stage4 上下文管理](STAGE4_CONTEXT.md)。
 
 ## 环境要求
 
@@ -66,7 +70,8 @@ Core 默认监听 `127.0.0.1:7437`。可通过 `.env` 中的 `MINICODE_CORE_HOST
 `MINICODE_CORE_PORT` 修改 loopback 地址；当前不允许监听非本机地址。
 持久化数据默认写入 `~/.minicode`，可通过绝对路径 `MINICODE_HOME` 覆盖。模型上下文预算由
 `LLM_CONTEXT_WINDOW_TOKENS` 和 `LLM_MAX_OUTPUT_TOKENS` 控制，省略时分别使用 200000 和 8192；
-无法容纳的新消息会在创建 turn/run 前被拒绝。
+无法容纳的固定规则、工具定义或本轮提问会在创建 turn/run 前被拒绝。自动压缩开关与预算配置
+见 `.env.example` 和 [Stage4 上下文管理](STAGE4_CONTEXT.md)。
 
 ## 终端界面（TUI）
 
@@ -93,6 +98,7 @@ close/delete/rename 操作。
 | `Ctrl+Enter` | 在输入框换行 |
 | `Ctrl-C` | 有草稿时清空草稿；运行中请求取消 |
 | `/new` | 当前 workspace 新建 chat |
+| `/compact [focus]` | 空闲时压缩上下文，可指定摘要关注方向 |
 | `/exit` | 空闲时退出 |
 | `PgUp` / `PgDn` | 向上/向下翻页 |
 | `Ctrl+Home` / `Ctrl+End` | 跳到日志开头/结尾 |
@@ -103,6 +109,13 @@ one-shot、Esc 退出。输入区中的普通 `q` 只是文本，不是退出键
 渲染，终端标记以稳定文字和颜色区分 `YOU`、`ASSISTANT`、`TURN`、`TOOL`、`TASK` 与 `ERROR`。
 
 详细说明见 [TUI 使用说明](TUI.md)。
+
+## 用户维护的上下文
+
+每个 run 开始时读取 `MINICODE_HOME/CONTEXT.md`（默认 `~/.minicode/CONTEXT.md`）和
+当前 session 的 `workspaceRoot/CONTEXT.md`。提示词按基础规则、全局规则、项目规则和 session notes
+顺序组装；项目与全局规则冲突时项目规则优先。不搜索祖先或子目录。
+空文件和不存在的文件会跳过，其他读取错误会明确报错；修改将在下一次提问生效，运行中使用固定快照。
 
 ## 会话、任务与 Trace
 
@@ -160,5 +173,6 @@ LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run 
 - [Stage2 验证矩阵](STAGE2_TEST_MATRIX.md)
 - [Stage3 权限与工具](STAGE3_PERMISSIONS.md)
 - [Stage3 验证矩阵](STAGE3_TEST_MATRIX.md)
+- [Stage4 上下文管理与验证矩阵](STAGE4_CONTEXT.md)
 - [TUI 使用说明](TUI.md)
 - [Wire protocol](WIRE_PROTOCOL.md)

@@ -87,6 +87,7 @@ export class RunTraceRegistry {
 
   /** 在 SessionEvent 成功持久化后记录 Core 边界。 */
   recordSessionEvent(event: SessionEvent): void {
+    if (!("runId" in event.payload)) return;
     const identity = event.payload;
     this.get(event.sessionId, identity.runId)?.record({
       source: "CORE",

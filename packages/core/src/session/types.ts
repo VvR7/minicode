@@ -1,3 +1,4 @@
+import { CompactionCheckpointSchema } from "../compact/types.ts";
 import type {
   ActiveRun,
   ClientMessageId,
@@ -125,9 +126,22 @@ export const TurnCompletedRecordSchema = z
 export type TurnCompletedRecord = z.infer<typeof TurnCompletedRecordSchema>;
 export type PersistedRunResult = NonNullable<TurnCompletedRecord["runResult"]>;
 
+/** compact 记录无手动 run 身份；ownerRunId 存在时仅该 run 成功才对后续上下文生效。 */
+export const CompactionRecordSchema = z.strictObject({
+  schemaVersion: z.literal(SESSION_SCHEMA_VERSION),
+  recordId: z.uuid(),
+  sessionId: SessionIdSchema,
+  timestamp: z.iso.datetime({ offset: true }),
+  kind: z.literal("context.compacted"),
+  ownerRunId: RunIdSchema.optional(),
+  checkpoint: CompactionCheckpointSchema,
+});
+export type CompactionRecord = z.infer<typeof CompactionRecordSchema>;
+
 export const HistoryRecordSchema = z.discriminatedUnion("kind", [
   TurnAcceptedRecordSchema,
   TurnCompletedRecordSchema,
+  CompactionRecordSchema,
 ]);
 export type HistoryRecord = z.infer<typeof HistoryRecordSchema>;
 
@@ -166,6 +180,7 @@ export interface SessionSnapshot {
   /** 完整 session journal，供订阅回放与恢复使用。 */
   readonly sessionEvents: readonly SessionEvent[];
   readonly notes: string;
+  readonly compactions: readonly CompactionRecord[];
 }
 
 /** session.list 的过滤与分页输入。 */

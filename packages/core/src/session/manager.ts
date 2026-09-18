@@ -2,6 +2,7 @@ import type {
   AgentCancelResult,
   AgentEvent,
   ClientMessageId,
+  SessionCompactResult,
   Environment,
   HistoryMessage,
   HistoryTurn,
@@ -26,13 +27,26 @@ import type { RunMetadataStore } from "../run/metadata.ts";
 import type { RunTraceRegistry } from "../trace/registry.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
 import {
-  checkContextBudget,
   type ContextBudgetEstimator,
   defaultContextBudgetEstimator,
   loadContextBudgetConfig,
 } from "./context-budget.ts";
-import { buildContextMessages, type SessionStore } from "./session-store.ts";
+import {
+  buildContextEntries,
+  buildContextMessages,
+  latestCompaction,
+  type SessionStore,
+} from "./session-store.ts";
 import type { SessionSnapshot } from "./types.ts";
+
+import {
+  prepareCompaction,
+  type CompactOptions,
+  type ContextEntry,
+  type CompactionCheckpoint,
+} from "../compact/index.ts";
+import { LlmError } from "../llm/errors.ts";
+import { loadCompactionConfig } from "./compaction-config.ts";
 
 const EMPTY_USAGE: LlmUsage = {
   inputTokens: 0,
@@ -48,6 +62,9 @@ export const DEFAULT_SESSION_SHUTDOWN_TIMEOUT_MS = 5_000;
 /** SessionManager 对 Runner 的最小依赖，便于隔离编排测试与替换 provider 实现。 */
 export interface SessionRunExecutor {
   run(request: AgentRunRequest, signal: AbortSignal): Promise<AgentRunOutcome>;
+  compact?(
+    options: CompactOptions,
+  ): Promise<{ checkpoint: CompactionCheckpoint; entries: readonly ContextEntry[] } | undefined>;
 }
 
 export type SessionManagerFailureCode =
@@ -90,6 +107,8 @@ interface ActiveExecution {
   readonly userMessage: string;
   readonly workspaceRoot: string;
   readonly history: readonly LlmMessage[];
+  readonly contextEntries: readonly ContextEntry[];
+  previousCheckpoint: CompactionCheckpoint | undefined;
   readonly systemPrompt: string;
   readonly trace: TraceRecorder;
   readonly controller: AbortController;
@@ -138,6 +157,7 @@ export class SessionManager {
   readonly #terminalCommits = new Set<Promise<void>>();
   readonly #active = new Map<string, ActiveExecution>();
   readonly #busySessions = new Set<string>();
+  readonly #manualControllers = new Map<string, AbortController>();
   readonly #finishedRuns = new Set<string>();
   readonly #corruptedSessions = new Set<string>();
   readonly #ready: Promise<void>;
@@ -253,6 +273,148 @@ export class SessionManager {
     };
   }
 
+  /** 空闲会话可主动摘要；与发送消息、其他压缩共享执行权，且不创建用户 turn。 */
+  compact(sessionId: string, focus?: string): Promise<SessionManagerResult<SessionCompactResult>> {
+    return this.#trackAdmission(this.#manualCompact(sessionId, focus));
+  }
+
+  /** 短临界区登记手动执行权，网络摘要在锁外执行，使并发请求立即得到 busy。 */
+  async #manualCompact(
+    sessionId: string,
+    focus?: string,
+  ): Promise<SessionManagerResult<SessionCompactResult>> {
+    await this.#ready;
+    const prepared = await this.#withSessionLock(
+      sessionId,
+      async (): Promise<SessionManagerResult<SessionSnapshot>> => {
+        if (this.#stopping || this.#recoveryFailed) return this.#internal("core is unavailable");
+        const loaded = await this.#store.load(sessionId);
+        if (!loaded.ok) return this.#fromStore(loaded.error.code, sessionId);
+        if (this.#corruptedSessions.has(sessionId))
+          return this.#failure("session_corrupted", "session is corrupted", sessionId);
+        if (this.#busySessions.has(sessionId) || loaded.value.activeRun !== undefined)
+          return this.#failure("session_busy", "session already has active work", sessionId);
+        this.#busySessions.add(sessionId);
+        this.#manualControllers.set(sessionId, new AbortController());
+        return loaded;
+      },
+    );
+    if (!prepared.ok) return prepared;
+    try {
+      const snapshot = prepared.value;
+      const files = await this.#store.loadContextFiles(snapshot.meta.workspaceRoot);
+      if (!files.ok) return this.#internal("failed to read CONTEXT.md");
+      const system = buildRunSystemPrompt(snapshot.notes, files.value);
+      const entries = buildContextEntries(snapshot.turns, snapshot.compactions);
+      const previous = latestCompaction(snapshot.turns, snapshot.compactions)?.checkpoint;
+      const result = await this.#compactEntries(sessionId, system, {
+        entries,
+        reason: "manual",
+        tokensBefore:
+          this.#estimator(system) +
+          this.#estimator(runToolSchemas()) +
+          this.#estimator(entries.map(({ role, content }) => ({ role, content }))),
+        signal: this.#manualControllers.get(sessionId)?.signal ?? AbortSignal.abort(),
+        ...(focus === undefined ? {} : { focus }),
+        ...(previous === undefined ? {} : { previous }),
+      });
+      return {
+        ok: true,
+        value:
+          result === undefined
+            ? { sessionId, status: "unchanged" }
+            : { sessionId, status: "compacted", result: this.#compactionResult(result.checkpoint) },
+      };
+    } catch (error) {
+      return error instanceof LlmError && error.code === "context_limit_exceeded"
+        ? this.#failure("context_limit_exceeded", "context cannot fit after compaction", sessionId)
+        : this.#internal("session compaction failed");
+    } finally {
+      this.#manualControllers.delete(sessionId);
+      this.#busySessions.delete(sessionId);
+    }
+  }
+
+  /** 生成、校验并落盘 checkpoint，再发布压缩完成事件；失败不安装新视图。 */
+  async #compactEntries(
+    sessionId: string,
+    system: string,
+    options: CompactOptions,
+    ownerRunId?: RunId,
+  ) {
+    const budget = loadContextBudgetConfig(this.#environment);
+    if (!budget.ok) throw budget.error;
+    const config = loadCompactionConfig(this.#environment, budget.value);
+    if (!config.ok) throw config.error;
+    if (prepareCompaction(options.entries, config.value.keepRecentTokens) === undefined)
+      return undefined;
+    const compactionId = this.#newId();
+    const publish = async (event: Parameters<SessionEventBus["publish"]>[0]) => {
+      const result = await this.#sessionEvents.publish(event);
+      if (!result.ok) throw new Error("compaction event storage failed");
+    };
+    await publish({
+      sessionId,
+      timestamp: this.#now(),
+      durable: true,
+      type: "session.compaction_started",
+      payload: { compactionId, reason: options.reason, tokensBefore: options.tokensBefore },
+    });
+    let storageFailed = false;
+    try {
+      const result = await this.#runner.compact?.({ ...options, compactionId });
+      if (options.signal.aborted) throw new LlmError("aborted", "compaction cancelled");
+      if (result === undefined) throw new LlmError("invalid_response", "compaction unavailable");
+      const tokensAfter =
+        this.#estimator(system) +
+        this.#estimator(runToolSchemas()) +
+        this.#estimator(result.entries.map(({ role, content }) => ({ role, content })));
+      if (tokensAfter + budget.value.maxOutputTokens > budget.value.contextWindowTokens)
+        throw new LlmError("context_limit_exceeded", "retained context cannot fit");
+      const checkpoint = { ...result.checkpoint, tokensAfter };
+      const saved = await this.#store.appendCompaction(sessionId, checkpoint, ownerRunId);
+      if (!saved.ok) {
+        storageFailed = true;
+        throw new Error("checkpoint storage failed");
+      }
+      await publish({
+        sessionId,
+        timestamp: this.#now(),
+        durable: true,
+        type: "session.compaction_finished",
+        payload: { reason: options.reason, result: this.#compactionResult(checkpoint) },
+      });
+      return { ...result, checkpoint };
+    } catch (error) {
+      const code = options.signal.aborted
+        ? "cancelled"
+        : storageFailed
+          ? "storage_error"
+          : error instanceof LlmError && error.code === "context_limit_exceeded"
+            ? "context_limit_exceeded"
+            : "summary_failed";
+      await publish({
+        sessionId,
+        timestamp: this.#now(),
+        durable: true,
+        type: "session.compaction_failed",
+        payload: {
+          compactionId,
+          reason: options.reason,
+          code,
+          message: `compaction failed (${code})`,
+        },
+      });
+      throw error;
+    }
+  }
+
+  /** 只向 IPC 暴露压缩结果统计，摘要文本保留在内部 journal。 */
+  #compactionResult(checkpoint: CompactionCheckpoint) {
+    const { compactionId, kind, firstKeptMessageId, tokensBefore, tokensAfter } = checkpoint;
+    return { compactionId, kind, firstKeptMessageId, tokensBefore, tokensAfter };
+  }
+
   /** 为 chat session 做 accepted 前检查并准备一个延迟激活的 run。 */
   prepareMessage(input: {
     readonly sessionId: string;
@@ -359,6 +521,7 @@ export class SessionManager {
   /** 同步封闭新 admission 并取消当前执行；供 Core 在关闭连接前启动两阶段停机。 */
   beginShutdown(): void {
     this.#stopping = true;
+    for (const controller of this.#manualControllers.values()) controller.abort();
     for (const execution of this.#active.values()) {
       execution.controller.abort();
     }
@@ -410,28 +573,23 @@ export class SessionManager {
       );
     }
 
-    const history = buildContextMessages(snapshot.turns);
-    const systemPrompt = buildRunSystemPrompt(snapshot.notes);
-    const baseSystemPrompt = buildRunSystemPrompt("");
+    const history = buildContextMessages(snapshot.turns, snapshot.compactions);
+    const files = await this.#store.loadContextFiles(snapshot.meta.workspaceRoot);
+    if (!files.ok) return this.#internal("failed to read CONTEXT.md");
+    const systemPrompt = buildRunSystemPrompt(snapshot.notes, files.value);
     const budgetConfig = loadContextBudgetConfig(this.#environment);
     if (!budgetConfig.ok) {
       return this.#internal("context budget configuration is invalid");
     }
-    const budget = checkContextBudget(
-      budgetConfig.value,
-      {
-        systemPrompt: baseSystemPrompt,
-        notes: snapshot.notes,
-        messages: history,
-        userMessage: content,
-        toolSchemas: runToolSchemas(),
-      },
-      this.#estimator,
-    );
-    if (!budget.ok) {
+    const compactionConfig = loadCompactionConfig(this.#environment, budgetConfig.value);
+    if (!compactionConfig.ok) return this.#internal("compaction configuration is invalid");
+    // 固定提示词、工具定义与本轮提问不可压缩；历史在模型调用前按需处理。
+    const fixedTokens =
+      this.#estimator(systemPrompt) + this.#estimator(runToolSchemas()) + this.#estimator(content);
+    if (fixedTokens + budgetConfig.value.maxOutputTokens > budgetConfig.value.contextWindowTokens) {
       return this.#failure(
         "context_limit_exceeded",
-        "session context exceeds the configured budget",
+        "fixed context exceeds the configured budget",
         snapshot.meta.sessionId,
       );
     }
@@ -471,6 +629,8 @@ export class SessionManager {
       userMessage: content,
       workspaceRoot: snapshot.meta.workspaceRoot,
       history,
+      contextEntries: buildContextEntries(snapshot.turns, snapshot.compactions),
+      previousCheckpoint: latestCompaction(snapshot.turns, snapshot.compactions)?.checkpoint,
       systemPrompt,
       trace: this.#traces.create(snapshot.meta.sessionId, runId),
       controller: new AbortController(),
@@ -592,13 +752,32 @@ export class SessionManager {
           goal: execution.userMessage,
           workspaceRoot: execution.workspaceRoot,
           history: execution.history,
+          contextEntries: execution.contextEntries,
+          compact: async (entries, tokensBefore, reason, signal) => {
+            const result = await this.#compactEntries(
+              execution.sessionId,
+              execution.systemPrompt,
+              {
+                entries,
+                tokensBefore,
+                reason,
+                signal,
+                ...(execution.previousCheckpoint === undefined
+                  ? {}
+                  : { previous: execution.previousCheckpoint }),
+              },
+              execution.runId,
+            );
+            if (result !== undefined) execution.previousCheckpoint = result.checkpoint;
+            return result?.entries;
+          },
           systemPrompt: execution.systemPrompt,
           trace: execution.trace,
         };
         outcome = await this.#runner.run(request, execution.controller.signal);
         // provider/executor 即使忽略 AbortSignal，编排层仍以已接受的取消为权威结果。
         if (execution.controller.signal.aborted) {
-          outcome = { completion: this.#cancelledCompletion(execution.userMessage) };
+          outcome = { completion: this.#cancelOutcome(outcome.completion) };
         }
       }
     } catch {
@@ -673,13 +852,14 @@ export class SessionManager {
   async #commit(execution: ActiveExecution, outcome: AgentRunOutcome): Promise<void> {
     // commit 创建前接受的取消优先于 executor 返回值；创建后 cancel 会返回 already_finished。
     let completion = execution.controller.signal.aborted
-      ? this.#cancelledCompletion(execution.userMessage)
+      ? this.#cancelOutcome(outcome.completion)
       : outcome.completion;
     const messages = toHistoryMessages(
       completion.messages,
       execution.turnId,
       execution.runId,
       this.#now,
+      completion.messageIds,
     );
     const persisted = await this.#store.appendCompleted(execution.sessionId, {
       turnId: execution.turnId,
@@ -919,6 +1099,8 @@ export class SessionManager {
     const acceptedSequence = new Map<string, number>();
     const finishedSequence = new Map<string, number>();
     for (const event of snapshot.sessionEvents) {
+      if (event.type !== "session.turn_accepted" && event.type !== "session.turn_finished")
+        continue;
       const turn = turns.get(event.payload.turnId);
       if (turn === undefined || event.payload.runId !== turn.runId) {
         return false;
@@ -990,6 +1172,12 @@ export class SessionManager {
       model: this.#environment[LLM_MODEL_ENV_KEY] ?? "",
       error: { code: reason, message: `run failed (${reason})` },
     };
+  }
+
+  /** 取消改变终态而保留已经生成的完整审计与用量，checkpoint 因 owner 取消而失效。 */
+  #cancelOutcome(completion: RunCompletion): RunCompletion {
+    const { error: _error, ...rest } = completion;
+    return { ...rest, status: "cancelled", reason: "cancelled", finalText: "" };
   }
 
   /** shutdown 超时强制收尾时构造不包含旧历史的 cancelled completion。 */

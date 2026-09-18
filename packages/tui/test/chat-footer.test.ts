@@ -12,6 +12,7 @@ const snapshot: TuiSnapshot = {
   permission: undefined,
   permissionSelection: "allow_once",
   run: "idle",
+  compacting: false,
   session: undefined,
   activeRunId: undefined,
   readOnly: false,

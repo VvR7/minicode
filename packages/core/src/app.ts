@@ -17,6 +17,7 @@ import { PermissionRespondHandler } from "./handlers/permission-respond-handler.
 import { PermissionManager } from "./permissions/manager.ts";
 import {
   SessionCreateHandler,
+  SessionCompactHandler,
   SessionGetHandler,
   SessionGetHistoryHandler,
   SessionListHandler,
@@ -107,6 +108,7 @@ export class CoreApp {
         new SessionListHandler(manager),
         new SessionGetHistoryHandler(manager),
         new SessionSendMessageHandler(manager),
+        new SessionCompactHandler(manager),
         new SessionSubscribeHandler(manager, sessionBroadcaster),
       ],
     });

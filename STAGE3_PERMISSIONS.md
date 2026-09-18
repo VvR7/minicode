@@ -7,13 +7,13 @@
 
 | 工具 | 参数与限制 |
 | --- | --- |
-| `read` | `path`；可选 `offset`（1-based）、`limit`（默认／最大 2000 行）；UTF-8 文本，最多 256 KiB 输出 |
+| `read` | `path`；可选 `offset`（1-based）、`limit`（默认／最大 2000 行）；UTF-8 文本，最多 2000 行／50 KiB 输出，保留头部 |
 | `write` | `path`、`content`；最多 1 MiB；创建父目录，原子创建／覆盖 |
 | `edit` | `path`、`oldText`、`newText`；可选 `replaceAll`；精确字面替换，不匹配或非唯一且未指定全部替换时失败；原子写入 |
-| `bash` | `command`（最多 8 KiB）；可选 `timeout`（整数秒，1–120，默认 120）；`/bin/bash -lc`，合并输出最多 64 KiB |
+| `bash` | `command`（最多 8 KiB）；可选 `timeout`（整数秒，1–120，默认 120）；`/bin/bash -lc`，合并输出最多 2000 行／50 KiB，保留尾部 |
 
 read/write/edit 执行预算统一 10 秒，bash 使用模型指定预算。bash 超时／取消终止进程组，
-子进程环境过滤常见凭据变量。输出截断保持合法 UTF-8。
+子进程环境过滤常见凭据变量。输出截断保持合法 UTF-8，提示自身计入行数与字节上限；不另存完整输出。显式 read limit 为所选行窗口，不视为容量截断。
 
 文件路径只拒绝显式 `..` 段，**允许外部绝对路径和指向 workspace 外的符号链接**。
 workspaceRoot 是相对路径基准，不是文件访问隔离边界；read 外部文件也不额外审批。

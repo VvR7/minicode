@@ -10,6 +10,9 @@ import {
   ToolFailureCategorySchema,
 } from "./permissions.ts";
 import {
+  SessionCompactionStartedEventSchema,
+  SessionCompactionFinishedEventSchema,
+  SessionCompactionFailedEventSchema,
   SessionTurnAcceptedEventSchema,
   SessionTurnFinishedEventSchema,
   TaskSnapshotSchema,
@@ -278,6 +281,9 @@ export const PushedEventSchema = z.discriminatedUnion("type", [
   TaskCreatedEventSchema,
   TaskUpdatedEventSchema,
   RunFinishedEventSchema,
+  SessionCompactionStartedEventSchema,
+  SessionCompactionFinishedEventSchema,
+  SessionCompactionFailedEventSchema,
   SessionTurnAcceptedEventSchema,
   SessionTurnFinishedEventSchema,
 ]);

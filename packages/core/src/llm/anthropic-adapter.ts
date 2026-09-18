@@ -39,6 +39,63 @@ function httpError(status: number): LlmError {
   return new LlmError("invalid_response", `LLM request rejected (HTTP ${status})`);
 }
 
+/** 只识别明确的上下文错误，不把普通 400 或输出 token 上限错误当作超窗。 */
+function isContextError(type: string | undefined, message: string | undefined): boolean {
+  if (
+    type === "context_length_exceeded" ||
+    type === "context_window_exceeded" ||
+    type === "prompt_too_long"
+  )
+    return true;
+  return /prompt (?:is )?too long|maximum context length|context (?:length|window|limit).*(?:exceed|limit)|(?:input|prompt).*exceed.*(?:token|context)|too many (?:input )?tokens/iu.test(
+    message ?? "",
+  );
+}
+
+/** 有界读取错误正文并释放响应流；provider 原始错误不进入公开错误消息。 */
+async function rejectedResponseError(response: Response): Promise<LlmError> {
+  const reader = response.body?.getReader();
+  if (reader === undefined) return httpError(response.status);
+  const limit = 8 * 1024;
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (bytes < limit) {
+      const item = await reader.read();
+      if (item.done) break;
+      const chunk = item.value.subarray(0, limit - bytes);
+      chunks.push(chunk);
+      bytes += chunk.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  if (response.status === 429 || response.status >= 500) return httpError(response.status);
+  const text = new TextDecoder().decode(Buffer.concat(chunks));
+  const schema = z
+    .object({
+      error: z
+        .object({
+          type: z.string().optional(),
+          code: z.string().optional(),
+          message: z.string().optional(),
+        })
+        .passthrough(),
+    })
+    .passthrough();
+  let info: z.infer<typeof schema> | undefined;
+  try {
+    const parsed = schema.safeParse(JSON.parse(text));
+    if (parsed.success) info = parsed.data;
+  } catch {
+    /* 非 JSON 错误正文沿用 HTTP 分类。 */
+  }
+  if (isContextError(info?.error.code ?? info?.error.type, info?.error.message))
+    return new LlmError("context_limit_exceeded", "LLM context limit exceeded");
+  return httpError(response.status);
+}
+
 /** 把任意失败归一化为 LlmError；非 LlmError 一律视为网络错误。 */
 function toLlmError(error: unknown): LlmError {
   if (error instanceof LlmError) {
@@ -231,8 +288,13 @@ function handleSseEvent(event: AnthropicSseEvent, acc: SseAccumulator): string |
       return undefined;
     }
     case "error": {
-      const code = mapProviderErrorType(event.error.type);
-      throw new LlmError(code, event.error.message ?? "provider returned an error");
+      const code = mapProviderErrorType(event.error.type, event.error.message);
+      throw new LlmError(
+        code,
+        code === "context_limit_exceeded"
+          ? "LLM context limit exceeded"
+          : (event.error.message ?? "provider returned an error"),
+      );
     }
     case "content_block_stop":
     case "message_stop":
@@ -242,7 +304,8 @@ function handleSseEvent(event: AnthropicSseEvent, acc: SseAccumulator): string |
 }
 
 /** 把 provider error.type 映射为可重试或不可重试的领域错误码。 */
-function mapProviderErrorType(type: string | undefined): LlmErrorCode {
+function mapProviderErrorType(type: string | undefined, message?: string): LlmErrorCode {
+  if (isContextError(type, message)) return "context_limit_exceeded";
   switch (type) {
     case "rate_limit_error":
       return "rate_limit";
@@ -362,8 +425,7 @@ export class AnthropicAdapter implements LlmProvider {
         try {
           const response = await this.#request(messages, options, controller.signal);
           if (!response.ok) {
-            await response.body?.cancel();
-            throw httpError(response.status);
+            throw await rejectedResponseError(response);
           }
           if (response.body === null) {
             throw new LlmError("invalid_response", "LLM returned an empty body");
@@ -449,7 +511,10 @@ export class AnthropicAdapter implements LlmProvider {
       tools?: { name: string; description: string; input_schema: Record<string, unknown> }[];
     } = {
       model: this.#config.model,
-      max_tokens: this.#config.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
+      max_tokens: Math.min(
+        options.maxOutputTokens ?? this.#config.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
+        this.#config.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
+      ),
       stream: true,
       messages: toAnthropicMessages(messages),
     };

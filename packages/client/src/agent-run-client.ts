@@ -17,10 +17,14 @@ import {
   EventPushNotificationSchema,
   EventSubscribeResultSchema,
   isAgentEvent,
+  isSessionEvent,
+  SESSION_SUBSCRIBE_METHOD,
+  SessionSubscribeResultSchema,
   PERMISSION_RESPOND_METHOD,
   PermissionRespondParamsSchema,
   PermissionRespondResultSchema,
 } from "@minicode/protocol";
+import type { SessionCompactionEvent } from "./session-controller.ts";
 import { NdjsonRpcConnection, RpcClientError } from "./ndjson-rpc-client.ts";
 import { type ClientPermission, PermissionState } from "./permission-state.ts";
 
@@ -43,6 +47,8 @@ export interface AgentRunClientCallbacks {
   onEvent(event: AgentEvent): void;
   /** 连接生命周期变化；CLI 可忽略，TUI 据此更新状态栏。 */
   onStatus(status: AgentRunClientStatus): void;
+  /** 会话级压缩进度有独立 cursor；不伪造 run 身份。 */
+  onCompaction?(event: SessionCompactionEvent): void;
   /** 审批投影变化或重新附着时通知前端；不能阻塞事件接收。 */
   onPermissions?(permissions: readonly ClientPermission[]): void;
 }
@@ -212,6 +218,7 @@ export class AgentRunClient {
     this.#onPermissions = callbacks.onPermissions;
 
     let lastSequence = 0;
+    let lastSessionSequence = 0;
     let cancelledByUser = false;
     let finished = false;
     let runIdentity: RunIdentity | undefined;
@@ -297,6 +304,7 @@ export class AgentRunClient {
       const runFinished = Promise.withResolvers<void>();
       const consume = async (): Promise<DrainResult> => {
         let stopListening: (() => void) | undefined;
+        let stopSessionListening: (() => void) | undefined;
         try {
           stopListening = connection.onNotification((notification) => {
             const parsed = EventPushNotificationSchema.safeParse(notification);
@@ -329,8 +337,50 @@ export class AgentRunClient {
               runFinished.resolve();
             }
           });
-          // listener 已注册、精确订阅已建立，重连后再次展示未处理审批。
+          // run listener 已就绪便开放审批响应；独立会话订阅不得延迟已附着状态。
           if (runIdentity !== undefined) this.#attached = { connection, identity: runIdentity };
+          if (callbacks.onCompaction !== undefined && runIdentity !== undefined) {
+            let sessionSubscriptionId: SubscriptionId | undefined;
+            const queued: unknown[] = [];
+            const consumeSession = (notification: unknown): void => {
+              const parsed = EventPushNotificationSchema.safeParse(notification);
+              if (!parsed.success || parsed.data.params.subscriptionId !== sessionSubscriptionId)
+                return;
+              const event = parsed.data.params.event;
+              if (
+                !isSessionEvent(event) ||
+                event.sessionId !== runIdentity?.sessionId ||
+                event.sessionSequence <= lastSessionSequence
+              )
+                return;
+              lastSessionSequence = event.sessionSequence;
+              if (
+                event.type === "session.compaction_started" ||
+                event.type === "session.compaction_finished" ||
+                event.type === "session.compaction_failed"
+              )
+                callbacks.onCompaction?.(event);
+            };
+            // 先监听再请求订阅，避免摘要进度或 run replay 在响应等待期间丢失。
+            stopSessionListening = connection.onNotification((notification) => {
+              if (sessionSubscriptionId === undefined) queued.push(notification);
+              else consumeSession(notification);
+            });
+            const pendingSession = connection.request(
+              SESSION_SUBSCRIBE_METHOD,
+              { sessionId: runIdentity.sessionId, afterSequence: lastSessionSequence },
+              SessionSubscribeResultSchema,
+            );
+            const response = await Promise.race([
+              pendingSession,
+              shutdownInterruption,
+              cancelExpiredInterruption,
+            ]);
+            if (response === SHUTDOWN || response === CANCEL_EXPIRED) return "disconnected";
+            sessionSubscriptionId = response.result.subscriptionId;
+            for (const notification of queued) consumeSession(notification);
+          }
+          // listener 已注册、精确订阅已建立，重连后再次展示未处理审批。
           callbacks.onPermissions?.(this.permissions);
           await Promise.race([
             runFinished.promise,
@@ -341,6 +391,7 @@ export class AgentRunClient {
           return finished ? "finished" : "disconnected";
         } finally {
           stopListening?.();
+          stopSessionListening?.();
         }
       };
       return consume();

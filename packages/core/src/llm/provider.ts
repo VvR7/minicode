@@ -12,6 +12,8 @@ export interface LlmStreamOptions {
   readonly timeoutMs?: number;
   /** 首 delta 前的最大尝试次数，默认 3。 */
   readonly maxAttempts?: number;
+  /** 摘要请求可降低单次输出上限，避免使用普通回答的全部预算。 */
+  readonly maxOutputTokens?: number;
 }
 
 /**

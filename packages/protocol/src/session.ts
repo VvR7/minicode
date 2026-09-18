@@ -14,6 +14,7 @@ export const SESSION_GET_METHOD = "session.get" as const;
 export const SESSION_LIST_METHOD = "session.list" as const;
 export const SESSION_SEND_MESSAGE_METHOD = "session.sendMessage" as const;
 export const SESSION_GET_HISTORY_METHOD = "session.getHistory" as const;
+export const SESSION_COMPACT_METHOD = "session.compact" as const;
 export const SESSION_SUBSCRIBE_METHOD = "session.subscribe" as const;
 
 /** turn 标识：每个被接受的用户消息对应一个 turn。 */
@@ -183,9 +184,17 @@ export const HistoryContentSchema = z.discriminatedUnion("type", [
 ]);
 export type HistoryContent = z.infer<typeof HistoryContentSchema>;
 
+/** 摘要消息的附加信息；旧消息省略 metadata，仍按普通消息解析。 */
+export const ContextMessageMetadataSchema = z.strictObject({
+  kind: z.enum(["summary", "fallback"]),
+  compactionId: z.uuid(),
+});
+export type ContextMessageMetadata = z.infer<typeof ContextMessageMetadataSchema>;
+
 /** 历史消息：provider-neutral，不导出任何 provider 原生对象。 */
 export const HistoryMessageSchema = z.strictObject({
   messageId: z.string().min(1).max(256),
+  metadata: ContextMessageMetadataSchema.optional(),
   turnId: TurnIdSchema,
   runId: RunIdSchema,
   role: z.enum(["user", "assistant"]),
@@ -359,9 +368,70 @@ export const SessionTurnFinishedEventSchema = sessionEventSchema(
 );
 export type SessionTurnFinishedEvent = z.infer<typeof SessionTurnFinishedEventSchema>;
 
+/** 压缩原因与结果在 RPC、事件和持久化之间共用。 */
+export const CompactionReasonSchema = z.enum(["threshold", "context_error", "manual"]);
+export type CompactionReason = z.infer<typeof CompactionReasonSchema>;
+export const CompactionResultSchema = z.strictObject({
+  compactionId: z.uuid(),
+  kind: z.enum(["summary", "fallback"]),
+  firstKeptMessageId: z.string().min(1).max(256),
+  tokensBefore: z.number().int().nonnegative(),
+  tokensAfter: z.number().int().nonnegative(),
+});
+export type CompactionResult = z.infer<typeof CompactionResultSchema>;
+
+/** 手动压缩不创建普通 turn；空闲会话才能执行。 */
+export const SessionCompactParamsSchema = z.strictObject({
+  sessionId: SessionIdSchema,
+  focus: z.string().trim().max(MAX_SESSION_MESSAGE_CHARS).optional(),
+});
+export type SessionCompactParams = z.infer<typeof SessionCompactParamsSchema>;
+export const SessionCompactResultSchema = z
+  .strictObject({
+    sessionId: SessionIdSchema,
+    status: z.enum(["compacted", "unchanged"]),
+    result: CompactionResultSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    if ((value.status === "compacted") !== (value.result !== undefined)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "compacted status requires a result; unchanged must omit it",
+        path: ["result"],
+      });
+    }
+  });
+export type SessionCompactResult = z.infer<typeof SessionCompactResultSchema>;
+
+/** 压缩状态事件只有会话 scope，不伪造手动操作的 run 身份。 */
+export const SessionCompactionStartedEventSchema = sessionEventSchema(
+  "session.compaction_started",
+  z.strictObject({
+    compactionId: z.uuid(),
+    reason: CompactionReasonSchema,
+    tokensBefore: z.number().int().nonnegative(),
+  }),
+);
+export const SessionCompactionFinishedEventSchema = sessionEventSchema(
+  "session.compaction_finished",
+  z.strictObject({ reason: CompactionReasonSchema, result: CompactionResultSchema }),
+);
+export const SessionCompactionFailedEventSchema = sessionEventSchema(
+  "session.compaction_failed",
+  z.strictObject({
+    compactionId: z.uuid(),
+    reason: CompactionReasonSchema,
+    code: z.enum(["cancelled", "context_limit_exceeded", "summary_failed", "storage_error"]),
+    message: z.string().min(1).max(1024),
+  }),
+);
+
 export const SessionEventSchema = z.discriminatedUnion("type", [
   SessionTurnAcceptedEventSchema,
   SessionTurnFinishedEventSchema,
+  SessionCompactionStartedEventSchema,
+  SessionCompactionFinishedEventSchema,
+  SessionCompactionFailedEventSchema,
 ]);
 export type SessionEvent = z.infer<typeof SessionEventSchema>;
 
@@ -380,6 +450,12 @@ function requestSchema<const Method extends string, ParamsSchema extends z.ZodTy
     params,
   });
 }
+
+export const SessionCompactRequestSchema = requestSchema(
+  SESSION_COMPACT_METHOD,
+  SessionCompactParamsSchema,
+);
+export const SessionCompactSuccessResponseSchema = jsonRpcSuccessSchema(SessionCompactResultSchema);
 
 export const SessionCreateRequestSchema = requestSchema(
   SESSION_CREATE_METHOD,

@@ -722,3 +722,72 @@ describe("SessionController", () => {
     await controller.dispose();
   });
 });
+
+describe("SessionController compaction cursor", () => {
+  test("replays independent events despite newer history and advances only after consumer success", async () => {
+    const compactionId = "950e8400-e29b-41d4-a716-446655440008";
+    const progress = sessionEvent("session.compaction_started", 1, {
+      compactionId,
+      reason: "manual",
+      tokensBefore: 90000,
+    });
+    const completed = sessionEvent("session.compaction_finished", 2, {
+      reason: "manual",
+      result: {
+        compactionId,
+        kind: "summary",
+        firstKeptMessageId: "kept",
+        tokensBefore: 90000,
+        tokensAfter: 20000,
+      },
+    });
+    const handler: RequestHandler = (method, _params, connection) => {
+      if (method === "session.getHistory")
+        return {
+          result: {
+            session: { ...summary, status: "idle", activeRun: undefined },
+            turns: [],
+            throughSessionSequence: 2,
+          },
+        };
+      if (method === "session.subscribe") {
+        connection.emit(push(sessionSubscriptionId, progress));
+        connection.emit(push(sessionSubscriptionId, completed));
+        return { result: { subscriptionId: sessionSubscriptionId, sessionId, latestSequence: 2 } };
+      }
+      if (method === "event.unsubscribe") return { result: { removed: true } };
+      throw new Error("unexpected method");
+    };
+    const first = new FakeConnection(handler),
+      second = new FakeConnection(handler);
+    const connections = [first, second];
+    let failOnce = true;
+    const received: string[] = [];
+    const done = Promise.withResolvers<void>();
+    const controller = new SessionController({
+      endpoint,
+      reconnectDelayMs: 0,
+      connect: async () => {
+        const connection = connections.shift();
+        if (connection === undefined) throw new Error("unexpected reconnect");
+        return asConnection(connection);
+      },
+      onEvent: (event) => {
+        if (event.type !== "session.compaction") return;
+        if (failOnce) {
+          failOnce = false;
+          throw new Error("consumer failed");
+        }
+        received.push(event.event.type);
+        if (event.event.type === "session.compaction_finished") done.resolve();
+      },
+    });
+    await controller.attach(sessionId);
+    await done.promise;
+    expect(received).toEqual(["session.compaction_started", "session.compaction_finished"]);
+    expect(
+      second.requests.find((request) => request.method === "session.subscribe")?.params,
+    ).toEqual({ sessionId, afterSequence: 0 });
+    await controller.dispose();
+  });
+});

@@ -54,6 +54,7 @@ export interface TuiSessionController {
     readonly limit?: number;
   }): Promise<SessionListResult>;
   sendMessage(content: string): Promise<unknown>;
+  compact(focus?: string): Promise<import("@minicode/protocol").SessionCompactResult>;
   cancelActiveRun(): Promise<unknown>;
   respondPermission(
     runId: string,
@@ -262,7 +263,13 @@ export class TuiApp {
       workspaceRow.visible = screen === "chat";
       footerRow.visible = screen === "chat";
       help.visible = screen === "selector";
-      if (inputFrame.visible && snapshot.run === "idle" && !operationPending) input.focus();
+      if (
+        inputFrame.visible &&
+        snapshot.run === "idle" &&
+        !snapshot.compacting &&
+        !operationPending
+      )
+        input.focus();
       else input.blur();
     };
 
@@ -353,7 +360,7 @@ export class TuiApp {
       }
     };
 
-    /** 处理聊天提交及两个本地 slash command。 */
+    /** 处理聊天提交与会话 slash command。 */
     const submitInput = async (): Promise<void> => {
       if (controller === undefined || operationPending) return;
       const raw = input.plainText;
@@ -370,7 +377,7 @@ export class TuiApp {
         return;
       }
       if (content === "/exit") {
-        if (snapshot.run !== "idle") {
+        if (snapshot.run !== "idle" || snapshot.compacting) {
           model.setNotice("run is active; press Ctrl+C to cancel first");
           updateChrome();
           return;
@@ -384,8 +391,30 @@ export class TuiApp {
         updateChrome();
         return;
       }
+      if (content === "/compact" || content.startsWith("/compact ")) {
+        if (snapshot.run !== "idle" || snapshot.compacting) {
+          model.setNotice("session is busy");
+          updateChrome();
+          return;
+        }
+        operationPending = true;
+        input.clear();
+        model.setNotice(undefined);
+        updateChrome();
+        try {
+          const focus = content.slice("/compact".length).trim();
+          const result = await controller.compact(focus || undefined);
+          if (result.status === "unchanged") model.setNotice("context does not need compaction");
+        } catch (error) {
+          log.apply(model.addError(error instanceof Error ? error.message : "compaction failed"));
+        } finally {
+          operationPending = false;
+          updateChrome();
+        }
+        return;
+      }
       if (content === "/new") {
-        if (snapshot.run !== "idle") {
+        if (snapshot.run !== "idle" || snapshot.compacting) {
           model.setNotice("cannot create a new session while running");
           updateChrome();
           return;
@@ -409,7 +438,7 @@ export class TuiApp {
         }
         return;
       }
-      if (snapshot.run !== "idle") {
+      if (snapshot.run !== "idle" || snapshot.compacting) {
         model.setNotice("session is busy");
         updateChrome();
         return;
@@ -537,7 +566,7 @@ export class TuiApp {
           if (decision !== undefined) respondPermission(decision);
         }
       } else if (
-        snapshot.run !== "idle" &&
+        (snapshot.run !== "idle" || snapshot.compacting) &&
         (key.name === "return" || key.name === "enter" || key.name === "kpenter")
       ) {
         key.preventDefault();
@@ -548,7 +577,7 @@ export class TuiApp {
         );
         updateChrome();
       } else if (
-        (snapshot.run !== "idle" || operationPending) &&
+        (snapshot.run !== "idle" || snapshot.compacting || operationPending) &&
         !(key.ctrl && key.name === "return")
       )
         key.preventDefault();

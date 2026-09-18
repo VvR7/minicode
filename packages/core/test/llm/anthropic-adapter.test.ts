@@ -92,6 +92,21 @@ describe("request construction", () => {
     expect(body.messages).toEqual([{ role: "user", content: [{ type: "text", text: "hello" }] }]);
   });
 
+  test("summary requests can lower output budget but cannot raise the configured cap", async () => {
+    for (const [requested, expected] of [
+      [100, 100],
+      [9000, 2048],
+    ] as const) {
+      const capture: Capture = {};
+      const adapter = new AnthropicAdapter(
+        { ...config, maxOutputTokens: 2048 },
+        captureFetch(capture, sseResponse(anthropicSseEvents({ text: "summary" }))),
+      );
+      await collect(adapter.stream([userMessage], { maxOutputTokens: requested }));
+      expect(requestBody(capture.init).max_tokens).toBe(expected);
+    }
+  });
+
   test("uses the configured maximum output token count", async () => {
     const capture: Capture = {};
     const adapter = new AnthropicAdapter(
@@ -494,5 +509,62 @@ describe("concurrency", () => {
     };
     expect(textOf(a)).toBe("reply:aaa");
     expect(textOf(b)).toBe("reply:bbb");
+  });
+});
+
+describe("context overflow classification", () => {
+  test("HTTP context errors are explicit and not internally retried", async () => {
+    for (const body of [
+      {
+        error: {
+          type: "invalid_request_error",
+          message: "prompt is too long: 210000 tokens > 200000 maximum",
+        },
+      },
+      { error: { code: "context_length_exceeded", message: "bad input" } },
+    ]) {
+      let calls = 0;
+      const adapter = new AnthropicAdapter(config, async () => {
+        calls += 1;
+        return jsonResponse(body, 400);
+      }, [0, 0]);
+      const result = await collectWithError(adapter.stream([userMessage]));
+      expect(result.error).toMatchObject({
+        code: "context_limit_exceeded",
+        retryable: false,
+        message: "LLM context limit exceeded",
+      });
+      expect(calls).toBe(1);
+    }
+  });
+  test("SSE context errors use the same classification", async () => {
+    const adapter = new AnthropicAdapter(
+      config,
+      async () =>
+        sseResponse([
+          {
+            type: "error",
+            error: {
+              type: "invalid_request_error",
+              message: "input length and max_tokens exceed context limit",
+            },
+          },
+        ]),
+      [0, 0],
+    );
+    expect((await collectWithError(adapter.stream([userMessage]))).error).toMatchObject({
+      code: "context_limit_exceeded",
+    });
+  });
+  test("ordinary 400, output caps and oversized unknown bodies stay invalid_response", async () => {
+    for (const response of [
+      jsonResponse({ error: { message: "max_tokens exceeds maximum allowed output" } }, 400),
+      new Response("x".repeat(20000), { status: 413 }),
+    ]) {
+      const adapter = new AnthropicAdapter(config, async () => response, [0, 0]);
+      expect((await collectWithError(adapter.stream([userMessage]))).error).toMatchObject({
+        code: "invalid_response",
+      });
+    }
   });
 });

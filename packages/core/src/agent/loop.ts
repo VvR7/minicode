@@ -50,6 +50,7 @@ type EventDescriptor = Omit<
 
 export interface AgentLoopOptions {
   readonly permissionParentRunId?: string;
+  readonly subagentResults?: (wait: boolean, signal: AbortSignal) => Promise<readonly string[]>;
   readonly systemPrompt?: string;
   /** 和接受请求前预算检查一致的固定工具目录。 */
   readonly toolSchemas?: readonly LlmToolSchema[];
@@ -92,6 +93,7 @@ function now(): string {
  * 不直接创建 ExecutionContext，由上层（AgentRunner）注入。
  */
 export class AgentLoop {
+  readonly #subagentResults: AgentLoopOptions["subagentResults"];
   readonly #permissionParentRunId: string | undefined;
   readonly #provider: LlmProvider;
   readonly #registry: ToolRegistry;
@@ -114,6 +116,7 @@ export class AgentLoop {
     bus: EventBus,
     options: AgentLoopOptions = {},
   ) {
+    this.#subagentResults = options.subagentResults;
     this.#permissionParentRunId = options.permissionParentRunId;
     this.#provider = provider;
     this.#registry = registry;
@@ -191,6 +194,8 @@ export class AgentLoop {
 
   /** 单步：选模型、消费流、累计 usage、按停止原因分派。 */
   async #runStep(context: ExecutionContext, signal: AbortSignal): Promise<StepOutcome> {
+    for (const result of (await this.#subagentResults?.(false, signal)) ?? [])
+      context.addUserContext(result);
     context.model = this.#provider.model;
     await this.#publish(
       context,
@@ -252,13 +257,19 @@ export class AgentLoop {
     context.anchorUsage(response.usage);
 
     switch (response.finishReason) {
-      case "end_turn":
+      case "end_turn": {
         if (response.toolCalls.length > 0) {
           context.markFailed("invalid_llm_response");
           return "failed";
         }
+        const results = (await this.#subagentResults?.(true, signal)) ?? [];
+        if (results.length > 0) {
+          for (const result of results) context.addUserContext(result);
+          return "continue";
+        }
         context.markSucceeded(response.text);
         return "succeeded";
+      }
       case "tool_use":
         if (response.toolCalls.length === 0) {
           context.markFailed("invalid_llm_response");

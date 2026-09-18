@@ -229,3 +229,5 @@ stdio 服务器以当前工作区为 cwd，支持 `env` 字符串表；命令、
 主 Agent 可先用 `list_subagent` 查找类型，再调用 `spawn_agent({ name, goal, context? })` 同步委派。子 Agent 使用相同模型及工作区，继承本轮固定的规则和 Skills 目录，仅接收显式任务和上下文，不继承父历史或 session notes。每个子 Agent 最多执行 20 步，工具来自类型文件中的完整名称白名单，禁止嵌套委派。
 
 子历史、任务、私有 notes、压缩 checkpoint 和事件审计保存在 `sessions/<sessionId>/runs/<parentRunId>/subagents/<childRunId>/`。父事件流仅收到生命周期摘要和带子身份的审批，Always 缓存与父 session 共用；取消和停机会排空子执行，重启将未结束的子记录标记为 interrupted，不自动续跑。
+
+`spawn_agent({ name, goal, context?, background: true })` 在子执行启动后返回 `childRunId`，父 Agent 可继续其他工作。`agent_result({ childRunId, wait? })` 查询当前父 run 拥有的子任务；`wait: true` 等待终态，仍响应取消。后台结果默认在父模型下一次调用前以普通用户上下文交付一次，显式查询终态后不再自动重复交付。父 Agent 准备结束时会等待剩余子任务并继续综合结果，额外模型调用计入父步数限制。后台任务仅存活于本轮 run，不能跨 turn 查询；CLI/TUI 显示子身份、生命周期和终态摘要，多窗口重放按事件序列去重。

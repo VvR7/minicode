@@ -80,9 +80,17 @@ export class GoalEventReducer {
       case "run.started":
         return { stderr: ["run started"] };
       case "subagent.started":
+        return {
+          stderr: [
+            `subagent ${event.payload.name} ${event.payload.childRunId} started${event.payload.background ? " in background" : ""}`,
+          ],
+        };
       case "subagent.finished":
-        // 协议先支持新事件，子 Agent 功能接入后再增加生命周期展示。
-        return { stderr: [] };
+        return {
+          stderr: [
+            `subagent ${event.payload.name} ${event.payload.childRunId} ${event.payload.status}: ${JSON.stringify(event.payload.summary)}`,
+          ],
+        };
       case "llm.model_selected":
         return { stderr: [`model ${event.payload.model} (${event.payload.provider})`] };
       case "llm.text_delta":

@@ -15,9 +15,15 @@ async function waitFor(condition: () => boolean) {
   }
 }
 
-test.each([false, true])(
+test.each([
+  { shutdown: false, mode: "sync" },
+  { shutdown: true, mode: "sync" },
+  { shutdown: false, mode: "background" },
+  { shutdown: true, mode: "background" },
+  { shutdown: false, mode: "wait" },
+])(
   "real Core routes child approval, isolates its turn, and reaps shutdown (%s)",
-  async (shutdown) => {
+  async ({ shutdown, mode }) => {
     const root = await mkdtemp(join(tmpdir(), "minicode-child-core-"));
     const workspace = join(root, "workspace");
     await mkdir(join(workspace, ".minicode/agents"), { recursive: true });
@@ -26,11 +32,35 @@ test.each([false, true])(
       '[agent]\ndescription="writer"\nsystem_prompt="PRIVATE_CHILD_ROLE"\nallowed_tools=["write","task_create"]\n',
     );
     const mock = startScriptedAnthropicMock((body) => {
-      const data = body as { system: string; messages: { content: { type: string }[] }[] };
+      const data = body as {
+        system: string;
+        messages: { content: { type: string; name?: string; text?: string; content?: string }[] }[];
+      };
       const child = data.system.includes("PRIVATE_CHILD_ROLE");
       const completedTools = data.messages
         .at(-1)
         ?.content.some((part) => part.type === "tool_result");
+      const integrated = data.messages.some((message) =>
+        message.content.some(
+          (part) => part.type === "text" && part.text?.startsWith("Subagent result:"),
+        ),
+      );
+      if (!child && integrated) return { kind: "text", chunks: ["parent final"] };
+      if (
+        !child &&
+        completedTools &&
+        mode === "wait" &&
+        !data.messages.some((message) =>
+          message.content.some((part) => part.name === "agent_result"),
+        )
+      ) {
+        const result = data.messages.at(-1)?.content.find((part) => part.type === "tool_result");
+        const childRunId = JSON.parse(result?.content ?? "{}").childRunId as string;
+        return {
+          kind: "tools",
+          calls: [{ id: "result", name: "agent_result", input: { childRunId, wait: true } }],
+        };
+      }
       if (completedTools)
         return { kind: "text", chunks: [child ? "private child result" : "parent final"] };
       return child
@@ -52,7 +82,11 @@ test.each([false, true])(
         : {
             kind: "tools",
             calls: [
-              { id: "spawn", name: "spawn_agent", input: { name: "writer", goal: "write child" } },
+              {
+                id: "spawn",
+                name: "spawn_agent",
+                input: { name: "writer", goal: "write child", background: mode !== "sync" },
+              },
             ],
           };
     });

@@ -104,6 +104,11 @@ export class ExecutionContext {
     this.#append({ role: "assistant", content: [...content] });
   }
 
+  /** 用普通用户上下文交付后台子结果，保持 tool_use/tool_result 配对不变。 */
+  addUserContext(text: string): void {
+    this.#append({ role: "user", content: [{ type: "text", text }] });
+  }
+
   /** 同一轮的全部工具结果合并为一条 user message。 */
   addToolResults(results: readonly ToolResultBlock[]): void {
     if (results.length === 0) {

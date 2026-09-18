@@ -1,3 +1,4 @@
+import { SubagentRegistry } from "./registry.ts";
 import { join } from "node:path";
 import { z } from "zod";
 import type { Environment, RunId, SessionId } from "@minicode/protocol";
@@ -34,50 +35,92 @@ export interface SubagentExecutorOptions {
   readonly registry: ToolRegistry;
   readonly bus: EventBus;
   readonly environment: Environment;
+  readonly parentSignal: AbortSignal;
   readonly runChild: (request: ChildExecution, signal: AbortSignal) => Promise<RunCompletion>;
 }
 const ChildStateSchema = z.object({
   childRunId: RunIdSchema,
   name: z.string().min(1).max(128),
+  background: z.boolean().default(false),
   status: z.enum(["running", "succeeded", "failed", "cancelled", "interrupted"]),
 });
 
 /** 子执行只属于一个父 run，完整状态保存在父目录下，不创建主 session turn。 */
 export class SubagentExecutor {
   readonly #options: SubagentExecutorOptions;
-  readonly #active = new Map<AbortController, Promise<ToolOutput>>();
+  readonly registry: SubagentRegistry;
   #closed = false;
 
   /** 固定父能力快照、模型执行入口和独立审计位置。 */
   constructor(options: SubagentExecutorOptions) {
     this.#options = options;
+    this.registry = new SubagentRegistry(options.sessionId, options.parentRunId);
   }
 
   /** 登记执行以支持父失败和 shutdown 排空，不设置额外并发上限。 */
-  spawn(params: SpawnAgentParams, signal: AbortSignal): Promise<ToolOutput> {
-    if (this.#closed || signal.aborted)
-      return Promise.reject(new ToolError("tool_cancelled", "subagent cancelled"));
+  async spawn(params: SpawnAgentParams, signal: AbortSignal): Promise<ToolOutput> {
+    if (this.#closed || signal.aborted || this.#options.parentSignal.aborted)
+      throw new ToolError("tool_cancelled", "subagent cancelled");
+    const profile = await loadSubagentProfile(this.#options.workspaceRoot, params.name);
+    const tools = allowedSubagentTools(profile, this.#options.registry);
+    if (this.#closed || signal.aborted || this.#options.parentSignal.aborted)
+      throw new ToolError("tool_cancelled", "subagent cancelled");
+    const childRunId = RunIdSchema.parse(crypto.randomUUID());
     const controller = new AbortController();
-    const execution = this.#execute(params, AbortSignal.any([signal, controller.signal]));
-    this.#active.set(controller, execution);
-    void execution.finally(() => this.#active.delete(controller)).catch(() => {});
-    return execution;
+    const ready = Promise.withResolvers<void>();
+    void ready.promise.catch(() => {});
+    const execution = this.#execute(
+      params,
+      profile,
+      tools.map((tool) => tool.name),
+      childRunId,
+      AbortSignal.any([signal, controller.signal, this.#options.parentSignal]),
+      ready.resolve,
+    );
+    void execution.catch(ready.reject);
+    this.registry.register(
+      childRunId,
+      profile.name,
+      params.background ?? false,
+      controller,
+      execution,
+    );
+    if (!params.background) return execution;
+    try {
+      await ready.promise;
+    } catch (error) {
+      // 初始化失败已通过当前 spawn 的 observation 返回，避免自动重复交付。
+      try {
+        await this.registry.result(
+          this.#options.sessionId,
+          this.#options.parentRunId,
+          childRunId,
+          true,
+          signal,
+        );
+      } catch {}
+      throw error;
+    }
+    return { content: JSON.stringify({ childRunId, status: "running" }) };
   }
 
   /** 关闭 admission，中断并等待全部子执行及其审计写入。 */
   async close(): Promise<void> {
     this.#closed = true;
-    for (const controller of this.#active.keys()) controller.abort();
-    await Promise.allSettled(this.#active.values());
+    await this.registry.close();
   }
 
   /** 加载最新类型、严格过滤能力，再执行冷启动的子上下文。 */
-  async #execute(params: SpawnAgentParams, signal: AbortSignal): Promise<ToolOutput> {
+  async #execute(
+    params: SpawnAgentParams,
+    profile: import("./profiles.ts").SubagentProfile,
+    toolNames: readonly string[],
+    childRunId: RunId,
+    signal: AbortSignal,
+    onReady: () => void,
+  ): Promise<ToolOutput> {
     const o = this.#options;
-    const profile = await loadSubagentProfile(o.workspaceRoot, params.name);
-    const tools = allowedSubagentTools(profile, o.registry);
     if (signal.aborted) throw new ToolError("tool_cancelled", "subagent cancelled");
-    const childRunId = RunIdSchema.parse(crypto.randomUUID());
     const directory = join(
       o.homeDirectory,
       "sessions",
@@ -89,7 +132,12 @@ export class SubagentExecutor {
     );
     await nodeSessionStorage.ensureDirectory(directory);
     const statePath = join(directory, "state.json");
-    const state = { childRunId, name: profile.name, status: "running" as string };
+    const state = {
+      childRunId,
+      name: profile.name,
+      background: params.background ?? false,
+      status: "running" as string,
+    };
     await nodeSessionStorage.writeFileAtomic(statePath, JSON.stringify(state));
     const snapshot = createRunSnapshot(
       composeSystemPrompt(
@@ -98,7 +146,7 @@ export class SubagentExecutor {
         "",
         o.snapshot.skillCatalog?.skills,
       ),
-      o.snapshot.toolSchemas.filter((tool) => tools.some((allowed) => allowed.name === tool.name)),
+      o.snapshot.toolSchemas.filter((tool) => toolNames.includes(tool.name)),
       o.snapshot.skillCatalog,
       o.snapshot.contextFiles,
     );
@@ -129,15 +177,16 @@ export class SubagentExecutor {
     try {
       await this.#publish({
         type: "subagent.started",
-        payload: { childRunId, name: profile.name, background: false },
+        payload: { childRunId, name: profile.name, background: params.background ?? false },
       });
       started = true;
+      onReady();
       completion = await o.runChild(
         {
           childRunId,
           directory,
           snapshot,
-          allowedTools: tools.map((tool) => tool.name),
+          allowedTools: toolNames,
           goal:
             params.context === undefined
               ? params.goal
@@ -179,7 +228,7 @@ export class SubagentExecutor {
           payload: {
             childRunId,
             name: profile.name,
-            background: false,
+            background: params.background ?? false,
             status: state.status as "succeeded" | "failed" | "cancelled",
             summary: (completion?.finalText || `subagent ${state.status}`).slice(0, 4096),
             ...(completion?.error === undefined
@@ -300,7 +349,7 @@ export async function recoverSubagents(
           payload: {
             childRunId: state.data.childRunId,
             name: state.data.name,
-            background: false,
+            background: state.data.background,
             status: "interrupted",
             summary: "subagent interrupted by Core restart",
           },

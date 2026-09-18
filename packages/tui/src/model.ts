@@ -440,6 +440,20 @@ export class TuiModel {
           `[TOOL] ${event.payload.isError ? "✗ failed" : "✓ completed"} ${event.payload.name}`,
         );
         break;
+      case "subagent.started":
+        this.#append(
+          mutations,
+          "info",
+          `[SUBAGENT] ${event.payload.name} ${event.payload.childRunId} started${event.payload.background ? " in background" : ""}`,
+        );
+        break;
+      case "subagent.finished":
+        this.#append(
+          mutations,
+          event.payload.status === "succeeded" ? "info" : "error",
+          `[SUBAGENT] ${event.payload.name} ${event.payload.childRunId} ${event.payload.status}: ${JSON.stringify(event.payload.summary)}`,
+        );
+        break;
       case "task.created":
       case "task.updated":
         this.#applyTask(event.runId, event.payload.task, mutations);

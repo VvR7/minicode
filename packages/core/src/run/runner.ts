@@ -1,3 +1,8 @@
+import {
+  createAgentResultTool,
+  AgentResultParamsSchema,
+  AGENT_RESULT_DESCRIPTION,
+} from "../subagents/result-tool.ts";
 import { SubagentExecutor, recoverSubagents, type ChildExecution } from "../subagents/executor.ts";
 import {
   createSpawnAgentTool,
@@ -62,6 +67,11 @@ export function buildRunSystemPrompt(
  */
 export function runToolSchemas(): readonly LlmToolSchema[] {
   const dynamic = [
+    {
+      name: "agent_result",
+      description: AGENT_RESULT_DESCRIPTION,
+      inputSchema: AgentResultParamsSchema,
+    },
     {
       name: "spawn_agent",
       description: SPAWN_AGENT_DESCRIPTION,
@@ -370,6 +380,7 @@ export class AgentRunner {
       executor = new SubagentExecutor({
         homeDirectory: this.#homeDirectory,
         environment: this.#environment,
+        parentSignal: externalSignal,
         sessionId: request.sessionId,
         parentRunId: request.runId,
         workspaceRoot: request.workspaceRoot,
@@ -380,6 +391,9 @@ export class AgentRunner {
       });
       const activeExecutor = executor;
       registry.register(
+        createAgentResultTool(activeExecutor.registry, request.sessionId, request.runId),
+      );
+      registry.register(
         createSpawnAgentTool((params, signal) => activeExecutor.spawn(params, signal)),
       );
     }
@@ -389,6 +403,12 @@ export class AgentRunner {
     const loop = new AgentLoop(provider, executionRegistry, invoker, this.#bus, {
       ...(this.#child === undefined ? {} : { permissionParentRunId: this.#child.parentRunId }),
       systemPrompt,
+      ...(executor === undefined
+        ? {}
+        : {
+            subagentResults: (wait: boolean, signal: AbortSignal) =>
+              executor?.registry.deliver(wait, signal) ?? Promise.resolve([]),
+          }),
       toolSchemas: request.snapshot?.toolSchemas ?? executionRegistry.toolSchemas(),
       ...(request.trace === undefined ? {} : { trace: request.trace }),
       contextWindowTokens: contextBudgetConfig.value.contextWindowTokens,

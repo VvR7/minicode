@@ -9,6 +9,7 @@ export const RunSnapshotSchema = z.strictObject({
   systemPrompt: z.string(),
   toolSchemas: z.array(LlmToolSchemaSchema),
   skillCatalog: SkillCatalogSchema.optional(),
+  contextFiles: z.strictObject({ global: z.string(), project: z.string() }).optional(),
 });
 export type RunSnapshot = Readonly<Omit<z.infer<typeof RunSnapshotSchema>, "toolSchemas">> & {
   readonly toolSchemas: readonly LlmToolSchema[];
@@ -26,11 +27,13 @@ export function createRunSnapshot(
   systemPrompt: string,
   toolSchemas: readonly LlmToolSchema[],
   skillCatalog?: SkillCatalog,
+  contextFiles?: ContextFiles,
 ): RunSnapshot {
   const parsed = RunSnapshotSchema.parse({
     systemPrompt,
     toolSchemas: structuredClone(toolSchemas),
     ...(skillCatalog === undefined ? {} : { skillCatalog: structuredClone(skillCatalog) }),
+    ...(contextFiles === undefined ? {} : { contextFiles: structuredClone(contextFiles) }),
   });
   return Object.freeze({
     ...parsed,

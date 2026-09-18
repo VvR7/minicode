@@ -12,6 +12,7 @@ import type {
   SessionGetHistoryResult,
   SessionListResult,
   SessionMode,
+  SessionId,
   SessionSendMessageResult,
   SessionSummary,
   TurnId,
@@ -62,6 +63,7 @@ export const DEFAULT_SESSION_SHUTDOWN_TIMEOUT_MS = 5_000;
 
 /** SessionManager 对 Runner 的最小依赖，便于隔离编排测试与替换 provider 实现。 */
 export interface SessionRunExecutor {
+  recoverSubagents?(sessionId: SessionId, parentRunId: RunId): Promise<void>;
   run(request: AgentRunRequest, signal: AbortSignal): Promise<AgentRunOutcome>;
   prepareSnapshot?(request: RunSnapshotRequest): Promise<RunSnapshot>;
   compact?(
@@ -987,6 +989,7 @@ export class SessionManager {
       return;
     }
     for (const turn of snapshot.turns) {
+      await this.#runner.recoverSubagents?.(snapshot.meta.sessionId, turn.runId);
       const journal = await this.#eventStore.read(snapshot.meta.sessionId, turn.runId);
       if (!journal.ok) {
         this.#corruptedSessions.add(snapshot.meta.sessionId);

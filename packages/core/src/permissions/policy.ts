@@ -73,6 +73,7 @@ export interface PermissionScope {
   readonly sessionId: string;
   readonly runId: string;
   readonly toolCallId: string;
+  readonly childRunId?: string;
 }
 
 export type PermissionCache = Map<string, boolean>;

@@ -1,0 +1,316 @@
+import { join } from "node:path";
+import { z } from "zod";
+import type { Environment, RunId, SessionId } from "@minicode/protocol";
+import { RunIdSchema, RunFinishedPayloadSchema } from "@minicode/protocol";
+import { composeSystemPrompt } from "../agent/system-prompt.ts";
+import { EventBus } from "../events/event-bus.ts";
+import { EventStore } from "../events/event-store.ts";
+import type { RunCompletion } from "../run/completion.ts";
+import { createRunSnapshot, type RunSnapshot } from "../run/snapshot.ts";
+import { nodeSessionStorage } from "../session/storage.ts";
+import type { ToolRegistry } from "../tools/registry.ts";
+import { ToolError, type ToolOutput } from "../tools/types.ts";
+import { loadTraceConfig } from "../trace/config.ts";
+import { TraceRecorder } from "../trace/recorder.ts";
+import { nodeTraceStorage } from "../trace/storage.ts";
+import { allowedSubagentTools, loadSubagentProfile } from "./profiles.ts";
+import type { SpawnAgentParams } from "./spawn-tool.ts";
+
+export interface ChildExecution {
+  readonly childRunId: RunId;
+  readonly directory: string;
+  readonly goal: string;
+  readonly snapshot: RunSnapshot;
+  readonly allowedTools: readonly string[];
+  readonly bus: EventBus;
+  readonly trace?: TraceRecorder;
+}
+export interface SubagentExecutorOptions {
+  readonly homeDirectory: string;
+  readonly sessionId: SessionId;
+  readonly parentRunId: RunId;
+  readonly workspaceRoot: string;
+  readonly snapshot: RunSnapshot;
+  readonly registry: ToolRegistry;
+  readonly bus: EventBus;
+  readonly environment: Environment;
+  readonly runChild: (request: ChildExecution, signal: AbortSignal) => Promise<RunCompletion>;
+}
+const ChildStateSchema = z.object({
+  childRunId: RunIdSchema,
+  name: z.string().min(1).max(128),
+  status: z.enum(["running", "succeeded", "failed", "cancelled", "interrupted"]),
+});
+
+/** 子执行只属于一个父 run，完整状态保存在父目录下，不创建主 session turn。 */
+export class SubagentExecutor {
+  readonly #options: SubagentExecutorOptions;
+  readonly #active = new Map<AbortController, Promise<ToolOutput>>();
+  #closed = false;
+
+  /** 固定父能力快照、模型执行入口和独立审计位置。 */
+  constructor(options: SubagentExecutorOptions) {
+    this.#options = options;
+  }
+
+  /** 登记执行以支持父失败和 shutdown 排空，不设置额外并发上限。 */
+  spawn(params: SpawnAgentParams, signal: AbortSignal): Promise<ToolOutput> {
+    if (this.#closed || signal.aborted)
+      return Promise.reject(new ToolError("tool_cancelled", "subagent cancelled"));
+    const controller = new AbortController();
+    const execution = this.#execute(params, AbortSignal.any([signal, controller.signal]));
+    this.#active.set(controller, execution);
+    void execution.finally(() => this.#active.delete(controller)).catch(() => {});
+    return execution;
+  }
+
+  /** 关闭 admission，中断并等待全部子执行及其审计写入。 */
+  async close(): Promise<void> {
+    this.#closed = true;
+    for (const controller of this.#active.keys()) controller.abort();
+    await Promise.allSettled(this.#active.values());
+  }
+
+  /** 加载最新类型、严格过滤能力，再执行冷启动的子上下文。 */
+  async #execute(params: SpawnAgentParams, signal: AbortSignal): Promise<ToolOutput> {
+    const o = this.#options;
+    const profile = await loadSubagentProfile(o.workspaceRoot, params.name);
+    const tools = allowedSubagentTools(profile, o.registry);
+    if (signal.aborted) throw new ToolError("tool_cancelled", "subagent cancelled");
+    const childRunId = RunIdSchema.parse(crypto.randomUUID());
+    const directory = join(
+      o.homeDirectory,
+      "sessions",
+      o.sessionId,
+      "runs",
+      o.parentRunId,
+      "subagents",
+      childRunId,
+    );
+    await nodeSessionStorage.ensureDirectory(directory);
+    const statePath = join(directory, "state.json");
+    const state = { childRunId, name: profile.name, status: "running" as string };
+    await nodeSessionStorage.writeFileAtomic(statePath, JSON.stringify(state));
+    const snapshot = createRunSnapshot(
+      composeSystemPrompt(
+        profile.systemPrompt,
+        o.snapshot.contextFiles ?? { global: "", project: "" },
+        "",
+        o.snapshot.skillCatalog?.skills,
+      ),
+      o.snapshot.toolSchemas.filter((tool) => tools.some((allowed) => allowed.name === tool.name)),
+      o.snapshot.skillCatalog,
+      o.snapshot.contextFiles,
+    );
+    const config = loadTraceConfig(o.environment);
+    const trace = config.ok
+      ? new TraceRecorder(
+          o.sessionId,
+          childRunId,
+          config.value,
+          nodeTraceStorage,
+          o.homeDirectory,
+          undefined,
+          o.parentRunId,
+        )
+      : undefined;
+    trace?.start();
+    const bus = new EventBus(new EventStore(o.homeDirectory, undefined, o.parentRunId), {
+      onPersisted: (event) =>
+        trace?.record({
+          source: "CORE",
+          target: "CORE",
+          kind: "core.event_persisted",
+          data: { type: event.type, sequence: event.sequence },
+        }),
+    });
+    let completion: RunCompletion | undefined;
+    let started = false;
+    try {
+      await this.#publish({
+        type: "subagent.started",
+        payload: { childRunId, name: profile.name, background: false },
+      });
+      started = true;
+      completion = await o.runChild(
+        {
+          childRunId,
+          directory,
+          snapshot,
+          allowedTools: tools.map((tool) => tool.name),
+          goal:
+            params.context === undefined
+              ? params.goal
+              : `${params.goal}\n\nExplicit context:\n${params.context}`,
+          bus,
+          ...(trace === undefined ? {} : { trace }),
+        },
+        signal,
+      );
+      state.status = completion.status;
+      await nodeSessionStorage.writeFileAtomic(
+        join(directory, "history.json"),
+        JSON.stringify(completion),
+      );
+      const finished = await bus.publish({
+        sessionId: o.sessionId,
+        runId: childRunId,
+        timestamp: new Date().toISOString(),
+        durable: true,
+        type: "run.finished",
+        payload: RunFinishedPayloadSchema.parse({
+          status: completion.status,
+          reason: completion.reason,
+          finalText: completion.finalText.slice(0, 256 * 1024),
+          steps: completion.steps,
+          usage: completion.usage,
+          ...(completion.error === undefined ? {} : { error: completion.error }),
+        }),
+      });
+      if (!finished.ok) throw new Error("child audit failed");
+    } catch {
+      state.status = signal.aborted ? "cancelled" : "failed";
+    } finally {
+      await trace?.stop();
+      await nodeSessionStorage.writeFileAtomic(statePath, JSON.stringify(state));
+      if (started)
+        await this.#publish({
+          type: "subagent.finished",
+          payload: {
+            childRunId,
+            name: profile.name,
+            background: false,
+            status: state.status as "succeeded" | "failed" | "cancelled",
+            summary: (completion?.finalText || `subagent ${state.status}`).slice(0, 4096),
+            ...(completion?.error === undefined
+              ? {}
+              : { errorCode: completion.error.code.slice(0, 128) }),
+          },
+        });
+    }
+    const output = { content: completion?.finalText || `subagent ${state.status}` };
+    if (state.status !== "succeeded")
+      throw new ToolError(
+        state.status === "cancelled" ? "tool_cancelled" : "io_error",
+        `subagent ${state.status}`,
+        { output },
+      );
+    return output;
+  }
+
+  /** 父流仅记录可重放的身份和终态摘要，不桥接子任务或模型细节。 */
+  async #publish(
+    event:
+      | {
+          type: "subagent.started";
+          payload: { childRunId: RunId; name: string; background: boolean };
+        }
+      | {
+          type: "subagent.finished";
+          payload: {
+            childRunId: RunId;
+            name: string;
+            background: boolean;
+            status: "succeeded" | "failed" | "cancelled";
+            summary: string;
+            errorCode?: string;
+          };
+        },
+  ): Promise<void> {
+    const o = this.#options;
+    const result = await o.bus.publish({
+      ...event,
+      sessionId: o.sessionId,
+      runId: o.parentRunId,
+      timestamp: new Date().toISOString(),
+      durable: true,
+    });
+    if (!result.ok) throw new Error("subagent lifecycle persistence failed");
+  }
+}
+
+/** 重启只补偿未结束的子执行；不恢复模型调用或创建新的主会话 turn。 */
+export async function recoverSubagents(
+  homeDirectory: string,
+  sessionId: SessionId,
+  parentRunId: RunId,
+  parentBus?: EventBus,
+): Promise<void> {
+  const root = join(homeDirectory, "sessions", sessionId, "runs", parentRunId, "subagents");
+  for (const directory of await nodeSessionStorage.listDirectories(root)) {
+    if (!RunIdSchema.safeParse(directory).success) continue;
+    const path = join(root, directory, "state.json");
+    const raw = await nodeSessionStorage.readFile(path);
+    if (!raw) continue;
+    let document: unknown;
+    try {
+      document = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    const state = ChildStateSchema.safeParse(document);
+    if (!state.success || state.data.childRunId !== directory || state.data.status !== "running")
+      continue;
+    const store = new EventStore(homeDirectory, undefined, parentRunId);
+    const journal = await store.read(sessionId, state.data.childRunId);
+    if (!journal.ok) throw new Error("child audit recovery failed");
+    if (!journal.value.finished) {
+      const finished = await new EventBus(store).publish({
+        sessionId,
+        runId: state.data.childRunId,
+        timestamp: new Date().toISOString(),
+        durable: true,
+        type: "run.finished",
+        payload: {
+          status: "failed",
+          reason: "core_restarted",
+          finalText: "",
+          steps: 0,
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          },
+        },
+      });
+      if (!finished.ok) throw new Error("child terminal recovery failed");
+    }
+    if (parentBus) {
+      const parent = await new EventStore(homeDirectory).read(sessionId, parentRunId);
+      if (!parent.ok) throw new Error("parent audit recovery failed");
+      if (
+        !parent.value.finished &&
+        parent.value.events.some(
+          (event) =>
+            event.type === "subagent.started" && event.payload.childRunId === state.data.childRunId,
+        ) &&
+        !parent.value.events.some(
+          (event) =>
+            event.type === "subagent.finished" &&
+            event.payload.childRunId === state.data.childRunId,
+        )
+      ) {
+        const finished = await parentBus.publish({
+          sessionId,
+          runId: parentRunId,
+          timestamp: new Date().toISOString(),
+          durable: true,
+          type: "subagent.finished",
+          payload: {
+            childRunId: state.data.childRunId,
+            name: state.data.name,
+            background: false,
+            status: "interrupted",
+            summary: "subagent interrupted by Core restart",
+          },
+        });
+        if (!finished.ok) throw new Error("child lifecycle recovery failed");
+      }
+    }
+    await nodeSessionStorage.writeFileAtomic(
+      path,
+      JSON.stringify({ ...state.data, status: "interrupted" }),
+    );
+  }
+}

@@ -1,3 +1,9 @@
+import { SubagentExecutor, recoverSubagents, type ChildExecution } from "../subagents/executor.ts";
+import {
+  createSpawnAgentTool,
+  SpawnAgentParamsSchema,
+  SPAWN_AGENT_DESCRIPTION,
+} from "../subagents/spawn-tool.ts";
 import { workspaceMcpTools } from "../mcp/tool.ts";
 import type { McpServerManager } from "../mcp/server-manager.ts";
 import { dirname, join } from "node:path";
@@ -56,6 +62,11 @@ export function buildRunSystemPrompt(
  */
 export function runToolSchemas(): readonly LlmToolSchema[] {
   const dynamic = [
+    {
+      name: "spawn_agent",
+      description: SPAWN_AGENT_DESCRIPTION,
+      inputSchema: SpawnAgentParamsSchema,
+    },
     {
       name: "list_subagent",
       description: createListSubagentTool().description,
@@ -132,6 +143,11 @@ export interface AgentRunRequest {
 }
 
 export interface AgentRunnerOptions {
+  readonly child?: {
+    readonly directory: string;
+    readonly allowedTools: readonly string[];
+    readonly parentRunId: RunId;
+  };
   readonly permissions?: PermissionManager;
   readonly mcp?: McpServerManager;
   readonly environment: Environment;
@@ -155,6 +171,7 @@ export interface AgentRunOutcome {
  * 由编排层在 history 提交后统一发布 run.finished。
  */
 export class AgentRunner {
+  readonly #child: AgentRunnerOptions["child"];
   readonly #environment: Environment;
   readonly #bus: EventBus;
   readonly #homeDirectory: string;
@@ -165,6 +182,7 @@ export class AgentRunner {
 
   /** 保存 run 组装所需的环境、存储、事件与可注入依赖。 */
   constructor(options: AgentRunnerOptions) {
+    this.#child = options.child;
     this.#mcp = options.mcp;
     this.#environment = options.environment;
     this.#bus = options.bus;
@@ -197,6 +215,7 @@ export class AgentRunner {
         })),
       ],
       loaded.skillCatalog,
+      request.files,
     );
   }
 
@@ -228,6 +247,11 @@ export class AgentRunner {
         },
       };
     }
+  }
+
+  /** 恢复父目录下未结束的子记录，仅标 interrupted 而不重新运行。 */
+  async recoverSubagents(sessionId: SessionId, parentRunId: RunId): Promise<void> {
+    await recoverSubagents(this.#homeDirectory, sessionId, parentRunId, this.#bus);
   }
 
   /** 使用当前模型创建独立摘要调用；压缩的持久化由会话编排层负责。 */
@@ -287,16 +311,17 @@ export class AgentRunner {
       return { completion: this.#completionFromContext(context) };
     }
 
-    const runDirectory = dirname(tasksPath(this.#homeDirectory, request.sessionId, request.runId));
+    const runDirectory =
+      this.#child?.directory ??
+      dirname(tasksPath(this.#homeDirectory, request.sessionId, request.runId));
     await nodeSessionStorage.ensureDirectory(runDirectory);
 
-    const taskManager = new TaskManager(
-      this.#taskStorage,
-      tasksPath(this.#homeDirectory, request.sessionId, request.runId),
-    );
+    const taskManager = new TaskManager(this.#taskStorage, join(runDirectory, "tasks.json"));
     const noteStore = new NoteStore(
       nodeSessionStorage,
-      join(this.#homeDirectory, "sessions", request.sessionId, "notes.md"),
+      this.#child
+        ? join(runDirectory, "notes.md")
+        : join(this.#homeDirectory, "sessions", request.sessionId, "notes.md"),
       { sessionId: request.sessionId, runId: request.runId },
     );
 
@@ -320,30 +345,62 @@ export class AgentRunner {
         registry.register(tool);
     }
 
-    // 编排层传入的完整快照直接复用；直接调用 Runner 时也加载同样的两处规则。
-    const systemPrompt =
-      request.snapshot?.systemPrompt ??
-      request.systemPrompt ??
-      (
-        await this.prepareSnapshot({
-          notes:
-            (await nodeSessionStorage.readFile(
+    // 主 run 预检快照固定规则和 skills，子 run 直接继承该目录与规则。
+    const snapshot =
+      request.snapshot ??
+      (await this.prepareSnapshot({
+        notes: this.#child
+          ? ""
+          : ((await nodeSessionStorage.readFile(
               join(this.#homeDirectory, "sessions", request.sessionId, "notes.md"),
-            )) ?? "",
-          files: await loadContextFiles(this.#homeDirectory, request.workspaceRoot),
-          workspaceRoot: request.workspaceRoot,
-        })
-      ).systemPrompt;
-    const invoker = new ToolInvoker(registry, { permissions: this.#permissions });
-    const loop = new AgentLoop(provider, registry, invoker, this.#bus, {
+            )) ?? ""),
+        files: await loadContextFiles(this.#homeDirectory, request.workspaceRoot),
+        workspaceRoot: request.workspaceRoot,
+      }));
+    let executor: SubagentExecutor | undefined;
+    let executionRegistry = registry;
+    if (this.#child) {
+      executionRegistry = new ToolRegistry();
+      for (const name of this.#child.allowedTools) {
+        const tool = registry.get(name);
+        if (!tool) throw new Error("missing child tool");
+        executionRegistry.register(tool);
+      }
+    } else {
+      executor = new SubagentExecutor({
+        homeDirectory: this.#homeDirectory,
+        environment: this.#environment,
+        sessionId: request.sessionId,
+        parentRunId: request.runId,
+        workspaceRoot: request.workspaceRoot,
+        snapshot,
+        registry,
+        bus: this.#bus,
+        runChild: (child, signal) => this.#runChild(request, child, signal),
+      });
+      const activeExecutor = executor;
+      registry.register(
+        createSpawnAgentTool((params, signal) => activeExecutor.spawn(params, signal)),
+      );
+    }
+    const systemPrompt =
+      request.snapshot?.systemPrompt ?? request.systemPrompt ?? snapshot.systemPrompt;
+    const invoker = new ToolInvoker(executionRegistry, { permissions: this.#permissions });
+    const loop = new AgentLoop(provider, executionRegistry, invoker, this.#bus, {
+      ...(this.#child === undefined ? {} : { permissionParentRunId: this.#child.parentRunId }),
       systemPrompt,
-      toolSchemas: request.snapshot?.toolSchemas ?? registry.toolSchemas(),
+      toolSchemas: request.snapshot?.toolSchemas ?? executionRegistry.toolSchemas(),
       ...(request.trace === undefined ? {} : { trace: request.trace }),
       contextWindowTokens: contextBudgetConfig.value.contextWindowTokens,
       compactionConfig: compactionConfig.value,
       ...(request.compact === undefined ? {} : { compact: request.compact }),
     });
-    const completion = await loop.run(context, externalSignal, true);
+    let completion: RunCompletion;
+    try {
+      completion = await loop.run(context, externalSignal, true);
+    } finally {
+      await executor?.close();
+    }
 
     const listed = await taskManager.list();
     const taskGraph: TaskGraphSnapshot | undefined =
@@ -356,6 +413,57 @@ export class AgentRunner {
         ...(taskGraph === undefined ? {} : { taskGraph }),
       },
     };
+  }
+
+  /** 复用模型配置，组装独立子资源；压缩 checkpoint 仅写入子目录。 */
+  async #runChild(
+    parent: AgentRunRequest,
+    child: ChildExecution,
+    signal: AbortSignal,
+  ): Promise<RunCompletion> {
+    const runner = new AgentRunner({
+      environment: this.#environment,
+      bus: child.bus,
+      homeDirectory: this.#homeDirectory,
+      providerFactory: this.#providerFactory,
+      taskStorage: this.#taskStorage,
+      permissions: this.#permissions,
+      ...(this.#mcp === undefined ? {} : { mcp: this.#mcp }),
+      child: {
+        directory: child.directory,
+        allowedTools: child.allowedTools,
+        parentRunId: parent.runId,
+      },
+    });
+    let previous: import("../compact/types.ts").CompactionCheckpoint | undefined;
+    const outcome = await runner.run(
+      {
+        sessionId: parent.sessionId,
+        runId: child.childRunId,
+        goal: child.goal,
+        workspaceRoot: parent.workspaceRoot,
+        snapshot: child.snapshot,
+        ...(child.trace === undefined ? {} : { trace: child.trace }),
+        compact: async (entries, tokensBefore, reason, compactSignal) => {
+          const result = await runner.compact({
+            entries,
+            tokensBefore,
+            reason,
+            signal: compactSignal,
+            ...(previous === undefined ? {} : { previous }),
+          });
+          if (!result) return undefined;
+          await nodeSessionStorage.writeFileAtomic(
+            join(child.directory, "compaction.json"),
+            JSON.stringify(result),
+          );
+          previous = result.checkpoint;
+          return result.entries;
+        },
+      },
+      signal,
+    );
+    return outcome.completion;
   }
 
   /** 由 context 组装 RunCompletion。 */

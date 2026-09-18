@@ -100,6 +100,7 @@ export class PermissionManager {
             durable: true,
             type: "permission.resolved",
             payload: {
+              ...(scope.childRunId === undefined ? {} : { childRunId: scope.childRunId }),
               permissionRequestId: id,
               toolCallId: scope.toolCallId,
               name,
@@ -134,6 +135,7 @@ export class PermissionManager {
         durable: true,
         type: "permission.requested",
         payload: {
+          ...(scope.childRunId === undefined ? {} : { childRunId: scope.childRunId }),
           permissionRequestId: id,
           toolCallId: scope.toolCallId,
           name,

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { AgentEvent } from "@minicode/protocol";
 import { z } from "zod";
 import { ExecutionContext } from "../../src/agent/context.ts";
-import { AgentLoop } from "../../src/agent/loop.ts";
+import { AgentLoop, MAX_SUBAGENT_PARALLEL_TOOL_RESULT_BYTES } from "../../src/agent/loop.ts";
 import { EventBus } from "../../src/events/event-bus.ts";
 import { EventStore } from "../../src/events/event-store.ts";
 import { PermissionManager } from "../../src/permissions/manager.ts";
@@ -26,6 +26,7 @@ function harness(
   calls: LlmToolCall[],
   onEvent?: (event: AgentEvent) => void,
   storage = new MemoryJournalStorage(),
+  maxParallelToolResultBytes?: number,
 ) {
   const events: AgentEvent[] = [];
   const bus = new EventBus(new EventStore("/unused", storage), {
@@ -42,7 +43,9 @@ function harness(
     { response: toolResponse(calls) },
     { response: textResponse("done") },
   ]);
-  const loop = new AgentLoop(provider, registry, invoker, bus);
+  const loop = new AgentLoop(provider, registry, invoker, bus, {
+    ...(maxParallelToolResultBytes === undefined ? {} : { maxParallelToolResultBytes }),
+  });
   const context = new ExecutionContext({
     sessionId: SESSION_A,
     runId: RUN_A,
@@ -143,6 +146,33 @@ describe("AgentLoop tool batches", () => {
     firstOutput.resolve({ content: "ok" });
     expect((await running).status).toBe("succeeded");
     expect(order).toEqual(["check:first", "execute:first", "check:second", "execute:second"]);
+  });
+
+  test("bounded parallel results preserve order, identity and errors for the next step", async () => {
+    const h = harness(
+      [
+        tool("first", () => ({ content: "甲".repeat(30_000) })),
+        tool("second", () => {
+          throw new ToolError("command_failed", "failed", {
+            output: { content: "乙".repeat(30_000) },
+          });
+        }),
+      ],
+      [toolCall("1", "first"), toolCall("2", "second")],
+      undefined,
+      new MemoryJournalStorage(),
+      MAX_SUBAGENT_PARALLEL_TOOL_RESULT_BYTES,
+    );
+    expect((await h.loop.run(h.context, new AbortController().signal)).status).toBe("succeeded");
+    const results = observations(h.provider) ?? [];
+    expect(results.map((result) => result.toolUseId)).toEqual(["1", "2"]);
+    expect(results[0]?.isError).toBeUndefined();
+    expect(results[1]?.isError).toBe(true);
+    expect(results.every((result) => result.content.includes("batch output truncated"))).toBe(true);
+    expect(
+      results.reduce((sum, result) => sum + Buffer.byteLength(result.content), 0),
+    ).toBeLessThanOrEqual(MAX_SUBAGENT_PARALLEL_TOOL_RESULT_BYTES);
+    expect(h.provider.calls).toHaveLength(2);
   });
 
   test("parallel execution waits for all ordered approvals and denial remains an independent result", async () => {

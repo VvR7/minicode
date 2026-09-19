@@ -48,10 +48,12 @@ system prompt 的 `available skills:` 只列 name、description 与 SKILL.md 绝
 description = "只读审核及外部查询"
 system_prompt = "检查显式任务，返回文本结论及证据。"
 allowed_tools = ["read", "mcp__local__search"]
+max_steps = 30
 ```
 
 内置 planner/reviewer 仅允许 read，返回文本计划或审核。executor 允许
 read/write/edit/bash/task_create/task_update/task_list/task_get。
+`max_steps` 可选，接受 1–100 的整数，默认 20；内置 executor 使用 40。
 空白名单表示没有工具；未知工具及 spawn_agent/agent_result/list_subagent 拒绝，禁止嵌套。
 白名单中的工具仍经过参数和固定安全策略，但子 Agent 默认 bypass，不产生人工审批。
 模型、工作区和规则继承父 run，不配置独立模型。
@@ -63,7 +65,7 @@ agent_result({ childRunId: "返回的 UUID", wait: true })
 ```
 
 默认同步返回文本，不使用普通工具的 10 秒时限。后台在启动后返回 childRunId；查询仅允许
-当前 session + 父 run 的子身份，wait=true 可取消等待。每个子执行最多 20 步，没有额外并发
+当前 session + 父 run 的子身份，wait=true 可取消等待。每个子执行采用 profile 步数上限，没有额外并发
 上限或 run 总时限，provider 请求仍有自己的超时。父失败、取消及停机中断并排空子任务。
 后台任务不跨 turn 存活，终态后释放 Registry。
 
@@ -72,6 +74,8 @@ agent_result({ childRunId: "返回的 UUID", wait: true })
 综合结果，额外调用计入父步数限制。不会伪造没有对应 tool_use 的 tool_result。
 同步、查询及自动交付共用结构化终态，包含身份、status、reason、errorCode、steps 和有界正文；
 `max_steps` 与 `context_limit_exceeded` 不再折叠为缺少原因的通用失败。
+子 Agent 的单步并行工具结果正文总量限制为 64 KiB；截断保持调用顺序、tool use ID、
+错误标志及明确提示。主 Agent 和串行批次不使用该子执行专用总量限制。
 
 子执行不创建主 session turn，不改变主 activeRun，且不继承父历史或 session notes。
 独立 TaskManager、私有 note_save、压缩 checkpoint、历史、Trace 和事件审计布局如下：
@@ -150,7 +154,7 @@ executeMode 可选 serial/parallel，默认 parallel。write/edit/bash/task_crea
 | 四能力组合、两个工作区、Skill 覆盖与展开、真实 MCP 并发关联、后台综合、审批镜像、取消、shutdown 和 interrupted 恢复 | `tests/integration/stage5-lifecycle.test.ts`、`fixtures/stage5-mcp.ts` |
 | Skills 元数据、正文快照、预算、原始命令幂等及 CLI/TUI 列表 | `packages/core/test/skills/*`、`tests/integration/stage5-skills.test.ts`、CLI/TUI 测试 |
 | 类型实时发现、无效覆盖不回退、完整名称白名单 | `packages/core/test/subagents/profiles.test.ts` |
-| 同步隔离 history/tasks/notes/压缩、20 步、权限 bypass、父取消和审计 | `packages/core/test/subagents/execution.test.ts` |
+| 同步隔离 history/tasks/notes/压缩、profile 步数、权限 bypass、父取消和审计 | `packages/core/test/subagents/execution.test.ts` |
 | 后台继续父工作、结束前等待与计步、父失败排空 | `packages/core/test/subagents/background.test.ts` |
 | 查询/等待、归属验证、一次交付、失败观察、释放 Registry | `packages/core/test/subagents/registry.test.ts` |
 | 真实 Core 同步/后台 bypass、agent_result wait、单一主 turn、shutdown | `tests/integration/stage5-subagents.test.ts` |

@@ -39,6 +39,8 @@ export const DEFAULT_SYSTEM_PROMPT =
 const MAX_TEXT_DELTA_CHARS = 16 * 1024;
 /** run.finished.finalText 的协议层上限（字符数）。 */
 const MAX_FINAL_TEXT_CHARS = 256 * 1024;
+/** 子 Agent 单个并行工具批次回填模型的正文总上限。 */
+export const MAX_SUBAGENT_PARALLEL_TOOL_RESULT_BYTES = 64 * 1024;
 
 type StepOutcome = "continue" | "succeeded" | "failed" | "cancelled";
 
@@ -64,6 +66,8 @@ export interface AgentLoopOptions {
   readonly contextWindowTokens?: number;
   readonly compactionConfig?: CompactionConfig;
   readonly compact?: ContextCompactionHook;
+  /** 仅对子 Agent 设置；限制单步并行工具结果写回模型的正文总字节数。 */
+  readonly maxParallelToolResultBytes?: number;
 }
 
 /** EventBus 发布失败（如 event_store_error）时抛出，由 run 映射为结构化失败。 */
@@ -81,6 +85,42 @@ function chunkText(text: string, maxChars: number): string[] {
     chunks.push(text.slice(i, i + maxChars));
   }
   return chunks;
+}
+
+/** 在 UTF-8 边界内截取正文，避免批次预算产生损坏字符。 */
+function sliceUtf8(text: string, maxBytes: number): string {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
+
+/** 按请求顺序公平分配批次预算，保留每个调用身份、错误标志和明确截断提示。 */
+function boundParallelToolResults(
+  results: readonly ToolResultBlock[],
+  maxBytes: number,
+): readonly ToolResultBlock[] {
+  const encoder = new TextEncoder();
+  if (
+    results.reduce((sum, result) => sum + encoder.encode(result.content).byteLength, 0) <= maxBytes
+  )
+    return results;
+  const marker = "\n[parallel tool batch output truncated]";
+  const markerBytes = encoder.encode(marker).byteLength;
+  let remaining = maxBytes;
+  return results.map((result, index) => {
+    const share = Math.floor(remaining / (results.length - index));
+    const bytes = encoder.encode(result.content).byteLength;
+    const content =
+      bytes <= share
+        ? result.content
+        : share <= markerBytes
+          ? sliceUtf8(marker.trimStart(), share)
+          : `${sliceUtf8(result.content, share - markerBytes)}${marker}`;
+    remaining -= encoder.encode(content).byteLength;
+    return { ...result, content };
+  });
 }
 
 function now(): string {
@@ -107,6 +147,7 @@ export class AgentLoop {
   readonly #contextWindowTokens: number | undefined;
   readonly #compactionConfig: CompactionConfig | undefined;
   readonly #compact: ContextCompactionHook | undefined;
+  readonly #maxParallelToolResultBytes: number | undefined;
 
   /** 保存本轮提示词、工具目录及执行依赖；循环中不重新发现能力。 */
   constructor(
@@ -130,6 +171,7 @@ export class AgentLoop {
     this.#contextWindowTokens = options.contextWindowTokens;
     this.#compactionConfig = options.compactionConfig;
     this.#compact = options.compact;
+    this.#maxParallelToolResultBytes = options.maxParallelToolResultBytes;
   }
 
   /** 执行直到终止；同一 signal 贯穿 LLM 与工具调用。返回结构化 RunCompletion，不发布 run.finished。 */
@@ -433,7 +475,11 @@ export class AgentLoop {
           results.push(await execution);
         }
       }
-      context.addToolResults(results);
+      context.addToolResults(
+        parallel && this.#maxParallelToolResultBytes !== undefined
+          ? boundParallelToolResults(results, this.#maxParallelToolResultBytes)
+          : results,
+      );
       // 已配对结果可保留审计，但取消后不能再进入下一次模型请求。
       if (signal.aborted) throw new LlmError("aborted", "agent run cancelled");
     } catch (error) {

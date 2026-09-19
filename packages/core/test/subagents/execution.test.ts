@@ -20,14 +20,6 @@ import {
   type FakeTurn,
 } from "../agent/test-helpers.ts";
 import { environmentWithLlm } from "../run/test-helpers.ts";
-/** 等待实际条件，允许 CI 上 fsync 和覆盖率插桩的正常开销。 */
-async function waitFor(condition: () => boolean): Promise<void> {
-  const deadline = performance.now() + 3000;
-  while (!condition()) {
-    if (performance.now() > deadline) throw new Error("subagent condition timed out");
-    await Bun.sleep(1);
-  }
-}
 
 /** 建立父子共用工作区、独立 provider 和可选类型配置。 */
 async function fixture(
@@ -199,7 +191,7 @@ test("spawn revalidates latest profile, unknown profile becomes observation", as
   }
 });
 
-test("child approval uses parent channel and identity; parent always cache is shared", async () => {
+test("child bypasses parent approval while keeping its explicit tool whitelist", async () => {
   const f = await fixture(
     [
       {
@@ -212,66 +204,33 @@ test("child approval uses parent channel and identity; parent always cache is sh
     '[agent]\ndescription="writer"\nsystem_prompt="writer"\nallowed_tools=["write"]\n',
   );
   try {
-    const pending = f.run();
-    await waitFor(() => f.observed.events.some((e) => e.type === "permission.requested"));
-    const request = f.observed.events.find((e) => e.type === "permission.requested");
-    expect(request?.type).toBe("permission.requested");
-    if (request?.type !== "permission.requested") throw new Error("missing approval");
-    const { childRunId } = await f.childDirectory();
-    expect(request.runId).toBe(RUN_A);
-    expect(request.payload.childRunId).toBe(childRunId);
-    expect(request.payload.toolCallId).toBe(`${childRunId}:write`);
-    await f.permissions.respond({
-      sessionId: SESSION_A,
-      runId: RUN_A,
-      permissionRequestId: request.payload.permissionRequestId,
-      decision: "always_allow",
-    });
-    expect((await pending).completion.status).toBe("succeeded");
+    expect((await f.run()).completion.status).toBe("succeeded");
     expect(await readFile(join(f.workspace, "child.txt"), "utf8")).toBe("child");
-    expect(
-      await f.permissions.check(
-        "write",
-        { path: "another", content: "x" },
-        { sessionId: SESSION_A, runId: RUN_A, toolCallId: "parent" },
-        new AbortController().signal,
-      ),
-    ).toEqual({ allowed: true, source: "session_cache" });
-    expect(f.observed.events.find((e) => e.type === "permission.resolved")?.payload).toMatchObject({
-      childRunId,
-    });
+    expect(f.permissions.pendingCount).toBe(0);
+    expect(f.observed.events.some((e) => e.type === "permission.requested")).toBe(false);
   } finally {
     await f.cleanup();
   }
 });
 
-test("parent abort drains child approval and audit before returning", async () => {
+test("child bypass still rejects a command denied by fixed bash policy", async () => {
   const f = await fixture(
     [
       {
-        response: toolResponse([
-          toolCall("write", "write", { path: "never.txt", content: "never" }),
-        ]),
+        response: toolResponse([toolCall("bash", "bash", { command: "git reset --hard" })]),
       },
+      { response: textResponse("handled") },
     ],
-    '[agent]\ndescription="writer"\nsystem_prompt="writer"\nallowed_tools=["write"]\n',
+    '[agent]\ndescription="runner"\nsystem_prompt="runner"\nallowed_tools=["bash"]\n',
   );
   try {
-    const controller = new AbortController();
-    const pending = f.run(controller.signal);
-    await waitFor(() => f.permissions.pendingCount > 0);
-    expect(f.permissions.pendingCount).toBe(1);
-    controller.abort();
-    expect((await pending).completion.status).toBe("cancelled");
+    expect((await f.run()).completion.status).toBe("succeeded");
     expect(f.permissions.pendingCount).toBe(0);
-    expect(await Bun.file(join(f.workspace, "never.txt")).exists()).toBe(false);
+    expect(f.observed.events.some((e) => e.type === "permission.requested")).toBe(false);
     const { directory } = await f.childDirectory();
-    expect(JSON.parse(await readFile(join(directory, "state.json"), "utf8")).status).toBe(
-      "cancelled",
+    expect(await readFile(join(directory, "events.jsonl"), "utf8")).toContain(
+      '"errorCode":"permission_denied"',
     );
-    expect(f.observed.events.find((e) => e.type === "subagent.finished")?.payload).toMatchObject({
-      status: "cancelled",
-    });
   } finally {
     await f.cleanup();
   }

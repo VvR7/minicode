@@ -53,7 +53,8 @@ allowed_tools = ["read", "mcp__local__search"]
 内置 planner/reviewer 仅允许 read，返回文本计划或审核。executor 允许
 read/write/edit/bash/task_create/task_update/task_list/task_get。
 空白名单表示没有工具；未知工具及 spawn_agent/agent_result/list_subagent 拒绝，禁止嵌套。
-白名单中的写入和 MCP 工具仍需要正常审批。模型、工作区和规则继承父 run，不配置独立模型。
+白名单中的工具仍经过参数和固定安全策略，但子 Agent 默认 bypass，不产生人工审批。
+模型、工作区和规则继承父 run，不配置独立模型。
 
 ```text
 spawn_agent({ name: "reviewer", goal: "检查指定改动", context: "必须提供的背景" })
@@ -84,8 +85,8 @@ sessions/<sessionId>/runs/<parentRunId>/subagents/<childRunId>/
   trace.jsonl          # 按 Trace 配置产生
 ```
 
-父 durable 流只记录 subagent.started/finished 身份与有界摘要。子审批走父通道，携带
-childRunId 和包含子身份的 toolCallId，共用 session 权限缓存。CLI/TUI 展示生命周期及摘要，
+父 durable 流只记录 subagent.started/finished 身份与有界摘要。子 Agent 默认 bypass，
+不会向父通道发布 permission.requested。CLI/TUI 展示生命周期及摘要，
 不展开子聊天；客户端和 TUI 按 sequence 重放去重。重启把未结束子记录标 interrupted，
 补偿独立审计终态；不自动恢复模型调用、后台执行、审批 Promise 或 Always 缓存。
 
@@ -147,10 +148,10 @@ executeMode 可选 serial/parallel，默认 parallel。write/edit/bash/task_crea
 | 四能力组合、两个工作区、Skill 覆盖与展开、真实 MCP 并发关联、后台综合、审批镜像、取消、shutdown 和 interrupted 恢复 | `tests/integration/stage5-lifecycle.test.ts`、`fixtures/stage5-mcp.ts` |
 | Skills 元数据、正文快照、预算、原始命令幂等及 CLI/TUI 列表 | `packages/core/test/skills/*`、`tests/integration/stage5-skills.test.ts`、CLI/TUI 测试 |
 | 类型实时发现、无效覆盖不回退、完整名称白名单 | `packages/core/test/subagents/profiles.test.ts` |
-| 同步隔离 history/tasks/notes/压缩、20 步、审批身份、父取消和审计 | `packages/core/test/subagents/execution.test.ts` |
+| 同步隔离 history/tasks/notes/压缩、20 步、权限 bypass、父取消和审计 | `packages/core/test/subagents/execution.test.ts` |
 | 后台继续父工作、结束前等待与计步、父失败排空 | `packages/core/test/subagents/background.test.ts` |
 | 查询/等待、归属验证、一次交付、失败观察、释放 Registry | `packages/core/test/subagents/registry.test.ts` |
-| 真实 Core 同步/后台审批、agent_result wait、单一主 turn、shutdown | `tests/integration/stage5-subagents.test.ts` |
+| 真实 Core 同步/后台 bypass、agent_result wait、单一主 turn、shutdown | `tests/integration/stage5-subagents.test.ts` |
 | MCP 配置覆盖、工作区连接隔离、失败诊断及固定快照 | `packages/core/test/mcp/server-manager.test.ts` |
 | MCP JSON Schema、审批拒绝、完整名缓存、结果转换、取消超时、不重试 | `packages/core/test/mcp/tool.test.ts`、`packages/core/test/run/runner.test.ts` |
 | SDK stdio/HTTP、分页、headers、cwd、Core preflight、进程回收 | `tests/integration/stage5-mcp-manager.test.ts` |

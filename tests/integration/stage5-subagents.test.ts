@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { CoreApp, EventStore } from "../../packages/core/src/index.ts";
 import { SessionStore } from "../../packages/core/src/session/session-store.ts";
 import { SessionController, type SessionControllerEvent } from "../../packages/client/src/index.ts";
-import { startScriptedAnthropicMock } from "./helpers/scripted-anthropic-mock.ts";
+import { createBarrier, startScriptedAnthropicMock } from "./helpers/scripted-anthropic-mock.ts";
 /** 等待真实 IPC 条件，不通过长时延猜测调度。 */
 async function waitFor(condition: () => boolean) {
   const deadline = performance.now() + 8000;
@@ -22,7 +22,7 @@ test.each([
   { shutdown: true, mode: "background" },
   { shutdown: false, mode: "wait" },
 ])(
-  "real Core routes child approval, isolates its turn, and reaps shutdown (%s)",
+  "real Core bypasses child approval, isolates its turn, and reaps shutdown (%s)",
   async ({ shutdown, mode }) => {
     const root = await mkdtemp(join(tmpdir(), "minicode-child-core-"));
     const workspace = join(root, "workspace");
@@ -31,7 +31,8 @@ test.each([
       join(workspace, ".minicode/agents/writer.toml"),
       '[agent]\ndescription="writer"\nsystem_prompt="PRIVATE_CHILD_ROLE"\nallowed_tools=["write","task_create"]\n',
     );
-    const mock = startScriptedAnthropicMock((body) => {
+    const childBarrier = shutdown ? createBarrier() : undefined;
+    const mock = startScriptedAnthropicMock(async (body) => {
       const data = body as {
         system: string;
         messages: { content: { type: string; name?: string; text?: string; content?: string }[] }[];
@@ -63,6 +64,7 @@ test.each([
       }
       if (completedTools)
         return { kind: "text", chunks: [child ? "private child result" : "parent final"] };
+      if (child && childBarrier !== undefined) await childBarrier.wait();
       return child
         ? {
             kind: "tools",
@@ -112,12 +114,18 @@ test.each([
     try {
       const session = await controller.create(workspace);
       const run = await controller.sendMessage("delegate");
-      await waitFor(() => controller.permissions.length === 1);
-      const approval = controller.permissions[0]?.request;
-      if (!approval) throw new Error("missing child approval");
-      expect(approval.runId).toBe(run.runId);
-      const childRunId = approval.payload.childRunId;
-      if (!childRunId) throw new Error("missing child identity");
+      await waitFor(() =>
+        events.some(
+          (event) => event.type === "run.event" && event.event.type === "subagent.started",
+        ),
+      );
+      const started = events.find(
+        (event) => event.type === "run.event" && event.event.type === "subagent.started",
+      );
+      if (started?.type !== "run.event" || started.event.type !== "subagent.started")
+        throw new Error("missing child identity");
+      const childRunId = started.event.payload.childRunId;
+      expect(controller.permissions).toHaveLength(0);
       const childDirectory = join(
         homeDirectory,
         "sessions",
@@ -128,14 +136,12 @@ test.each([
         childRunId,
       );
       if (shutdown) {
-        await app.stop();
+        await childBarrier?.reached;
+        const stopping = app.stop();
+        childBarrier?.release();
+        await stopping;
         expect(await Bun.file(join(workspace, "child.txt")).exists()).toBe(false);
       } else {
-        await controller.respondPermission(
-          run.runId,
-          approval.payload.permissionRequestId,
-          "allow_once",
-        );
         await waitFor(() =>
           events.some((e) => e.type === "turn.committed" && e.runId === run.runId),
         );
@@ -154,8 +160,11 @@ test.each([
         childRunId,
       );
       expect(child.ok && child.value.finished).toBe(true);
-      expect(child.ok && child.value.events.some((e) => e.type.startsWith("task."))).toBe(true);
+      expect(child.ok && child.value.events.some((e) => e.type.startsWith("task."))).toBe(
+        !shutdown,
+      );
     } finally {
+      childBarrier?.release();
       await controller.dispose();
       await app.stop();
       await mock.stop();

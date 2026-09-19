@@ -238,3 +238,8 @@ stdio 服务器以当前工作区为 cwd，支持 `env` 字符串表；命令、
 子历史、任务、私有 notes、压缩 checkpoint 和事件审计保存在 `sessions/<sessionId>/runs/<parentRunId>/subagents/<childRunId>/`。子 Agent 默认 bypass，不产生人工审批事件；父事件流仅收到生命周期摘要。取消和停机会排空子执行，重启将未结束的子记录标记为 interrupted，不自动续跑。
 
 `spawn_agent({ name, goal, context?, background: true })` 在子执行启动后返回 `childRunId`，父 Agent 可继续其他工作。`agent_result({ childRunId, wait? })` 查询当前父 run 拥有的子任务；`wait: true` 等待终态，仍响应取消。后台结果默认在父模型下一次调用前以普通用户上下文交付一次，显式查询终态后不再自动重复交付。父 Agent 准备结束时会等待剩余子任务并继续综合结果，额外模型调用计入父步数限制。后台任务仅存活于本轮 run，不能跨 turn 查询；CLI/TUI 显示子身份、生命周期和终态摘要，多窗口重放按事件序列去重。
+
+同步返回、后台查询和自动交付使用相同的结构化终态，包含 `childRunId`、`name`、`status`、
+`reason`、可选 `errorCode`、`steps` 与有界 `content`。例如上下文溢出会保留
+`errorCode=context_limit_exceeded`，达到步数上限会返回 `reason=max_steps`；父 Agent 应据此缩小
+任务或调整已配置预算，不应原样盲目重试。

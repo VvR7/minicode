@@ -9,7 +9,7 @@ export const AgentResultParamsSchema = z.strictObject({
 });
 export type AgentResultParams = z.infer<typeof AgentResultParamsSchema>;
 export const AGENT_RESULT_DESCRIPTION =
-  "Query an owned background subagent by childRunId. Set wait=true to wait for its terminal result. Only subagents in the current parent run are accessible.";
+  "Query an owned background subagent by childRunId. Set wait=true to wait for its structured terminal result, including reason, errorCode and steps. Only subagents in the current parent run are accessible.";
 /** 将父 run 的拥有者身份固定到查询工具，不接受模型覆盖 scope。 */
 export function createAgentResultTool(
   registry: SubagentRegistry,

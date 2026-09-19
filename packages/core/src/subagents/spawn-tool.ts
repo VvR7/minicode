@@ -8,7 +8,7 @@ export const SpawnAgentParamsSchema = z.strictObject({
 });
 export type SpawnAgentParams = z.infer<typeof SpawnAgentParamsSchema>;
 export const SPAWN_AGENT_DESCRIPTION =
-  "Delegate a self-contained task to a named isolated subagent. Call list_subagent to discover available types. Provide all required context explicitly; the child cannot see parent history or notes. By default waits for its final result; background=true returns childRunId immediately.";
+  "Delegate a self-contained task to a named isolated subagent. Call list_subagent to discover available types. Provide all required context explicitly; the child cannot see parent history or notes. By default waits for a structured terminal result; background=true returns childRunId immediately. On failure, inspect reason and errorCode before deciding whether to narrow the task or use a configured larger budget; do not blindly retry the same request.";
 /** 同步委派没有工具总时限，由父 run 取消和模型请求时限控制。 */
 export function createSpawnAgentTool(
   spawn: (params: SpawnAgentParams, signal: AbortSignal) => Promise<ToolOutput>,

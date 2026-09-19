@@ -1,20 +1,28 @@
 import { expect, test } from "bun:test";
-import { SubagentRegistry } from "../../src/subagents/registry.ts";
+import { SubagentRegistry, type SubagentResult } from "../../src/subagents/registry.ts";
 import { createAgentResultTool } from "../../src/subagents/result-tool.ts";
-import { ToolError, type ToolOutput } from "../../src/tools/types.ts";
+import { ToolError } from "../../src/tools/types.ts";
 import { SESSION_A, SESSION_B, RUN_A, RUN_B } from "../agent/test-helpers.ts";
 const child = crypto.randomUUID();
 const signal = () => new AbortController().signal;
+const result = (childRunId: string, name: string, content: string): SubagentResult => ({
+  childRunId,
+  name,
+  status: "succeeded",
+  reason: "completed",
+  steps: 1,
+  content,
+});
 
 test("background pending query does not consume delivery; completed results deliver once", async () => {
   const registry = new SubagentRegistry(SESSION_A, RUN_A);
-  const deferred = Promise.withResolvers<ToolOutput>();
+  const deferred = Promise.withResolvers<SubagentResult>();
   registry.register(child, "reviewer", true, new AbortController(), deferred.promise);
   expect(
     JSON.parse((await registry.result(SESSION_A, RUN_A, child, false, signal())).content).status,
   ).toBe("running");
   expect(await registry.deliver(false, signal())).toEqual([]);
-  deferred.resolve({ content: "review complete" });
+  deferred.resolve(result(child, "reviewer", "review complete"));
   const messages = await registry.deliver(true, signal());
   expect(messages).toHaveLength(1);
   expect(messages[0]).toContain("review complete");
@@ -32,7 +40,7 @@ test("explicit terminal query and sync result prevent duplicate automatic delive
     "reviewer",
     true,
     new AbortController(),
-    Promise.resolve({ content: "result" }),
+    Promise.resolve(result(child, "reviewer", "result")),
   );
   expect((await registry.result(SESSION_A, RUN_A, child, true, signal())).content).toContain(
     "result",
@@ -42,7 +50,7 @@ test("explicit terminal query and sync result prevent duplicate automatic delive
     "planner",
     false,
     new AbortController(),
-    Promise.resolve({ content: "sync" }),
+    Promise.resolve(result(child, "planner", "sync")),
   );
   expect(await registry.deliver(true, signal())).toEqual([]);
   expect(
@@ -61,7 +69,7 @@ test("foreign session, parent run and unknown identity are uniformly unavailable
     "reviewer",
     true,
     new AbortController(),
-    Promise.resolve({ content: "private" }),
+    Promise.resolve(result(child, "reviewer", "private")),
   );
   for (const [session, run, id] of [
     [SESSION_B, RUN_A, child],
@@ -84,9 +92,15 @@ test("background failures are observed and exposed in delivery and queried tool 
     "reviewer",
     true,
     new AbortController(),
-    Promise.reject(
-      new ToolError("io_error", "child failed", { output: { content: "failure detail" } }),
-    ),
+    Promise.resolve({
+      childRunId: child,
+      name: "reviewer",
+      status: "failed",
+      reason: "llm_error",
+      errorCode: "context_limit_exceeded",
+      steps: 4,
+      content: "failure detail",
+    }),
   );
   const messages = await registry.deliver(true, signal());
   expect(messages[0]).toContain('"status":"failed"');
@@ -98,7 +112,36 @@ test("background failures are observed and exposed in delivery and queried tool 
         childRunId: child,
         name: "reviewer",
         status: "failed",
+        reason: "llm_error",
+        errorCode: "context_limit_exceeded",
+        steps: 4,
         content: "failure detail",
+      }),
+    },
+  });
+  await registry.close();
+});
+
+test("cancelled execution exposes the same structured terminal shape", async () => {
+  const registry = new SubagentRegistry(SESSION_A, RUN_A);
+  registry.register(
+    child,
+    "reviewer",
+    true,
+    new AbortController(),
+    Promise.reject(new ToolError("tool_cancelled", "cancelled")),
+  );
+  await expect(registry.result(SESSION_A, RUN_A, child, true, signal())).rejects.toMatchObject({
+    code: "tool_cancelled",
+    output: {
+      content: JSON.stringify({
+        childRunId: child,
+        name: "reviewer",
+        status: "cancelled",
+        reason: "cancelled",
+        errorCode: "tool_cancelled",
+        steps: 0,
+        content: "cancelled",
       }),
     },
   });
@@ -108,7 +151,7 @@ test("background failures are observed and exposed in delivery and queried tool 
 test("cancelled waiter and registry close abort and drain all owned executions", async () => {
   const registry = new SubagentRegistry(SESSION_A, RUN_A);
   const controller = new AbortController();
-  const execution = new Promise<ToolOutput>((_resolve, reject) =>
+  const execution = new Promise<SubagentResult>((_resolve, reject) =>
     controller.signal.addEventListener(
       "abort",
       () => reject(new ToolError("tool_cancelled", "cancelled")),

@@ -70,6 +70,8 @@ agent_result({ childRunId: "返回的 UUID", wait: true })
 完成未交付的后台结果在下一父模型调用前作为普通 user context 交付一次，显式终态查询
 在对应 tool_result 里交付后不再自动重复注入。父准备结束时等待剩余子任务，再继续模型循环
 综合结果，额外调用计入父步数限制。不会伪造没有对应 tool_use 的 tool_result。
+同步、查询及自动交付共用结构化终态，包含身份、status、reason、errorCode、steps 和有界正文；
+`max_steps` 与 `context_limit_exceeded` 不再折叠为缺少原因的通用失败。
 
 子执行不创建主 session turn，不改变主 activeRun，且不继承父历史或 session notes。
 独立 TaskManager、私有 note_save、压缩 checkpoint、历史、Trace 和事件审计布局如下：

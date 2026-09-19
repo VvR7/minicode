@@ -4,6 +4,9 @@ export interface SubagentResult {
   readonly childRunId: RunId;
   readonly name: string;
   readonly status: "succeeded" | "failed" | "cancelled";
+  readonly reason: string;
+  readonly errorCode?: string;
+  readonly steps: number;
   readonly content: string;
 }
 interface Entry {
@@ -41,12 +44,12 @@ export class SubagentRegistry {
     name: string,
     background: boolean,
     controller: AbortController,
-    execution: Promise<ToolOutput>,
+    execution: Promise<SubagentResult>,
   ): void {
     if (this.#closed || this.#entries.has(childRunId))
       throw new Error("subagent registry unavailable");
     const settled = execution.then(
-      (output) => ({ childRunId, name, status: "succeeded" as const, content: output.content }),
+      (result) => result,
       (error) => ({
         childRunId,
         name,
@@ -54,6 +57,12 @@ export class SubagentRegistry {
           error instanceof ToolError && error.code === "tool_cancelled"
             ? ("cancelled" as const)
             : ("failed" as const),
+        reason:
+          error instanceof ToolError && error.code === "tool_cancelled"
+            ? "cancelled"
+            : "internal_error",
+        ...(error instanceof ToolError ? { errorCode: error.code } : {}),
+        steps: 0,
         content:
           error instanceof ToolError ? (error.output?.content ?? error.message) : "subagent failed",
       }),
@@ -103,9 +112,7 @@ export class SubagentRegistry {
     for (const entry of this.#entries.values()) {
       if (!entry.background || entry.delivered || !entry.result) continue;
       entry.delivered = true;
-      results.push(
-        `Subagent result:\n${JSON.stringify({ ...entry.result, content: entry.result.content.slice(0, 256 * 1024 - 1024) })}`,
-      );
+      results.push(`Subagent result:\n${JSON.stringify(entry.result)}`);
     }
     return results;
   }

@@ -312,6 +312,10 @@ test("child stops at twenty model steps and returns a failure observation", asyn
   try {
     await f.run();
     expect(f.child.calls).toHaveLength(20);
+    const parentObservation = JSON.stringify(f.parent.calls[1]?.messages);
+    expect(parentObservation).toContain('\\"reason\\":\\"max_steps\\"');
+    expect(parentObservation).toContain('\\"errorCode\\":\\"max_steps\\"');
+    expect(parentObservation).toContain('\\"steps\\":20');
     const { directory } = await f.childDirectory();
     expect(JSON.parse(await readFile(join(directory, "history.json"), "utf8"))).toMatchObject({
       status: "failed",
@@ -320,6 +324,7 @@ test("child stops at twenty model steps and returns a failure observation", asyn
     });
     expect(f.observed.events.find((e) => e.type === "subagent.finished")?.payload).toMatchObject({
       status: "failed",
+      errorCode: "max_steps",
     });
   } finally {
     await f.cleanup();

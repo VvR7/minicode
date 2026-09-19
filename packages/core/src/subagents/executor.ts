@@ -1,4 +1,4 @@
-import { SubagentRegistry } from "./registry.ts";
+import { SubagentRegistry, type SubagentResult } from "./registry.ts";
 import { join } from "node:path";
 import { z } from "zod";
 import type { Environment, RunId, SessionId } from "@minicode/protocol";
@@ -85,7 +85,14 @@ export class SubagentExecutor {
       controller,
       execution,
     );
-    if (!params.background) return execution;
+    if (!params.background)
+      return this.registry.result(
+        this.#options.sessionId,
+        this.#options.parentRunId,
+        childRunId,
+        true,
+        signal,
+      );
     try {
       await ready.promise;
     } catch (error) {
@@ -118,7 +125,7 @@ export class SubagentExecutor {
     childRunId: RunId,
     signal: AbortSignal,
     onReady: () => void,
-  ): Promise<ToolOutput> {
+  ): Promise<SubagentResult> {
     const o = this.#options;
     if (signal.aborted) throw new ToolError("tool_cancelled", "subagent cancelled");
     const directory = join(
@@ -174,6 +181,7 @@ export class SubagentExecutor {
     });
     let completion: RunCompletion | undefined;
     let started = false;
+    let executionError: unknown;
     try {
       await this.#publish({
         type: "subagent.started",
@@ -217,7 +225,8 @@ export class SubagentExecutor {
         }),
       });
       if (!finished.ok) throw new Error("child audit failed");
-    } catch {
+    } catch (error) {
+      executionError = error;
       state.status = signal.aborted ? "cancelled" : "failed";
     } finally {
       await trace?.stop();
@@ -237,14 +246,29 @@ export class SubagentExecutor {
           },
         });
     }
-    const output = { content: completion?.finalText || `subagent ${state.status}` };
-    if (state.status !== "succeeded")
-      throw new ToolError(
-        state.status === "cancelled" ? "tool_cancelled" : "io_error",
-        `subagent ${state.status}`,
-        { output },
-      );
-    return output;
+    // started 之前的初始化错误没有可交付子终态，仍由 spawn 工具直接报告。
+    if (!started) throw executionError;
+    const status = state.status as "succeeded" | "failed" | "cancelled";
+    const matchedCompletion = completion?.status === status ? completion : undefined;
+    return {
+      childRunId,
+      name: profile.name,
+      status,
+      reason: matchedCompletion
+        ? matchedCompletion.reason
+        : status === "cancelled"
+          ? "cancelled"
+          : "internal_error",
+      ...(matchedCompletion?.error !== undefined
+        ? { errorCode: matchedCompletion.error.code }
+        : executionError instanceof ToolError
+          ? { errorCode: executionError.code }
+          : status === "failed"
+            ? { errorCode: "internal_error" }
+            : {}),
+      steps: matchedCompletion?.steps ?? 0,
+      content: (completion?.finalText || `subagent ${status}`).slice(0, 256 * 1024 - 2048),
+    };
   }
 
   /** 父流仅记录可重放的身份和终态摘要，不桥接子任务或模型细节。 */

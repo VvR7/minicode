@@ -8,6 +8,7 @@ describe("core configuration", () => {
   test("uses default log level", () => {
     const config = loadCoreConfig({});
     expect(config.logLevel).toBe("info");
+    expect(config.permissionMode).toBe("bypasspermission");
     expect(config.homeDirectory.endsWith("/.minicode")).toBe(true);
   });
 
@@ -17,6 +18,13 @@ describe("core configuration", () => {
 
   test("rejects an invalid log level", () => {
     expect(() => loadCoreConfig({ MINICODE_LOG_LEVEL: "verbose" })).toThrow(ConfigurationError);
+  });
+
+  test("normalizes and validates the permission mode", () => {
+    expect(loadCoreConfig({ MINICODE_PERMISSION_MODE: "ALWAYSASK" }).permissionMode).toBe(
+      "alwaysask",
+    );
+    expect(() => loadCoreConfig({ MINICODE_PERMISSION_MODE: "allow" })).toThrow(ConfigurationError);
   });
 
   test("accepts only an absolute MINICODE_HOME", () => {

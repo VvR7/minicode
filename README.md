@@ -8,9 +8,11 @@ TUI 前端、类型化 IPC、事件流、工具与权限系统、任务规划、
 `mc --goal`，以及支持持久多轮会话、恢复和多窗口同步的 `mc-tui`。Core 统一拥有 AgentLoop、
 历史、notes、run 级任务图、上下文压缩、Trace 和事件流。
 
-Stage3 的 Core 权限层已接入：`write`／`edit` 及非白名单 `bash` 会挂起等待
-`permission.respond`。`mc --goal` 在交互终端支持允许／拒绝一次及 session 内 always 决策；
-没有交互 TTY 时自动拒绝一次。审批与进度写 stderr，assistant 输出仍写 stdout。
+Stage3 的 Core 权限层已接入。主 Agent 默认使用 `bypasspermission`，省略人工审批但仍执行
+参数校验、路径约束和危险 Bash 强制拒绝；设置 `MINICODE_PERMISSION_MODE=alwaysask` 后，
+`write`／`edit` 及非白名单 `bash` 会挂起等待 `permission.respond`。`mc --goal` 在交互终端支持
+允许／拒绝一次及 session 内 always 决策；没有交互 TTY 时自动拒绝一次。
+审批与进度写 stderr，assistant 输出仍写 stdout。
 TUI 在 transcript 内展示审批摘要，支持方向键／Tab 加 Enter，以及 1–4 快捷键；Ctrl-C 仍可取消 run。
 通用工具为 `read`、`write`、`edit`、`bash`，保留任务和笔记工具。工具参数先严格校验，
 再审批、执行和有限重试。workspace 不是沙箱：允许外部绝对路径和符号链接目标；
@@ -70,6 +72,8 @@ bun run mc --goal "Read README.md and summarize it"
 
 Core 默认监听 `127.0.0.1:7437`。可通过 `.env` 中的 `MINICODE_CORE_HOST` 和
 `MINICODE_CORE_PORT` 修改 loopback 地址；当前不允许监听非本机地址。
+`MINICODE_PERMISSION_MODE` 可设为 `bypasspermission`（默认）或 `alwaysask`，在 Core 启动时固定。
+子 Agent 始终默认 bypass，不继承主 Agent 的 `alwaysask`。
 持久化数据默认写入 `~/.minicode`，可通过绝对路径 `MINICODE_HOME` 覆盖。模型上下文预算由
 `LLM_CONTEXT_WINDOW_TOKENS` 和 `LLM_MAX_OUTPUT_TOKENS` 控制，省略时分别使用 200000 和 8192；
 无法容纳的固定规则、工具定义或本轮提问会在创建 turn/run 前被拒绝。自动压缩开关与预算配置
@@ -227,10 +231,10 @@ url = "http://127.0.0.1:8080/mcp"
 Authorization = "Bearer ${MCP_TOKEN}"
 ```
 
-stdio 服务器以当前工作区为 cwd，支持 `env` 字符串表；命令、参数、环境变量、HTTP 地址及 headers 支持 `${ENV_NAME}` 引用。发现的工具使用 `mcp__<server>__<tool>` 名称，保留原始 JSON Schema 并在本地校验。外部工具默认需要审批，Always 决策只作用于当前 session 的完整工具名，重启不保留。工具调用遵循批次并行规则，不自动重试；文本与结构化结果进入模型上下文，图片、音频及嵌入资源以类型或地址摘要展示。
+stdio 服务器以当前工作区为 cwd，支持 `env` 字符串表；命令、参数、环境变量、HTTP 地址及 headers 支持 `${ENV_NAME}` 引用。发现的工具使用 `mcp__<server>__<tool>` 名称，保留原始 JSON Schema 并在本地校验。主 Agent 处于 `alwaysask` 时外部工具需要审批，Always 决策只作用于当前 session 的完整工具名，重启不保留；`bypasspermission` 及子 Agent 省略人工审批。工具调用遵循批次并行规则，不自动重试；文本与结构化结果进入模型上下文，图片、音频及嵌入资源以类型或地址摘要展示。
 
 主 Agent 可先用 `list_subagent` 查找类型，再调用 `spawn_agent({ name, goal, context? })` 同步委派。子 Agent 使用相同模型及工作区，继承本轮固定的规则和 Skills 目录，仅接收显式任务和上下文，不继承父历史或 session notes。每个子 Agent 最多执行 20 步，工具来自类型文件中的完整名称白名单，禁止嵌套委派。
 
-子历史、任务、私有 notes、压缩 checkpoint 和事件审计保存在 `sessions/<sessionId>/runs/<parentRunId>/subagents/<childRunId>/`。父事件流仅收到生命周期摘要和带子身份的审批，Always 缓存与父 session 共用；取消和停机会排空子执行，重启将未结束的子记录标记为 interrupted，不自动续跑。
+子历史、任务、私有 notes、压缩 checkpoint 和事件审计保存在 `sessions/<sessionId>/runs/<parentRunId>/subagents/<childRunId>/`。子 Agent 默认 bypass，不产生人工审批事件；父事件流仅收到生命周期摘要。取消和停机会排空子执行，重启将未结束的子记录标记为 interrupted，不自动续跑。
 
 `spawn_agent({ name, goal, context?, background: true })` 在子执行启动后返回 `childRunId`，父 Agent 可继续其他工作。`agent_result({ childRunId, wait? })` 查询当前父 run 拥有的子任务；`wait: true` 等待终态，仍响应取消。后台结果默认在父模型下一次调用前以普通用户上下文交付一次，显式查询终态后不再自动重复交付。父 Agent 准备结束时会等待剩余子任务并继续综合结果，额外模型调用计入父步数限制。后台任务仅存活于本轮 run，不能跨 turn 查询；CLI/TUI 显示子身份、生命周期和终态摘要，多窗口重放按事件序列去重。

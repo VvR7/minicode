@@ -17,6 +17,8 @@ export interface Environment {
   readonly MINICODE_CORE_PORT?: string;
   readonly MINICODE_HOME?: string;
   readonly MINICODE_LOG_LEVEL?: string;
+  /** 主 Agent 权限模式；子 Agent 始终使用 bypasspermission。 */
+  readonly MINICODE_PERMISSION_MODE?: string;
   readonly MINICODE_COMPACTION_ENABLED?: string;
   readonly MINICODE_COMPACTION_RESERVE_TOKENS?: string;
   readonly MINICODE_COMPACTION_KEEP_RECENT_TOKENS?: string;

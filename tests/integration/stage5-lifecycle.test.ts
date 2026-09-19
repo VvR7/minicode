@@ -119,7 +119,13 @@ test("complete Stage5 lifecycle combines skills, background subagents, MCP concu
       ],
     };
   });
-  const config = { host: "127.0.0.1" as const, port: 0, logLevel: "error" as const, homeDirectory };
+  const config = {
+    host: "127.0.0.1" as const,
+    port: 0,
+    logLevel: "error" as const,
+    permissionMode: "alwaysask" as const,
+    homeDirectory,
+  };
   const environment = {
     LLM_API_KEY: "fixture",
     LLM_BASE_URL: mock.url,

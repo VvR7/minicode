@@ -1,5 +1,6 @@
 import type { PermissionManager } from "../permissions/manager.ts";
 import type { PermissionScope } from "../permissions/policy.ts";
+import type { PermissionMode } from "../config.ts";
 import type { ToolRegistry } from "./registry.ts";
 import {
   DEFAULT_TOOL_MAX_ATTEMPTS,
@@ -18,6 +19,7 @@ const DEFAULT_RETRY_DELAYS_MS = [2_000, 4_000] as const;
 
 export interface ToolInvokerOptions {
   readonly permissions?: PermissionManager;
+  readonly permissionMode?: PermissionMode;
   readonly timeoutMs?: number;
   readonly maxAttempts?: number;
   readonly retryDelaysMs?: readonly number[];
@@ -150,11 +152,13 @@ export class ToolInvoker {
   readonly #maxAttempts: number;
   readonly #retryDelaysMs: readonly number[];
   readonly #permissions: PermissionManager | undefined;
+  readonly #permissionMode: PermissionMode;
 
   /** 保存注册表及统一超时、尝试次数和退避配置。 */
   constructor(registry: ToolRegistry, options: ToolInvokerOptions = {}) {
     this.#registry = registry;
     this.#permissions = options.permissions;
+    this.#permissionMode = options.permissionMode ?? "alwaysask";
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
     this.#maxAttempts = Math.min(3, Math.max(1, options.maxAttempts ?? DEFAULT_TOOL_MAX_ATTEMPTS));
     this.#retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
@@ -206,6 +210,7 @@ export class ToolInvoker {
           parsed.data,
           options.permissionScope,
           context.signal,
+          this.#permissionMode,
         );
         permissionSource = outcome.source;
         if (!outcome.allowed)

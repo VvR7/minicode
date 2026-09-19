@@ -50,7 +50,13 @@ async function fixture(calls: readonly ScriptedToolCall[]) {
       : { kind: "tools", calls };
   });
   const app = new CoreApp(
-    { host: "127.0.0.1", port: 0, logLevel: "error", homeDirectory },
+    {
+      host: "127.0.0.1",
+      port: 0,
+      logLevel: "error",
+      permissionMode: "alwaysask",
+      homeDirectory,
+    },
     {
       LLM_API_KEY: "test-key",
       LLM_BASE_URL: mock.url,

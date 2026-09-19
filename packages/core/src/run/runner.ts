@@ -45,6 +45,7 @@ import { builtinTools } from "../tools/builtin/index.ts";
 import { ToolInvoker } from "../tools/invoker.ts";
 import { ToolRegistry } from "../tools/registry.ts";
 import type { Tool } from "../tools/types.ts";
+import type { PermissionMode } from "../config.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
 import type { RunCompletion } from "./completion.ts";
 import { createRunSnapshot, type RunSnapshot, type RunSnapshotRequest } from "./snapshot.ts";
@@ -159,6 +160,8 @@ export interface AgentRunnerOptions {
     readonly parentRunId: RunId;
   };
   readonly permissions?: PermissionManager;
+  /** 主 run 使用启动配置；子 run 由编排层强制使用 bypasspermission。 */
+  readonly permissionMode?: PermissionMode;
   readonly mcp?: McpServerManager;
   readonly environment: Environment;
   readonly bus: EventBus;
@@ -188,6 +191,7 @@ export class AgentRunner {
   readonly #providerFactory: (config: LlmConfig) => LlmProvider;
   readonly #taskStorage: TaskStorage;
   readonly #permissions: PermissionManager;
+  readonly #permissionMode: PermissionMode;
   readonly #mcp: McpServerManager | undefined;
 
   /** 保存 run 组装所需的环境、存储、事件与可注入依赖。 */
@@ -200,6 +204,7 @@ export class AgentRunner {
     this.#providerFactory = options.providerFactory ?? ((config) => new AnthropicAdapter(config));
     this.#taskStorage = options.taskStorage ?? nodeTaskStorage;
     this.#permissions = options.permissions ?? new PermissionManager(options.bus);
+    this.#permissionMode = options.permissionMode ?? "bypasspermission";
   }
 
   /** 在 preflight 前准备能力快照；后续扩展在此接入 workspace 的 skills/MCP。 */
@@ -399,7 +404,10 @@ export class AgentRunner {
     }
     const systemPrompt =
       request.snapshot?.systemPrompt ?? request.systemPrompt ?? snapshot.systemPrompt;
-    const invoker = new ToolInvoker(executionRegistry, { permissions: this.#permissions });
+    const invoker = new ToolInvoker(executionRegistry, {
+      permissions: this.#permissions,
+      permissionMode: this.#permissionMode,
+    });
     const loop = new AgentLoop(provider, executionRegistry, invoker, this.#bus, {
       ...(this.#child === undefined ? {} : { permissionParentRunId: this.#child.parentRunId }),
       systemPrompt,
@@ -448,6 +456,7 @@ export class AgentRunner {
       providerFactory: this.#providerFactory,
       taskStorage: this.#taskStorage,
       permissions: this.#permissions,
+      permissionMode: "bypasspermission",
       ...(this.#mcp === undefined ? {} : { mcp: this.#mcp }),
       child: {
         directory: child.directory,

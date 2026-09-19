@@ -298,6 +298,7 @@ test("MCP preflight and execution share original schemas and approval lifecycle"
       environment: environmentWithLlm(),
       bus,
       permissions,
+      permissionMode: "alwaysask",
       mcp,
       homeDirectory: workspace,
       providerFactory: () => provider,

@@ -23,6 +23,7 @@ export interface ChildExecution {
   readonly goal: string;
   readonly snapshot: RunSnapshot;
   readonly allowedTools: readonly string[];
+  readonly maxSteps: number;
   readonly bus: EventBus;
   readonly trace?: TraceRecorder;
 }
@@ -195,6 +196,7 @@ export class SubagentExecutor {
           directory,
           snapshot,
           allowedTools: toolNames,
+          maxSteps: profile.maxSteps,
           goal:
             params.context === undefined
               ? params.goal

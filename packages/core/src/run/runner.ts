@@ -15,7 +15,12 @@ import { dirname, join } from "node:path";
 import type { Environment, RunId, SessionId, TaskGraphSnapshot } from "@minicode/protocol";
 import { z } from "zod";
 import { ExecutionContext } from "../agent/context.ts";
-import { AgentLoop, type ContextCompactionHook, DEFAULT_SYSTEM_PROMPT } from "../agent/loop.ts";
+import {
+  AgentLoop,
+  type ContextCompactionHook,
+  DEFAULT_SYSTEM_PROMPT,
+  MAX_SUBAGENT_PARALLEL_TOOL_RESULT_BYTES,
+} from "../agent/loop.ts";
 import { composeSystemPrompt, loadSystemPrompt } from "../agent/system-prompt.ts";
 import { type CompactOptions, Compactor, type ContextEntry } from "../compact/index.ts";
 import type { EventBus } from "../events/event-bus.ts";
@@ -158,6 +163,7 @@ export interface AgentRunnerOptions {
     readonly directory: string;
     readonly allowedTools: readonly string[];
     readonly parentRunId: RunId;
+    readonly maxSteps: number;
   };
   readonly permissions?: PermissionManager;
   /** 主 run 使用启动配置；子 run 由编排层强制使用 bypasspermission。 */
@@ -298,6 +304,7 @@ export class AgentRunner {
       ...(request.userContent === undefined ? {} : { userContent: request.userContent }),
       ...(request.history === undefined ? {} : { prefillMessages: request.history }),
       ...(request.contextEntries === undefined ? {} : { prefillEntries: request.contextEntries }),
+      ...(this.#child === undefined ? {} : { maxSteps: this.#child.maxSteps }),
     });
     await this.#publishStarted(context);
     // 等待 RPC response 入队后才继续执行，既保证 durable start，又保持响应先于事件。
@@ -410,6 +417,9 @@ export class AgentRunner {
     });
     const loop = new AgentLoop(provider, executionRegistry, invoker, this.#bus, {
       ...(this.#child === undefined ? {} : { permissionParentRunId: this.#child.parentRunId }),
+      ...(this.#child === undefined
+        ? {}
+        : { maxParallelToolResultBytes: MAX_SUBAGENT_PARALLEL_TOOL_RESULT_BYTES }),
       systemPrompt,
       ...(executor === undefined
         ? {}
@@ -462,6 +472,7 @@ export class AgentRunner {
         directory: child.directory,
         allowedTools: child.allowedTools,
         parentRunId: parent.runId,
+        maxSteps: child.maxSteps,
       },
     });
     let previous: import("../compact/types.ts").CompactionCheckpoint | undefined;

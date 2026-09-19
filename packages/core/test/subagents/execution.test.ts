@@ -308,6 +308,7 @@ test("child stops at twenty model steps and returns a failure observation", asyn
     Array.from({ length: 20 }, (_, i) => ({
       response: toolResponse([toolCall(`read-${i}`, "read", { path: "missing" })]),
     })),
+    '[agent]\ndescription="bounded"\nsystem_prompt="bounded"\nallowed_tools=["read"]\n',
   );
   try {
     await f.run();
@@ -326,6 +327,22 @@ test("child stops at twenty model steps and returns a failure observation", asyn
       status: "failed",
       errorCode: "max_steps",
     });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("builtin executor can finish after more than twenty model steps", async () => {
+  const f = await fixture([
+    ...Array.from({ length: 21 }, (_, i) => ({
+      response: toolResponse([toolCall(`read-${i}`, "read", { path: "missing" })]),
+    })),
+    { response: textResponse("long task done") },
+  ]);
+  try {
+    expect((await f.run()).completion.status).toBe("succeeded");
+    expect(f.child.calls).toHaveLength(22);
+    expect(JSON.stringify(f.parent.calls[1]?.messages)).toContain("long task done");
   } finally {
     await f.cleanup();
   }

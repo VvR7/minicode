@@ -12,6 +12,7 @@ const AgentSettingsSchema = z.strictObject({
   description: z.string().trim().min(1).max(1024),
   system_prompt: z.string().trim().min(1),
   allowed_tools: z.array(z.string().min(1)),
+  max_steps: z.number().int().min(1).max(100).optional(),
 });
 const DocumentSchema = z.strictObject({ agent: AgentSettingsSchema });
 export interface SubagentProfile {
@@ -19,6 +20,7 @@ export interface SubagentProfile {
   readonly description: string;
   readonly systemPrompt: string;
   readonly allowedTools: readonly string[];
+  readonly maxSteps: number;
 }
 export interface SubagentCatalog {
   readonly profiles: readonly SubagentProfile[];
@@ -38,6 +40,7 @@ function parseProfile(name: string, document: unknown): SubagentProfile {
     description: agent.description,
     systemPrompt: agent.system_prompt,
     allowedTools: agent.allowed_tools,
+    maxSteps: agent.max_steps ?? 20,
   };
 }
 const BUILTINS = [
@@ -78,7 +81,8 @@ export async function listSubagents(workspaceRoot: string): Promise<SubagentCata
       diagnostics.push({
         path,
         code: "invalid_agent_profile",
-        message: "子 Agent 类型需要有效的 description、system_prompt 和 allowed_tools",
+        message:
+          "子 Agent 类型需要有效的 description、system_prompt、allowed_tools 和可选 max_steps（1-100）",
       });
     }
   }

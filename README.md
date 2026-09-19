@@ -209,9 +209,10 @@ TUI 输入 `/skill`，或运行 `mc --goal "/skill"` 列出目录，不调用模
 description = "读取并分析项目"
 system_prompt = "阅读相关文件并返回分析结果。"
 allowed_tools = ["read"]
+max_steps = 30
 ```
 
-三个字段均必填，`allowed_tools = []` 表示无工具。白名单使用完整工具名称（包括 `mcp__<server>__<tool>`），未知工具或嵌套委派工具会被拒绝。类型使用父 Agent 的模型。
+前三个字段必填，`max_steps` 可选且必须是 1–100 的整数，省略时为 20；内置 `executor` 为 40。`allowed_tools = []` 表示无工具。白名单使用完整工具名称（包括 `mcp__<server>__<tool>`），未知工具或嵌套委派工具会被拒绝。类型使用父 Agent 的模型。
 
 MCP 配置可写入 `~/.minicode/config.toml`（或 `MINICODE_HOME/config.toml`）及项目的 `.minicode/config.toml`。项目同名服务器覆盖全局配置；全局配置在 Core 启动时固定，项目配置在首次使用工作区时固定，修改后需重启 Core。
 
@@ -233,7 +234,7 @@ Authorization = "Bearer ${MCP_TOKEN}"
 
 stdio 服务器以当前工作区为 cwd，支持 `env` 字符串表；命令、参数、环境变量、HTTP 地址及 headers 支持 `${ENV_NAME}` 引用。发现的工具使用 `mcp__<server>__<tool>` 名称，保留原始 JSON Schema 并在本地校验。主 Agent 处于 `alwaysask` 时外部工具需要审批，Always 决策只作用于当前 session 的完整工具名，重启不保留；`bypasspermission` 及子 Agent 省略人工审批。工具调用遵循批次并行规则，不自动重试；文本与结构化结果进入模型上下文，图片、音频及嵌入资源以类型或地址摘要展示。
 
-主 Agent 可先用 `list_subagent` 查找类型，再调用 `spawn_agent({ name, goal, context? })` 同步委派。子 Agent 使用相同模型及工作区，继承本轮固定的规则和 Skills 目录，仅接收显式任务和上下文，不继承父历史或 session notes。每个子 Agent 最多执行 20 步，工具来自类型文件中的完整名称白名单，禁止嵌套委派。
+主 Agent 可先用 `list_subagent` 查找类型，再调用 `spawn_agent({ name, goal, context? })` 同步委派。子 Agent 使用相同模型及工作区，继承本轮固定的规则和 Skills 目录，仅接收显式任务和上下文，不继承父历史或 session notes。执行步数由类型的 `max_steps` 控制，工具来自类型文件中的完整名称白名单，禁止嵌套委派。子 Agent 单步并行工具结果正文合计最多 64 KiB，超出时按调用顺序公平截断并保留每个调用身份、错误标志和截断提示；单个工具原有上限继续生效。
 
 子历史、任务、私有 notes、压缩 checkpoint 和事件审计保存在 `sessions/<sessionId>/runs/<parentRunId>/subagents/<childRunId>/`。子 Agent 默认 bypass，不产生人工审批事件；父事件流仅收到生命周期摘要。取消和停机会排空子执行，重启将未结束的子记录标记为 interrupted，不自动续跑。
 

@@ -1,0 +1,174 @@
+import { expect, test } from "bun:test";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CoreApp, EventStore } from "../../packages/core/src/index.ts";
+import { SessionStore } from "../../packages/core/src/session/session-store.ts";
+import { SessionController, type SessionControllerEvent } from "../../packages/client/src/index.ts";
+import { createBarrier, startScriptedAnthropicMock } from "./helpers/scripted-anthropic-mock.ts";
+/** 等待真实 IPC 条件，不通过长时延猜测调度。 */
+async function waitFor(condition: () => boolean) {
+  const deadline = performance.now() + 8000;
+  while (!condition()) {
+    if (performance.now() > deadline) throw new Error("subagent IPC timed out");
+    await Bun.sleep(5);
+  }
+}
+
+test.each([
+  { shutdown: false, mode: "sync" },
+  { shutdown: true, mode: "sync" },
+  { shutdown: false, mode: "background" },
+  { shutdown: true, mode: "background" },
+  { shutdown: false, mode: "wait" },
+])(
+  "real Core bypasses child approval, isolates its turn, and reaps shutdown (%s)",
+  async ({ shutdown, mode }) => {
+    const root = await mkdtemp(join(tmpdir(), "minicode-child-core-"));
+    const workspace = join(root, "workspace");
+    await mkdir(join(workspace, ".minicode/agents"), { recursive: true });
+    await Bun.write(
+      join(workspace, ".minicode/agents/writer.toml"),
+      '[agent]\ndescription="writer"\nsystem_prompt="PRIVATE_CHILD_ROLE"\nallowed_tools=["write","task_create"]\n',
+    );
+    const childBarrier = shutdown ? createBarrier() : undefined;
+    const mock = startScriptedAnthropicMock(async (body) => {
+      const data = body as {
+        system: string;
+        messages: { content: { type: string; name?: string; text?: string; content?: string }[] }[];
+      };
+      const child = data.system.includes("PRIVATE_CHILD_ROLE");
+      const completedTools = data.messages
+        .at(-1)
+        ?.content.some((part) => part.type === "tool_result");
+      const integrated = data.messages.some((message) =>
+        message.content.some(
+          (part) => part.type === "text" && part.text?.startsWith("Subagent result:"),
+        ),
+      );
+      if (!child && integrated) return { kind: "text", chunks: ["parent final"] };
+      if (
+        !child &&
+        completedTools &&
+        mode === "wait" &&
+        !data.messages.some((message) =>
+          message.content.some((part) => part.name === "agent_result"),
+        )
+      ) {
+        const result = data.messages.at(-1)?.content.find((part) => part.type === "tool_result");
+        const childRunId = JSON.parse(result?.content ?? "{}").childRunId as string;
+        return {
+          kind: "tools",
+          calls: [{ id: "result", name: "agent_result", input: { childRunId, wait: true } }],
+        };
+      }
+      if (completedTools)
+        return { kind: "text", chunks: [child ? "private child result" : "parent final"] };
+      if (child && childBarrier !== undefined) await childBarrier.wait();
+      return child
+        ? {
+            kind: "tools",
+            calls: [
+              {
+                id: "task",
+                name: "task_create",
+                input: { subject: "private child task", description: "private" },
+              },
+              {
+                id: "write",
+                name: "write",
+                input: { path: "child.txt", content: "child content" },
+              },
+            ],
+          }
+        : {
+            kind: "tools",
+            calls: [
+              {
+                id: "spawn",
+                name: "spawn_agent",
+                input: { name: "writer", goal: "write child", background: mode !== "sync" },
+              },
+            ],
+          };
+    });
+    const homeDirectory = join(root, "home");
+    const app = new CoreApp(
+      { host: "127.0.0.1", port: 0, logLevel: "error", homeDirectory },
+      {
+        LLM_API_KEY: "fixture",
+        LLM_BASE_URL: mock.url,
+        LLM_MODEL: "fixture",
+        LLM_CONTEXT_WINDOW_TOKENS: "100000",
+        LLM_MAX_OUTPUT_TOKENS: "4096",
+        MINICODE_TRACE_ENABLED: "false",
+      },
+    );
+    const events: SessionControllerEvent[] = [];
+    const controller = new SessionController({
+      endpoint: app.start(),
+      onEvent: (event) => {
+        events.push(event);
+      },
+    });
+    try {
+      const session = await controller.create(workspace);
+      const run = await controller.sendMessage("delegate");
+      await waitFor(() =>
+        events.some(
+          (event) => event.type === "run.event" && event.event.type === "subagent.started",
+        ),
+      );
+      const started = events.find(
+        (event) => event.type === "run.event" && event.event.type === "subagent.started",
+      );
+      if (started?.type !== "run.event" || started.event.type !== "subagent.started")
+        throw new Error("missing child identity");
+      const childRunId = started.event.payload.childRunId;
+      expect(controller.permissions).toHaveLength(0);
+      const childDirectory = join(
+        homeDirectory,
+        "sessions",
+        session.sessionId,
+        "runs",
+        run.runId,
+        "subagents",
+        childRunId,
+      );
+      if (shutdown) {
+        await childBarrier?.reached;
+        const stopping = app.stop();
+        childBarrier?.release();
+        await stopping;
+        expect(await Bun.file(join(workspace, "child.txt")).exists()).toBe(false);
+      } else {
+        await waitFor(() =>
+          events.some((e) => e.type === "turn.committed" && e.runId === run.runId),
+        );
+        expect(await readFile(join(workspace, "child.txt"), "utf8")).toBe("child content");
+      }
+      const state = JSON.parse(await readFile(join(childDirectory, "state.json"), "utf8"));
+      expect(state.status).toBe(shutdown ? "cancelled" : "succeeded");
+      const loaded = await new SessionStore(homeDirectory).load(session.sessionId);
+      expect(loaded.ok && loaded.value.turns).toHaveLength(1);
+      expect(loaded.ok && loaded.value.turns[0]?.taskGraph).toBeUndefined();
+      const parent = await new EventStore(homeDirectory).read(session.sessionId, run.runId);
+      expect(parent.ok && parent.value.finished).toBe(true);
+      expect(parent.ok && parent.value.events.some((e) => e.type.startsWith("task."))).toBe(false);
+      const child = await new EventStore(homeDirectory, undefined, run.runId).read(
+        session.sessionId,
+        childRunId,
+      );
+      expect(child.ok && child.value.finished).toBe(true);
+      expect(child.ok && child.value.events.some((e) => e.type.startsWith("task."))).toBe(
+        !shutdown,
+      );
+    } finally {
+      childBarrier?.release();
+      await controller.dispose();
+      await app.stop();
+      await mock.stop();
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);

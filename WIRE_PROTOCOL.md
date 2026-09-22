@@ -67,6 +67,29 @@
 - Core implements persisted incremental checkpoints, automatic threshold/context-error compaction,
   and idle manual compaction. TUI exposes `/compact [focus]`; CLI reports automatic progress on stderr.
 
+## Stage5 extension contracts
+
+- `skill.list` defines a workspace-scoped catalog response with name, description, SKILL.md path,
+  and bounded diagnostics. Core discovers global MINICODE_HOME/skills and project .minicode/skills;
+  project metadata names override global names. Each run fixes the advertised catalog. CLI/TUI
+  `/skill` query this method without a model call; `/skill <name> [arguments]` preserves the raw
+  command and adds the fixed body and arguments to user content before context preflight.
+- Durable `subagent.started` / `subagent.finished` events belong to the parent session/run and carry
+  the isolated childRunId, profile name, background flag, and bounded terminal summary. Child task
+  events do not belong to the parent's task graph.
+- Permission summaries support MCP server/tool identity and a bounded, publisher-redacted parameter
+  preview. Requested/resolved events may carry childRunId without changing the parent run scope.
+  Legacy events without childRunId remain valid. MCP approval policy is implemented with MCP tools.
+- Core prepares a fixed system prompt/tool-schema snapshot before allocating turn/run IDs, then
+  reuses it for the provider, tracing, and compaction budget checks. Tools may export an original
+  JSON Schema while retaining local Zod validation.
+- Tools may declare serial/parallel execution mode (default parallel). All-parallel batches complete
+  argument validation and approval in request order before Promise.all execution; any serial tool
+  makes the whole batch sequential. Failed calls remain independent observations, and results keep
+  request order even when completion events arrive out of order. Infrastructure failure cancels and
+  drains the batch. An explicit null execution timeout disables only the tool timer, preserving
+  external cancellation and provider timeouts.
+
 ## Sessions
 
 - Session RPCs are additive: `agent.run` keeps its Stage1 shape as the one-shot test entry point.
@@ -731,6 +754,161 @@ Success response:
 }
 ```
 
+### SkillListRequest
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "jsonrpc": {
+      "type": "string",
+      "const": "2.0"
+    },
+    "id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        }
+      ]
+    },
+    "method": {
+      "type": "string",
+      "const": "skill.list"
+    },
+    "params": {
+      "type": "object",
+      "properties": {
+        "workspaceRoot": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "workspaceRoot"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "jsonrpc",
+    "id",
+    "method",
+    "params"
+  ],
+  "additionalProperties": false
+}
+```
+
+### SkillListSuccessResponse
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "jsonrpc": {
+      "type": "string",
+      "const": "2.0"
+    },
+    "id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        }
+      ]
+    },
+    "result": {
+      "type": "object",
+      "properties": {
+        "skills": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            },
+            "required": [
+              "name",
+              "description",
+              "path"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "code": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              }
+            },
+            "required": [
+              "path",
+              "code",
+              "message"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "skills",
+        "diagnostics"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "jsonrpc",
+    "id",
+    "result"
+  ],
+  "additionalProperties": false
+}
+```
+
 ### AgentEvent
 
 ```json
@@ -770,6 +948,160 @@ Success response:
         "payload": {
           "type": "object",
           "properties": {},
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "sessionId",
+        "runId",
+        "sequence",
+        "timestamp",
+        "durable",
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "runId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "sequence": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+        },
+        "durable": {
+          "type": "boolean",
+          "const": true
+        },
+        "type": {
+          "type": "string",
+          "const": "subagent.started"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "childRunId": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "background": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "childRunId",
+            "name",
+            "background"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "sessionId",
+        "runId",
+        "sequence",
+        "timestamp",
+        "durable",
+        "type",
+        "payload"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "runId": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "sequence": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+        },
+        "durable": {
+          "type": "boolean",
+          "const": true
+        },
+        "type": {
+          "type": "string",
+          "const": "subagent.finished"
+        },
+        "payload": {
+          "type": "object",
+          "properties": {
+            "childRunId": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "background": {
+              "type": "boolean"
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "succeeded",
+                "failed",
+                "cancelled",
+                "interrupted"
+              ]
+            },
+            "summary": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "errorCode": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          "required": [
+            "childRunId",
+            "name",
+            "background",
+            "status",
+            "summary"
+          ],
           "additionalProperties": false
         }
       },
@@ -1599,6 +1931,11 @@ Success response:
               "minLength": 1,
               "maxLength": 128
             },
+            "childRunId": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
             "riskCategories": {
               "minItems": 1,
               "maxItems": 4,
@@ -1611,7 +1948,8 @@ Success response:
                   "bash:workspace-mutation",
                   "bash:network",
                   "bash:process-execution",
-                  "bash:other"
+                  "bash:other",
+                  "mcp"
                 ]
               }
             },
@@ -1620,6 +1958,36 @@ Success response:
             },
             "summary": {
               "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "const": "mcp"
+                    },
+                    "server": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "tool": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "paramsPreview": {
+                      "type": "string",
+                      "maxLength": 1024
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "server",
+                    "tool",
+                    "paramsPreview"
+                  ],
+                  "additionalProperties": false
+                },
                 {
                   "type": "object",
                   "properties": {
@@ -1815,6 +2183,11 @@ Success response:
               "type": "string",
               "minLength": 1,
               "maxLength": 128
+            },
+            "childRunId": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
             },
             "decision": {
               "type": "string",
@@ -4679,6 +5052,160 @@ Success response:
                   "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
                 },
                 "durable": {
+                  "type": "boolean",
+                  "const": true
+                },
+                "type": {
+                  "type": "string",
+                  "const": "subagent.started"
+                },
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "childRunId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "background": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "childRunId",
+                    "name",
+                    "background"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "sessionId",
+                "runId",
+                "sequence",
+                "timestamp",
+                "durable",
+                "type",
+                "payload"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "sessionId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "runId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "sequence": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "timestamp": {
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                },
+                "durable": {
+                  "type": "boolean",
+                  "const": true
+                },
+                "type": {
+                  "type": "string",
+                  "const": "subagent.finished"
+                },
+                "payload": {
+                  "type": "object",
+                  "properties": {
+                    "childRunId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    },
+                    "background": {
+                      "type": "boolean"
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "succeeded",
+                        "failed",
+                        "cancelled",
+                        "interrupted"
+                      ]
+                    },
+                    "summary": {
+                      "type": "string",
+                      "maxLength": 4096
+                    },
+                    "errorCode": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 128
+                    }
+                  },
+                  "required": [
+                    "childRunId",
+                    "name",
+                    "background",
+                    "status",
+                    "summary"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "sessionId",
+                "runId",
+                "sequence",
+                "timestamp",
+                "durable",
+                "type",
+                "payload"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "sessionId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "runId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "sequence": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "timestamp": {
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                },
+                "durable": {
                   "type": "boolean"
                 },
                 "type": {
@@ -5470,6 +5997,11 @@ Success response:
                       "minLength": 1,
                       "maxLength": 128
                     },
+                    "childRunId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
                     "riskCategories": {
                       "minItems": 1,
                       "maxItems": 4,
@@ -5482,7 +6014,8 @@ Success response:
                           "bash:workspace-mutation",
                           "bash:network",
                           "bash:process-execution",
-                          "bash:other"
+                          "bash:other",
+                          "mcp"
                         ]
                       }
                     },
@@ -5491,6 +6024,36 @@ Success response:
                     },
                     "summary": {
                       "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "kind": {
+                              "type": "string",
+                              "const": "mcp"
+                            },
+                            "server": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128
+                            },
+                            "tool": {
+                              "type": "string",
+                              "minLength": 1,
+                              "maxLength": 128
+                            },
+                            "paramsPreview": {
+                              "type": "string",
+                              "maxLength": 1024
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "server",
+                            "tool",
+                            "paramsPreview"
+                          ],
+                          "additionalProperties": false
+                        },
                         {
                           "type": "object",
                           "properties": {
@@ -5686,6 +6249,11 @@ Success response:
                       "type": "string",
                       "minLength": 1,
                       "maxLength": 128
+                    },
+                    "childRunId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
                     },
                     "decision": {
                       "type": "string",

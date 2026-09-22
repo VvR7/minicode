@@ -46,6 +46,7 @@ async function fixture() {
     host: "127.0.0.1" as const,
     port: 0,
     logLevel: "error" as const,
+    permissionMode: "alwaysask" as const,
     homeDirectory: home,
   };
   const environment = {
@@ -106,6 +107,64 @@ async function fixture() {
 }
 
 describe("Core permission flow (integration)", () => {
+  test("default bypass mode executes an ask-classified tool without publishing approval", async () => {
+    const home = await mkdtemp(join(tmpdir(), "minicode-bypass-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "minicode-bypass-workspace-"));
+    const mock = startScriptedAnthropicMock((_body, call) =>
+      call === 1
+        ? {
+            kind: "tools",
+            calls: [
+              {
+                id: "write-bypass",
+                name: "write",
+                input: { path: "bypassed.txt", content: "bypassed" },
+              },
+            ],
+          }
+        : { kind: "text", chunks: ["done"] },
+    );
+    const app = new CoreApp(
+      { host: "127.0.0.1", port: 0, logLevel: "error", homeDirectory: home },
+      {
+        LLM_API_KEY: "test-key",
+        LLM_BASE_URL: mock.url,
+        LLM_MODEL: "test-model",
+        LLM_CONTEXT_WINDOW_TOKENS: "100000",
+        LLM_MAX_OUTPUT_TOKENS: "4096",
+        MINICODE_TRACE_ENABLED: "false",
+      },
+    );
+    const client = await NdjsonRpcConnection.connect(app.start());
+    const events: AgentEvent[] = [];
+    client.onNotification((notification) => {
+      const parsed = EventPushNotificationSchema.safeParse(notification);
+      if (parsed.success && isAgentEvent(parsed.data.params.event))
+        events.push(parsed.data.params.event);
+    });
+    try {
+      const accepted = await client.request(
+        "agent.run",
+        { goal: "write without prompt", workspaceRoot: workspace },
+        AgentRunResultSchema,
+      );
+      await client.request(
+        "event.subscribe",
+        { sessionId: accepted.result.sessionId, runId: accepted.result.runId },
+        EventSubscribeResultSchema,
+      );
+      await waitFor(() => events.some((event) => event.type === "run.finished"));
+      expect(events.some((event) => event.type === "permission.requested")).toBe(false);
+      expect(await readFile(join(workspace, "bypassed.txt"), "utf8")).toBe("bypassed");
+    } finally {
+      client.close();
+      await app.stop();
+      await mock.stop();
+      await rm(home, { recursive: true, force: true });
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   test("unattached connections cannot respond; first attached response wins before write executes", async () => {
     const f = await fixture();
     try {

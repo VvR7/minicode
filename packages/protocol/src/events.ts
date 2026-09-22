@@ -10,13 +10,13 @@ import {
   ToolFailureCategorySchema,
 } from "./permissions.ts";
 import {
-  SessionCompactionStartedEventSchema,
-  SessionCompactionFinishedEventSchema,
   SessionCompactionFailedEventSchema,
+  SessionCompactionFinishedEventSchema,
+  SessionCompactionStartedEventSchema,
+  type SessionEvent,
   SessionTurnAcceptedEventSchema,
   SessionTurnFinishedEventSchema,
   TaskSnapshotSchema,
-  type SessionEvent,
 } from "./session.ts";
 
 export const EVENT_PUSH_METHOD = "event.push" as const;
@@ -53,6 +53,29 @@ const ToolIdentityShape = {
   toolCallId: z.string().min(1).max(256),
   name: z.string().min(1).max(128),
 };
+
+/** 子生命周期事件属于父 run；childRunId 只标识隔离执行，不替换信封 runId。 */
+const SubagentIdentityShape = {
+  childRunId: RunIdSchema,
+  name: z.string().min(1).max(128),
+  background: z.boolean(),
+};
+
+export const SubagentStartedEventSchema = eventSchema(
+  "subagent.started",
+  z.strictObject(SubagentIdentityShape),
+  z.literal(true),
+);
+export const SubagentFinishedEventSchema = eventSchema(
+  "subagent.finished",
+  z.strictObject({
+    ...SubagentIdentityShape,
+    status: z.enum(["succeeded", "failed", "cancelled", "interrupted"]),
+    summary: z.string().max(4096),
+    errorCode: z.string().min(1).max(128).optional(),
+  }),
+  z.literal(true),
+);
 
 export const RunStartedEventSchema = eventSchema("run.started", z.strictObject({}));
 export const StepStartedEventSchema = eventSchema(
@@ -158,6 +181,7 @@ export const PermissionRequestedEventSchema = eventSchema(
   z.strictObject({
     permissionRequestId: PermissionRequestIdSchema,
     ...ToolIdentityShape,
+    childRunId: RunIdSchema.optional(),
     riskCategories: z.array(PermissionRiskCategorySchema).min(1).max(4),
     cacheable: z.boolean(),
     summary: PermissionRequestSummarySchema,
@@ -170,6 +194,7 @@ export const PermissionResolvedEventSchema = eventSchema(
     .strictObject({
       permissionRequestId: PermissionRequestIdSchema,
       ...ToolIdentityShape,
+      childRunId: RunIdSchema.optional(),
       decision: PermissionDecisionSchema,
       allowed: z.boolean(),
       source: z.literal("user"),
@@ -247,6 +272,8 @@ export const RunFinishedEventSchema = eventSchema("run.finished", RunFinishedPay
 
 export const AgentEventSchema = z.discriminatedUnion("type", [
   RunStartedEventSchema,
+  SubagentStartedEventSchema,
+  SubagentFinishedEventSchema,
   StepStartedEventSchema,
   LlmModelSelectedEventSchema,
   LlmTextDeltaEventSchema,
@@ -267,6 +294,8 @@ export type AgentEvent = z.infer<typeof AgentEventSchema>;
 /** event.push 顶层按 type 一次判别，避免嵌套 union 产生含糊分支。 */
 export const PushedEventSchema = z.discriminatedUnion("type", [
   RunStartedEventSchema,
+  SubagentStartedEventSchema,
+  SubagentFinishedEventSchema,
   StepStartedEventSchema,
   LlmModelSelectedEventSchema,
   LlmTextDeltaEventSchema,

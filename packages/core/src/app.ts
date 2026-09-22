@@ -1,3 +1,5 @@
+import { SkillListHandler } from "./handlers/skill-list-handler.ts";
+import { McpServerManager } from "./mcp/server-manager.ts";
 import type { CoreEndpoint, Environment } from "@minicode/protocol";
 import { formatEndpoint, MINICODE_VERSION } from "@minicode/protocol";
 import type { CoreConfig } from "./config.ts";
@@ -44,6 +46,7 @@ export class CoreApp {
   #manager: SessionManager | undefined;
   #traces: RunTraceRegistry | undefined;
   #permissions: PermissionManager | undefined;
+  #mcp: McpServerManager | undefined;
   #startedAt = 0;
   #stopping = false;
   #stopPromise: Promise<void> | undefined;
@@ -61,6 +64,7 @@ export class CoreApp {
       throw new Error("core already started");
     }
 
+    this.#mcp = new McpServerManager(this.#config.homeDirectory, this.#environment);
     this.#startedAt = performance.now();
     const eventStore = new EventStore(this.#config.homeDirectory);
     const traces = new RunTraceRegistry(this.#config.homeDirectory, this.#environment);
@@ -79,6 +83,8 @@ export class CoreApp {
       bus: eventBus,
       homeDirectory: this.#config.homeDirectory,
       permissions,
+      permissionMode: this.#config.permissionMode ?? "bypasspermission",
+      mcp: this.#mcp,
     });
     const manager = new SessionManager({
       store: sessionStore,
@@ -92,6 +98,7 @@ export class CoreApp {
     });
     const dispatcher = createRpcDispatcher({
       handlers: [
+        new SkillListHandler(this.#config.homeDirectory),
         new PingHandler({ uptimeMs: () => performance.now() - this.#startedAt }),
         new PermissionRespondHandler(
           permissions,
@@ -158,6 +165,8 @@ export class CoreApp {
       this.#permissions?.close();
       await server.stop();
       await manager?.shutdown();
+      await this.#mcp?.close();
+      this.#mcp = undefined;
 
       this.#broadcaster?.close();
       this.#sessionBroadcaster?.close();

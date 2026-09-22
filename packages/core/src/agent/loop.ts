@@ -1,16 +1,26 @@
 import type { AgentEvent, CompactionReason } from "@minicode/protocol";
+import type { ContextEntry } from "../compact/types.ts";
+import type { EventBus } from "../events/event-bus.ts";
 import { LlmError } from "../llm/errors.ts";
 import type { LlmProvider } from "../llm/provider.ts";
-import type { LlmContentPart, LlmResponse, LlmStreamEvent } from "../llm/types.ts";
-import type { EventBus } from "../events/event-bus.ts";
-import type { ToolRegistry } from "../tools/registry.ts";
-import type { ToolInvoker } from "../tools/invoker.ts";
+import type {
+  LlmContentPart,
+  LlmResponse,
+  LlmStreamEvent,
+  LlmToolSchema,
+  LlmToolCall,
+} from "../llm/types.ts";
 import type { RunCompletion } from "../run/completion.ts";
-import type { TraceRecorder } from "../trace/recorder.ts";
-import type { ExecutionContext, FailedReason, RunFinishReason } from "./context.ts";
-
-import type { ContextEntry } from "../compact/types.ts";
 import type { CompactionConfig } from "../session/compaction-config.ts";
+import type { PreparedToolInvocation, ToolInvoker } from "../tools/invoker.ts";
+import type { ToolRegistry } from "../tools/registry.ts";
+import type { TraceRecorder } from "../trace/recorder.ts";
+import type {
+  ExecutionContext,
+  FailedReason,
+  RunFinishReason,
+  ToolResultBlock,
+} from "./context.ts";
 
 export type ContextCompactionHook = (
   entries: readonly ContextEntry[],
@@ -29,6 +39,8 @@ export const DEFAULT_SYSTEM_PROMPT =
 const MAX_TEXT_DELTA_CHARS = 16 * 1024;
 /** run.finished.finalText 的协议层上限（字符数）。 */
 const MAX_FINAL_TEXT_CHARS = 256 * 1024;
+/** 子 Agent 单个并行工具批次回填模型的正文总上限。 */
+export const MAX_SUBAGENT_PARALLEL_TOOL_RESULT_BYTES = 64 * 1024;
 
 type StepOutcome = "continue" | "succeeded" | "failed" | "cancelled";
 
@@ -39,7 +51,11 @@ type EventDescriptor = Omit<
 >;
 
 export interface AgentLoopOptions {
+  readonly permissionParentRunId?: string;
+  readonly subagentResults?: (wait: boolean, signal: AbortSignal) => Promise<readonly string[]>;
   readonly systemPrompt?: string;
+  /** 和接受请求前预算检查一致的固定工具目录。 */
+  readonly toolSchemas?: readonly LlmToolSchema[];
   /** 传给 provider 的单次调用超时毫秒数。 */
   readonly timeoutMs?: number;
   /** 传给 provider 的首 delta 前最大尝试次数。 */
@@ -50,6 +66,8 @@ export interface AgentLoopOptions {
   readonly contextWindowTokens?: number;
   readonly compactionConfig?: CompactionConfig;
   readonly compact?: ContextCompactionHook;
+  /** 仅对子 Agent 设置；限制单步并行工具结果写回模型的正文总字节数。 */
+  readonly maxParallelToolResultBytes?: number;
 }
 
 /** EventBus 发布失败（如 event_store_error）时抛出，由 run 映射为结构化失败。 */
@@ -69,18 +87,57 @@ function chunkText(text: string, maxChars: number): string[] {
   return chunks;
 }
 
+/** 在 UTF-8 边界内截取正文，避免批次预算产生损坏字符。 */
+function sliceUtf8(text: string, maxBytes: number): string {
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.byteLength <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
+
+/** 按请求顺序公平分配批次预算，保留每个调用身份、错误标志和明确截断提示。 */
+function boundParallelToolResults(
+  results: readonly ToolResultBlock[],
+  maxBytes: number,
+): readonly ToolResultBlock[] {
+  const encoder = new TextEncoder();
+  if (
+    results.reduce((sum, result) => sum + encoder.encode(result.content).byteLength, 0) <= maxBytes
+  )
+    return results;
+  const marker = "\n[parallel tool batch output truncated]";
+  const markerBytes = encoder.encode(marker).byteLength;
+  let remaining = maxBytes;
+  return results.map((result, index) => {
+    const share = Math.floor(remaining / (results.length - index));
+    const bytes = encoder.encode(result.content).byteLength;
+    const content =
+      bytes <= share
+        ? result.content
+        : share <= markerBytes
+          ? sliceUtf8(marker.trimStart(), share)
+          : `${sliceUtf8(result.content, share - markerBytes)}${marker}`;
+    remaining -= encoder.encode(content).byteLength;
+    return { ...result, content };
+  });
+}
+
 function now(): string {
   return new Date().toISOString();
 }
 
 /**
  * 驱动 LLM → tools → tool results → LLM 的主循环。
- * 消费 provider 流、顺序执行工具、把领域事件转换为 IPC 事件发布到 EventBus。
+ * 消费 provider 流、按整批模式执行工具、把领域事件转换为 IPC 事件发布到 EventBus。
  * 不直接创建 ExecutionContext，由上层（AgentRunner）注入。
  */
 export class AgentLoop {
+  readonly #subagentResults: AgentLoopOptions["subagentResults"];
+  readonly #permissionParentRunId: string | undefined;
   readonly #provider: LlmProvider;
   readonly #registry: ToolRegistry;
+  readonly #toolSchemas: readonly LlmToolSchema[];
   readonly #invoker: ToolInvoker;
   readonly #bus: EventBus;
   readonly #systemPrompt: string;
@@ -90,7 +147,9 @@ export class AgentLoop {
   readonly #contextWindowTokens: number | undefined;
   readonly #compactionConfig: CompactionConfig | undefined;
   readonly #compact: ContextCompactionHook | undefined;
+  readonly #maxParallelToolResultBytes: number | undefined;
 
+  /** 保存本轮提示词、工具目录及执行依赖；循环中不重新发现能力。 */
   constructor(
     provider: LlmProvider,
     registry: ToolRegistry,
@@ -98,8 +157,11 @@ export class AgentLoop {
     bus: EventBus,
     options: AgentLoopOptions = {},
   ) {
+    this.#subagentResults = options.subagentResults;
+    this.#permissionParentRunId = options.permissionParentRunId;
     this.#provider = provider;
     this.#registry = registry;
+    this.#toolSchemas = options.toolSchemas ?? registry.toolSchemas();
     this.#invoker = invoker;
     this.#bus = bus;
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
@@ -109,6 +171,7 @@ export class AgentLoop {
     this.#contextWindowTokens = options.contextWindowTokens;
     this.#compactionConfig = options.compactionConfig;
     this.#compact = options.compact;
+    this.#maxParallelToolResultBytes = options.maxParallelToolResultBytes;
   }
 
   /** 执行直到终止；同一 signal 贯穿 LLM 与工具调用。返回结构化 RunCompletion，不发布 run.finished。 */
@@ -173,6 +236,8 @@ export class AgentLoop {
 
   /** 单步：选模型、消费流、累计 usage、按停止原因分派。 */
   async #runStep(context: ExecutionContext, signal: AbortSignal): Promise<StepOutcome> {
+    for (const result of (await this.#subagentResults?.(false, signal)) ?? [])
+      context.addUserContext(result);
     context.model = this.#provider.model;
     await this.#publish(
       context,
@@ -187,7 +252,7 @@ export class AgentLoop {
     if (
       config?.enabled &&
       this.#contextWindowTokens !== undefined &&
-      context.contextTokens(this.#systemPrompt, this.#registry.toolSchemas()) >
+      context.contextTokens(this.#systemPrompt, this.#toolSchemas) >
         this.#contextWindowTokens - config.reserveTokens
     ) {
       await this.#compactContext(context, "threshold", signal);
@@ -234,13 +299,19 @@ export class AgentLoop {
     context.anchorUsage(response.usage);
 
     switch (response.finishReason) {
-      case "end_turn":
+      case "end_turn": {
         if (response.toolCalls.length > 0) {
           context.markFailed("invalid_llm_response");
           return "failed";
         }
+        const results = (await this.#subagentResults?.(true, signal)) ?? [];
+        if (results.length > 0) {
+          for (const result of results) context.addUserContext(result);
+          return "continue";
+        }
         context.markSucceeded(response.text);
         return "succeeded";
+      }
       case "tool_use":
         if (response.toolCalls.length === 0) {
           context.markFailed("invalid_llm_response");
@@ -263,7 +334,7 @@ export class AgentLoop {
   ): Promise<void> {
     const entries = await this.#compact?.(
       context.contextEntries,
-      context.contextTokens(this.#systemPrompt, this.#registry.toolSchemas()),
+      context.contextTokens(this.#systemPrompt, this.#toolSchemas),
       reason,
       signal,
     );
@@ -285,7 +356,7 @@ export class AgentLoop {
         provider: this.#provider.providerName,
         systemPrompt: this.#systemPrompt,
         messages: context.messages,
-        tools: this.#registry.toolSchemas(),
+        tools: this.#toolSchemas,
       },
     });
     let response: LlmResponse | undefined;
@@ -365,102 +436,155 @@ export class AgentLoop {
   #stream(context: ExecutionContext, signal: AbortSignal): AsyncIterable<LlmStreamEvent> {
     return this.#provider.stream(context.messages, {
       system: this.#systemPrompt,
-      toolSchemas: this.#registry.toolSchemas(),
+      toolSchemas: this.#toolSchemas,
       signal,
       ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }),
       ...(this.#maxAttempts === undefined ? {} : { maxAttempts: this.#maxAttempts }),
     });
   }
 
-  /** 顺序执行全部工具调用，发布 tool.* 事件，结果合并为一条 user message。 */
+  /** 按整批模式调度；并行批次先完成全部准备，结果始终保持请求顺序。 */
   async #executeTools(
     context: ExecutionContext,
-    toolCalls: readonly { id: string; name: string; input: Record<string, unknown> }[],
+    toolCalls: readonly LlmToolCall[],
     signal: AbortSignal,
   ): Promise<void> {
-    const results: { toolUseId: string; content: string; isError: boolean }[] = [];
-    for (const call of toolCalls) {
-      // 取消后不再开始新的工具，避免产生无意义的工具副作用与事件。
-      if (signal.aborted) {
-        throw new LlmError("aborted", "agent run cancelled");
+    const parallel = toolCalls.every(
+      (call) => (this.#registry.get(call.name)?.executeMode ?? "parallel") === "parallel",
+    );
+    const batchAbort = new AbortController();
+    const batchSignal = AbortSignal.any([signal, batchAbort.signal]);
+    const executions: Promise<ToolResultBlock>[] = [];
+    const results: ToolResultBlock[] = [];
+    try {
+      if (parallel) {
+        const prepared: PreparedToolInvocation[] = [];
+        for (const call of toolCalls)
+          prepared.push(await this.#prepareToolCall(context, call, batchSignal));
+        for (const [index, call] of toolCalls.entries()) {
+          const invocation = prepared[index];
+          if (invocation === undefined) throw new Error("missing prepared tool invocation");
+          executions.push(this.#executePreparedTool(context, call, invocation));
+        }
+        results.push(...(await Promise.all(executions)));
+      } else {
+        for (const call of toolCalls) {
+          const prepared = await this.#prepareToolCall(context, call, batchSignal);
+          const execution = this.#executePreparedTool(context, call, prepared);
+          executions.push(execution);
+          results.push(await execution);
+        }
       }
-      await this.#publish(
-        context,
-        { type: "tool.started", payload: { toolCallId: call.id, name: call.name, attempt: 1 } },
-        true,
+      context.addToolResults(
+        parallel && this.#maxParallelToolResultBytes !== undefined
+          ? boundParallelToolResults(results, this.#maxParallelToolResultBytes)
+          : results,
       );
-
-      const invocation = await this.#invoker.invoke(
-        call.name,
-        call.input,
-        { workspaceRoot: context.workspaceRoot, signal },
-        {
-          permissionScope: {
-            sessionId: context.sessionId,
-            runId: context.runId,
-            toolCallId: call.id,
-          },
-          onRetry: async (retry) => {
-            await this.#publish(
-              context,
-              {
-                type: "tool.retrying",
-                payload: {
-                  toolCallId: call.id,
-                  name: call.name,
-                  attempt: retry.attempt,
-                  maxAttempts: retry.maxAttempts,
-                  delayMs: retry.delayMs,
-                  failureCategory: retry.failureCategory,
-                  errorCode: retry.errorCode,
-                },
-              },
-              true,
-            );
-          },
-        },
-      );
-
-      await this.#publish(
-        context,
-        {
-          type: "tool.finished",
-          payload: invocation.result.isError
-            ? {
-                toolCallId: call.id,
-                name: call.name,
-                isError: true,
-                durationMs: invocation.durationMs,
-                outputBytes: invocation.result.outputBytes,
-                truncated: invocation.result.truncated,
-                attempts: invocation.attempts,
-                failureCategory: invocation.result.failure?.category ?? "runtime_error",
-                errorCode: invocation.result.failure?.errorCode ?? "io_error",
-                ...(invocation.permissionSource === undefined
-                  ? {}
-                  : { permissionSource: invocation.permissionSource }),
-              }
-            : {
-                toolCallId: call.id,
-                name: call.name,
-                isError: false,
-                durationMs: invocation.durationMs,
-                outputBytes: invocation.result.outputBytes,
-                truncated: invocation.result.truncated,
-                attempts: invocation.attempts,
-                permissionSource: invocation.permissionSource ?? "policy",
-              },
-        },
-        true,
-      );
-
-      results.push({
-        toolUseId: call.id,
-        content: invocation.result.content,
-        isError: invocation.result.isError,
-      });
+      // 已配对结果可保留审计，但取消后不能再进入下一次模型请求。
+      if (signal.aborted) throw new LlmError("aborted", "agent run cancelled");
+    } catch (error) {
+      // 事件写入或回调失败必须取消并排空同批调用，不能让它们跨 run 终态继续运行。
+      batchAbort.abort();
+      await Promise.allSettled(executions);
+      throw error;
     }
-    context.addToolResults(results);
+  }
+
+  /** 按请求顺序发布开始事件并完成参数校验和审批。 */
+  async #prepareToolCall(
+    context: ExecutionContext,
+    call: LlmToolCall,
+    signal: AbortSignal,
+  ): Promise<PreparedToolInvocation> {
+    // 取消后不再开始新的工具，避免产生无意义的工具副作用与事件。
+    if (signal.aborted) {
+      throw new LlmError("aborted", "agent run cancelled");
+    }
+    await this.#publish(
+      context,
+      { type: "tool.started", payload: { toolCallId: call.id, name: call.name, attempt: 1 } },
+      true,
+    );
+
+    return this.#invoker.prepare(
+      call.name,
+      call.input,
+      { workspaceRoot: context.workspaceRoot, signal },
+      {
+        permissionScope: {
+          sessionId: context.sessionId,
+          runId: this.#permissionParentRunId ?? context.runId,
+          ...(this.#permissionParentRunId === undefined ? {} : { childRunId: context.runId }),
+          toolCallId:
+            this.#permissionParentRunId === undefined ? call.id : `${context.runId}:${call.id}`,
+        },
+        onRetry: async (retry) => {
+          await this.#publish(
+            context,
+            {
+              type: "tool.retrying",
+              payload: {
+                toolCallId: call.id,
+                name: call.name,
+                attempt: retry.attempt,
+                maxAttempts: retry.maxAttempts,
+                delayMs: retry.delayMs,
+                failureCategory: retry.failureCategory,
+                errorCode: retry.errorCode,
+              },
+            },
+            true,
+          );
+        },
+      },
+    );
+  }
+
+  /** 执行单个准备结果并发布终态，返回模型需要的配对 observation。 */
+  async #executePreparedTool(
+    context: ExecutionContext,
+    call: LlmToolCall,
+    prepared: PreparedToolInvocation,
+  ): Promise<ToolResultBlock> {
+    const invocation = await this.#invoker.executePrepared(prepared);
+    await this.#publish(
+      context,
+      {
+        type: "tool.finished",
+        payload: invocation.result.isError
+          ? {
+              toolCallId: call.id,
+              name: call.name,
+              isError: true,
+              durationMs: invocation.durationMs,
+              outputBytes: invocation.result.outputBytes,
+              truncated: invocation.result.truncated,
+              attempts: invocation.attempts,
+              failureCategory: invocation.result.failure?.category ?? "runtime_error",
+              errorCode: invocation.result.failure?.errorCode ?? "io_error",
+              ...(invocation.permissionSource === undefined
+                ? {}
+                : { permissionSource: invocation.permissionSource }),
+            }
+          : {
+              toolCallId: call.id,
+              name: call.name,
+              isError: false,
+              durationMs: invocation.durationMs,
+              outputBytes: invocation.result.outputBytes,
+              truncated: invocation.result.truncated,
+              attempts: invocation.attempts,
+              permissionSource: invocation.permissionSource ?? "policy",
+            },
+      },
+      true,
+    );
+
+    return {
+      toolUseId: call.id,
+      content: invocation.result.content,
+      isError: invocation.result.isError,
+    };
   }
 
   /** 依据 context 终态组装结构化 completion。 */

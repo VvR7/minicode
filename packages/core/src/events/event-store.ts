@@ -78,16 +78,27 @@ const nodeJournalStorage: EventJournalStorage = {
 export class EventStore {
   readonly #homeDirectory: string;
   readonly #storage: EventJournalStorage;
+  readonly #parentRunId: RunId | undefined;
 
-  constructor(homeDirectory: string, storage: EventJournalStorage = nodeJournalStorage) {
+  /** 保存存储根目录，子 Agent 的事件嵌套在指定父 run 中。 */
+  constructor(
+    homeDirectory: string,
+    storage: EventJournalStorage = nodeJournalStorage,
+    parentRunId?: RunId,
+  ) {
+    this.#parentRunId = parentRunId === undefined ? undefined : RunIdSchema.parse(parentRunId);
     this.#homeDirectory = homeDirectory;
     this.#storage = storage;
   }
 
+  /** 按运行身份返回主目录或父 run 下的子审计路径。 */
   pathFor(sessionId: SessionId, runId: RunId): string {
     SessionIdSchema.parse(sessionId);
     RunIdSchema.parse(runId);
-    return join(this.#homeDirectory, "sessions", sessionId, "runs", runId, "events.jsonl");
+    const root = join(this.#homeDirectory, "sessions", sessionId, "runs");
+    return this.#parentRunId === undefined
+      ? join(root, runId, "events.jsonl")
+      : join(root, this.#parentRunId, "subagents", runId, "events.jsonl");
   }
 
   async append(event: AgentEvent): Promise<EventStoreResult<void>> {
@@ -207,6 +218,7 @@ export class EventStore {
     return { ok: true, value: { events, latestSequence: previousSequence, finished } };
   }
 
+  /** 追加并同步记录，子 Agent 不占用主 run 的 journal。 */
   async #appendRecord(
     sessionId: SessionId,
     runId: RunId,
@@ -215,7 +227,10 @@ export class EventStore {
     const sessions = join(this.#homeDirectory, "sessions");
     const session = join(sessions, sessionId);
     const runs = join(session, "runs");
-    const run = join(runs, runId);
+    const run =
+      this.#parentRunId === undefined
+        ? join(runs, runId)
+        : join(runs, this.#parentRunId, "subagents", runId);
     await this.#storage.append(join(run, "events.jsonl"), `${JSON.stringify(record)}\n`, [
       sessions,
       session,

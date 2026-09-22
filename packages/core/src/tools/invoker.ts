@@ -1,22 +1,25 @@
+import type { PermissionManager } from "../permissions/manager.ts";
+import type { PermissionScope } from "../permissions/policy.ts";
+import type { PermissionMode } from "../config.ts";
+import type { ToolRegistry } from "./registry.ts";
 import {
   DEFAULT_TOOL_MAX_ATTEMPTS,
   DEFAULT_TOOL_TIMEOUT_MS,
   MAX_TOOL_RESULT_BYTES,
   ToolError,
+  type Tool,
   type ToolExecutionContext,
   type ToolInvocationResult,
   type ToolOutput,
   type ToolResult,
   type ToolRetry,
 } from "./types.ts";
-import type { ToolRegistry } from "./registry.ts";
-import type { PermissionManager } from "../permissions/manager.ts";
-import type { PermissionScope } from "../permissions/policy.ts";
 
 const DEFAULT_RETRY_DELAYS_MS = [2_000, 4_000] as const;
 
 export interface ToolInvokerOptions {
   readonly permissions?: PermissionManager;
+  readonly permissionMode?: PermissionMode;
   readonly timeoutMs?: number;
   readonly maxAttempts?: number;
   readonly retryDelaysMs?: readonly number[];
@@ -27,6 +30,19 @@ export interface ToolInvocationOptions {
   readonly permissionSource?: "policy" | "session_cache" | "user";
   readonly onRetry?: (retry: ToolRetry) => Promise<void> | void;
 }
+
+/** 准备结果固定已校验参数与审批决定，执行阶段不再重复审批。 */
+export type PreparedToolInvocation =
+  | { readonly kind: "finished"; readonly invocation: ToolInvocationResult }
+  | {
+      readonly kind: "ready";
+      readonly tool: Tool;
+      readonly params: Record<string, unknown>;
+      readonly context: ToolExecutionContext;
+      readonly options: ToolInvocationOptions;
+      readonly permissionSource: "policy" | "session_cache" | "user";
+      readonly startedAt: number;
+    };
 
 /** 非 ToolError 的意外异常不可证明可安全重试，避免重复执行有副作用的工具。 */
 function toToolError(error: unknown): ToolError {
@@ -136,45 +152,55 @@ export class ToolInvoker {
   readonly #maxAttempts: number;
   readonly #retryDelaysMs: readonly number[];
   readonly #permissions: PermissionManager | undefined;
+  readonly #permissionMode: PermissionMode;
 
   /** 保存注册表及统一超时、尝试次数和退避配置。 */
   constructor(registry: ToolRegistry, options: ToolInvokerOptions = {}) {
     this.#registry = registry;
     this.#permissions = options.permissions;
+    this.#permissionMode = options.permissionMode ?? "alwaysask";
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
     this.#maxAttempts = Math.min(3, Math.max(1, options.maxAttempts ?? DEFAULT_TOOL_MAX_ATTEMPTS));
     this.#retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
   }
 
-  /** 校验参数后执行工具，把可预期失败归一化为模型可见 observation。 */
+  /** 兼容单次调用入口：准备后立即执行，保留原有校验与审批次序。 */
   async invoke(
     name: string,
     params: unknown,
     context: ToolExecutionContext,
     options: ToolInvocationOptions = {},
   ): Promise<ToolInvocationResult> {
-    const started = performance.now();
-    const duration = (): number => Math.max(0, Math.floor(performance.now() - started));
+    return this.executePrepared(await this.prepare(name, params, context, options));
+  }
 
-    const tool = this.#registry.get(name);
-    if (tool === undefined) {
-      return this.#fail(new ToolError("unknown_tool", `unknown tool: ${name}`), 0, [], duration());
-    }
-
-    const parsed = tool.inputSchema.safeParse(params);
-    if (!parsed.success) {
-      return this.#fail(
-        new ToolError("invalid_params", "invalid tool parameters"),
+  /** 只完成参数校验与审批，不创建执行 Promise 或执行超时定时器。 */
+  async prepare(
+    name: string,
+    params: unknown,
+    context: ToolExecutionContext,
+    options: ToolInvocationOptions = {},
+  ): Promise<PreparedToolInvocation> {
+    const startedAt = performance.now();
+    const failed = (
+      error: ToolError,
+      permissionSource?: "policy" | "session_cache" | "user",
+    ): PreparedToolInvocation => ({
+      kind: "finished",
+      invocation: this.#fail(
+        error,
         0,
         [],
-        duration(),
-      );
-    }
-    // 在创建执行 promise 前退出，确保已取消的 run 不会实际调用工具。
-    if (context.signal.aborted) {
-      return this.#fail(new ToolError("tool_cancelled", "tool call cancelled"), 0, [], duration());
-    }
-
+        Math.max(0, Math.floor(performance.now() - startedAt)),
+        permissionSource,
+      ),
+    });
+    const tool = this.#registry.get(name);
+    if (tool === undefined) return failed(new ToolError("unknown_tool", `unknown tool: ${name}`));
+    const parsed = tool.inputSchema.safeParse(params);
+    if (!parsed.success) return failed(new ToolError("invalid_params", "invalid tool parameters"));
+    if (context.signal.aborted)
+      return failed(new ToolError("tool_cancelled", "tool call cancelled"));
     let permissionSource = options.permissionSource ?? "policy";
     if (this.#permissions !== undefined) {
       if (options.permissionScope === undefined) throw new Error("permission scope required");
@@ -184,39 +210,59 @@ export class ToolInvoker {
           parsed.data,
           options.permissionScope,
           context.signal,
+          this.#permissionMode,
         );
         permissionSource = outcome.source;
         if (!outcome.allowed)
-          return this.#fail(
+          return failed(
             new ToolError("permission_denied", "tool permission denied"),
-            0,
-            [],
-            duration(),
             permissionSource,
           );
       } catch (error) {
         if (!(error instanceof ToolError)) throw error;
-        return this.#fail(error, 0, [], duration());
+        return failed(error);
       }
-      if (context.signal.aborted)
-        return this.#fail(
-          new ToolError("tool_cancelled", "tool call cancelled"),
-          0,
-          [],
-          duration(),
-          permissionSource,
-        );
     }
+    if (context.signal.aborted)
+      return failed(new ToolError("tool_cancelled", "tool call cancelled"), permissionSource);
+    return {
+      kind: "ready",
+      tool,
+      params: parsed.data,
+      context,
+      options,
+      permissionSource,
+      startedAt,
+    };
+  }
 
+  /** 执行已批准调用；超时从实际执行开始计时，取消后不再调用工具。 */
+  async executePrepared(prepared: PreparedToolInvocation): Promise<ToolInvocationResult> {
+    if (prepared.kind === "finished") return prepared.invocation;
+    const { tool, params, context, options, permissionSource, startedAt } = prepared;
+    const duration = (): number => Math.max(0, Math.floor(performance.now() - startedAt));
+    if (context.signal.aborted)
+      return this.#fail(
+        new ToolError("tool_cancelled", "tool call cancelled"),
+        0,
+        [],
+        duration(),
+        permissionSource,
+      );
     // 组合外部取消与内部超时，二者必须可区分。
     const controller = new AbortController();
     let timedOut = false;
     const onExternalAbort = (): void => controller.abort();
-    const timeoutMs = tool.timeoutMs?.(parsed.data) ?? this.#timeoutMs;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutMs);
+    // null 是显式无限等待，不能用 ?? 把它还原成默认超时。
+    const requestedTimeout = tool.timeoutMs?.(params);
+    const timeoutMs = requestedTimeout === undefined ? this.#timeoutMs : requestedTimeout;
+    const timer =
+      timeoutMs === null
+        ? undefined
+        : setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+          }, timeoutMs);
     if (context.signal.aborted) {
       controller.abort();
     } else {
@@ -229,12 +275,15 @@ export class ToolInvoker {
     try {
       for (let attempt = 1; attempt <= this.#maxAttempts; attempt++) {
         attempts = attempt;
-        const execution = Promise.resolve().then(() =>
-          tool.execute(parsed.data, {
+        const execution = Promise.resolve().then(() => {
+          // 并行批次可能在 Promise 排队后取消，调用副作用前再次检查。
+          if (controller.signal.aborted)
+            throw new ToolError("tool_cancelled", "tool call cancelled");
+          return tool.execute(params, {
             workspaceRoot: context.workspaceRoot,
             signal: controller.signal,
-          }),
-        );
+          });
+        });
 
         let output: ToolOutput;
         try {
@@ -310,7 +359,7 @@ export class ToolInvoker {
         permissionSource,
       );
     } finally {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
       context.signal.removeEventListener("abort", onExternalAbort);
     }
   }

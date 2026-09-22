@@ -377,3 +377,64 @@ describe("CLI compaction channel", () => {
     expect(listeners.size).toBe(0);
   });
 });
+
+test("/skill lists via typed RPC without agent.run and always closes the connection", async () => {
+  const methods: string[] = [];
+  let closed = false;
+  let stdout = "";
+  const connection = {
+    request: async (method: string, params: unknown) => {
+      methods.push(method);
+      expect(params).toEqual({ workspaceRoot: "/workspace" });
+      return {
+        result: {
+          skills: [{ name: "demo", description: "Demo", path: "/skills/demo/SKILL.md" }],
+          diagnostics: [],
+        },
+      };
+    },
+    close: () => {
+      closed = true;
+    },
+  } as unknown as NdjsonRpcConnection;
+  expect(
+    await runGoalCommand({
+      goal: "/skill",
+      workspaceRoot: "/workspace",
+      endpoint: { host: "127.0.0.1", port: 1 },
+      connect: async () => connection,
+      stdout: (text) => {
+        stdout += text;
+      },
+    }),
+  ).toBe(0);
+  expect(methods).toEqual(["skill.list"]);
+  expect(stdout).toContain("demo: Demo");
+  expect(closed).toBe(true);
+});
+
+test("CLI prints subagent identity and terminal summary on stderr", () => {
+  const reducer = new GoalEventReducer();
+  const childRunId = crypto.randomUUID();
+  expect(
+    reducer
+      .onEvent(event("subagent.started", { childRunId, name: "reviewer", background: true }, 1))
+      .stderr.join(" "),
+  ).toContain(`${childRunId} started in background`);
+  const finished = reducer.onEvent(
+    event(
+      "subagent.finished",
+      {
+        childRunId,
+        name: "reviewer",
+        background: true,
+        status: "failed",
+        summary: "failure \u001b[2J",
+      },
+      2,
+    ),
+  );
+  expect(finished.stderr.join(" ")).toContain("failed");
+  expect(finished.stderr.join(" ")).not.toContain("\u001b");
+  expect(finished.stdout).toBeUndefined();
+});

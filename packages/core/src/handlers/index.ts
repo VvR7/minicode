@@ -5,3 +5,4 @@ export * from "./ping-handler.ts";
 export * from "./permission-respond-handler.ts";
 export * from "./rpc-method-handler.ts";
 export * from "./session-handlers.ts";
+export * from "./skill-list-handler.ts";

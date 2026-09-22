@@ -255,3 +255,33 @@ describe("TuiModel", () => {
     });
   });
 });
+
+test("multiple TUI windows replay subagent summaries once without opening child chat", () => {
+  const childRunId = crypto.randomUUID();
+  const started = event("subagent.started", { childRunId, name: "reviewer", background: true }, 1);
+  const finished = event(
+    "subagent.finished",
+    {
+      childRunId,
+      name: "reviewer",
+      background: true,
+      status: "succeeded",
+      summary: "review complete",
+    },
+    2,
+  );
+  const windows = [new TuiModel(), new TuiModel()];
+  for (const model of windows) {
+    model.apply({ type: "session.attached", session: summary });
+    model.apply({ type: "run.event", event: started });
+    model.apply({ type: "run.event", event: finished });
+    model.apply({ type: "run.event", event: started });
+    model.apply({ type: "run.event", event: finished });
+    expect(
+      model.snapshot().lines.filter((line) => line.text.startsWith("[SUBAGENT]")),
+    ).toHaveLength(2);
+    expect(model.snapshot().lines.at(-1)?.text).toContain("review complete");
+    expect(model.snapshot().lines.at(-1)?.text).toContain(childRunId);
+  }
+  expect(windows[0]?.snapshot().lines).toEqual(windows[1]?.snapshot().lines);
+});

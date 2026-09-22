@@ -43,6 +43,9 @@ transcript。普通 `q` 是输入字符。
 
 ## 权限审批
 
+仅当 Core 使用 `MINICODE_PERMISSION_MODE=alwaysask` 时显示审批块；默认 bypass 模式及子 Agent
+不会产生人工审批请求。
+
 `PERMISSION` 内联块显示工具、风险类别和有界参数摘要。`↑/↓` 或 Tab 选择，Enter 提交；
 `1/y` 允许一次、`2/a` 始终允许、`3/n` 拒绝一次、`4/d` 始终拒绝。
 Always 仅作用于本 session 的同类风险；复合风险会禁用这两个选项。

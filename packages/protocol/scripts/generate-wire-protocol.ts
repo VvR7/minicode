@@ -15,12 +15,12 @@ import {
   JsonRpcNotificationEnvelopeSchema,
   JsonRpcRequestEnvelopeSchema,
   MAX_JSON_RPC_FRAME_BYTES,
+  PermissionRespondRequestSchema,
+  PermissionRespondSuccessResponseSchema,
   PingParamsSchema,
   PingRequestSchema,
   PingSuccessResponseSchema,
   PongResultSchema,
-  PermissionRespondRequestSchema,
-  PermissionRespondSuccessResponseSchema,
   SessionCompactRequestSchema,
   SessionCompactSuccessResponseSchema,
   SessionCreateRequestSchema,
@@ -37,6 +37,8 @@ import {
   SessionSubscribeRequestSchema,
   SessionSubscribeSuccessResponseSchema,
   SessionSummarySchema,
+  SkillListRequestSchema,
+  SkillListSuccessResponseSchema,
 } from "../src/index.ts";
 
 const outputUrl = new URL("../../../WIRE_PROTOCOL.md", import.meta.url);
@@ -59,6 +61,8 @@ export function renderWireProtocol(): string {
     schemaBlock("AgentCancelSuccessResponse", AgentCancelSuccessResponseSchema),
     schemaBlock("PermissionRespondRequest", PermissionRespondRequestSchema),
     schemaBlock("PermissionRespondSuccessResponse", PermissionRespondSuccessResponseSchema),
+    schemaBlock("SkillListRequest", SkillListRequestSchema),
+    schemaBlock("SkillListSuccessResponse", SkillListSuccessResponseSchema),
     schemaBlock("AgentEvent", AgentEventSchema),
     schemaBlock("EventSubscribeRequest", EventSubscribeRequestSchema),
     schemaBlock("EventSubscribeSuccessResponse", EventSubscribeSuccessResponseSchema),
@@ -153,6 +157,29 @@ export function renderWireProtocol(): string {
   compaction messages. Provider messages exclude this metadata.
 - Core implements persisted incremental checkpoints, automatic threshold/context-error compaction,
   and idle manual compaction. TUI exposes \`/compact [focus]\`; CLI reports automatic progress on stderr.
+
+## Stage5 extension contracts
+
+- \`skill.list\` defines a workspace-scoped catalog response with name, description, SKILL.md path,
+  and bounded diagnostics. Core discovers global MINICODE_HOME/skills and project .minicode/skills;
+  project metadata names override global names. Each run fixes the advertised catalog. CLI/TUI
+  \`/skill\` query this method without a model call; \`/skill <name> [arguments]\` preserves the raw
+  command and adds the fixed body and arguments to user content before context preflight.
+- Durable \`subagent.started\` / \`subagent.finished\` events belong to the parent session/run and carry
+  the isolated childRunId, profile name, background flag, and bounded terminal summary. Child task
+  events do not belong to the parent's task graph.
+- Permission summaries support MCP server/tool identity and a bounded, publisher-redacted parameter
+  preview. Requested/resolved events may carry childRunId without changing the parent run scope.
+  Legacy events without childRunId remain valid. MCP approval policy is implemented with MCP tools.
+- Core prepares a fixed system prompt/tool-schema snapshot before allocating turn/run IDs, then
+  reuses it for the provider, tracing, and compaction budget checks. Tools may export an original
+  JSON Schema while retaining local Zod validation.
+- Tools may declare serial/parallel execution mode (default parallel). All-parallel batches complete
+  argument validation and approval in request order before Promise.all execution; any serial tool
+  makes the whole batch sequential. Failed calls remain independent observations, and results keep
+  request order even when completion events arrive out of order. Infrastructure failure cancels and
+  drains the batch. An explicit null execution timeout disables only the tool timer, preserving
+  external cancellation and provider timeouts.
 
 ## Sessions
 

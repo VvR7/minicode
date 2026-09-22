@@ -36,5 +36,5 @@ export function formatPermissionBlock(
     const enabled = allowedChoices(permission).includes(decision);
     return `${enabled && selected === decision ? "▶" : " "} ${index + 1} ${PERMISSION_LABELS[decision]}${enabled ? "" : " (disabled)"}`;
   }).join("\n");
-  return `${header}\n${JSON.stringify(payload.summary, null, 2)}\n${payload.cacheable ? "Always applies to this risk category in this session only." : "Composite risk: always choices disabled."}\n${choices}\n${sending ? "Sending / awaiting Core resolution…" : "↑/↓ or Tab to select · Enter to send · 1–4 / y,a,n,d shortcuts · Ctrl+C cancel"}${error === undefined ? "" : `\nResponse error: ${JSON.stringify(error)}`}`;
+  return `${header}\n${JSON.stringify(payload.summary, null, 2)}\n${payload.cacheable ? (payload.summary.kind === "mcp" ? `Always applies to ${payload.name} in this session only.` : "Always applies to this risk category in this session only.") : "Composite risk: always choices disabled."}\n${choices}\n${sending ? "Sending / awaiting Core resolution…" : "↑/↓ or Tab to select · Enter to send · 1–4 / y,a,n,d shortcuts · Ctrl+C cancel"}${error === undefined ? "" : `\nResponse error: ${JSON.stringify(error)}`}`;
 }

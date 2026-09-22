@@ -18,6 +18,7 @@ export type WriteParams = z.infer<typeof WriteParamsSchema>;
 
 /** 原子创建或覆盖 UTF-8 文本文件，并按需创建父目录。 */
 export class WriteTool implements Tool<WriteParams> {
+  readonly executeMode = "serial" as const;
   readonly name = "write";
   readonly description =
     "Create or atomically overwrite a UTF-8 text file, creating parent directories.";

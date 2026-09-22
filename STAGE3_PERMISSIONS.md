@@ -37,10 +37,21 @@ runtime_error、rate_limited、cancelled。只重试显式瞬时运行时错误�
 
 ## Core 权限审批
 
+`MINICODE_PERMISSION_MODE` 在 Core 启动时解析，支持 `bypasspermission`（默认）和
+`alwaysask`。bypass 模式只跳过用户交互：固定 allow/deny 策略仍先执行，危险 Bash 继续拒绝，
+schema、路径及工具执行边界不变。alwaysask 使用以下完整审批生命周期。子 Agent 始终默认
+bypass，不继承主 Agent 的 alwaysask。
+
 Core 为整个 daemon 创建一个 `PermissionManager`，跨 turn 复用，同一 session 的
 always 决策仅保存在内存。独立 session 和 daemon 重启均不会继承该缓存。
 
-调用顺序为：注册表查找 → schema 校验 → 权限策略与缓存 → 用户审批（如需）→ 工具执行与重试。
+调用顺序为：注册表查找 → schema 校验 → 固定权限策略 → 模式判断与缓存 → 用户审批（如需）→ 工具执行与重试。
+
+Stage5 将工具批次的准备与执行分开：模型一次回复中的工具全部为 parallel（默认）时，
+先按请求顺序完成所有参数校验和审批，再并行执行通过的调用。只要包含一个 serial 工具，
+整批逐项完成校验、审批和执行。`write`、`edit`、`bash`、`task_create`、`task_update` 和
+`note_save` 为 serial；读取与查询工具默认 parallel。单项失败仍为独立 observation，结果按
+请求顺序配对，完成事件按实际完成顺序发布；取消后不启动新执行，基础设施失败取消并排空同批调用。
 审批等待不计入工具执行超时，也没有单独的审批超时。拒绝时尝试次数为 0，不重试。
 
 `read`、任务和笔记工具自动允许；`write`、`edit` 请求审批。`bash` 使用共用的固定

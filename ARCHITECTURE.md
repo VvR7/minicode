@@ -1,4 +1,4 @@
-# 架构与持久化（Stage2 / Stage3）
+# 架构与持久化（Stage2–Stage5）
 
 ## 进程与数据流
 
@@ -39,8 +39,8 @@ CoreApp 创建 daemon 共享 PermissionManager，AgentRunner 注入每轮 ToolIn
 有效响应先占位，持久化决定后才放行，重复响应返回 `already_resolved`。前端只有消费决策
 事件才更新 resolved 投影，不从 RPC `accepted` 推导已批准，也不拥有权限策略。
 
-read/task/note 默认允许，write/edit 请求审批；bash 固定危险规则优先于 always 缓存，
-简单白名单允许，其余请求审批。always 在 daemon 内存按 session + 单一风险类别保存，
+主 Agent 默认 `bypasspermission`，固定危险规则仍优先执行；`alwaysask` 下 read/task/note
+自动允许，write/edit 请求审批，bash 简单白名单允许、其余请求审批。always 在 daemon 内存按 session + 单一风险类别保存，
 不是对某一个文件／命令的授权；复合命令或多风险请求不可缓存，没有持久化策略文件。
 
 审批无超时、不占执行预算。read/write/edit 统一 10 秒，bash 默认／最大 120 秒，可传
@@ -119,6 +119,7 @@ LLM request/delta/response/error/cancelled。配置：
 | `MINICODE_TRACE_QUEUE_EVENTS` | `1024` | 有界内存队列，范围 16..65536 |
 | `MINICODE_TRACE_MAX_BYTES` | `33554432` | 单 run 文件上限，最小 1 MiB |
 | `MINICODE_TRACE_SHUTDOWN_MS` | `2000` | 停机刷盘等待，范围 100..30000 ms |
+| `MINICODE_PERMISSION_MODE` | `bypasspermission` | 主 Agent 权限模式：`bypasspermission` 或 `alwaysask` |
 
 `summary` 剥离 prompt、正文和工具输入输出；`full` 保留业务 payload。两者都递归屏蔽 API key、
 token、secret、password、authorization、cookie 与认证字符串，并限制单字段/单记录大小。队列
@@ -153,3 +154,20 @@ provider 仅接收 role/content。旧版无 compact 的日志仍按完整成功�
 SessionManager 负责执行权、不可容纳校验、journal 和独立会话压缩事件。SessionController 附着时
 从已成功消费的 session cursor 回放，避免只依靠 turn history 水位漏掉压缩进度。完整流程与配置
 见 [Stage4 上下文管理](STAGE4_CONTEXT.md)。
+
+
+## Stage5 扩展与子执行隔离
+
+父 run 的预检能力快照包含实际 Skills、规则与 MCP 工具 Schema，并复用于模型调用及压缩。
+MCP 连接由 Core 管理，按工作区隔离，配置和发现结果固定至 daemon 重启。外部工具进入
+标准参数校验、审批和批次调度，Always 仅缓存 session + 完整 MCP 工具名。
+
+子 Agent 由最新类型文件限定 system prompt 和完整工具白名单，拥有父目录下独立的
+childRunId、历史、任务、私有 notes、压缩、Trace 和事件审计，不创建主 session turn。
+子 Agent 始终默认 bypass，父流只发布生命周期摘要。后台 Registry 只属于一个父 run，查询验证归属，
+结果通过普通上下文恰好一次交付；父结束前等待并调用模型综合，失败或取消时排空子执行。
+重启只将未结束子记录标 interrupted，不恢复后台任务或审批。
+
+工具批次全为 parallel 时先顺序准备审批再并发执行，任何 serial 工具则整批串行；
+模型结果保留请求顺序，终态事件按完成顺序发布。完整配置、持久目录与验证说明见
+[Stage5 扩展能力](STAGE5_EXTENSIONS.md)。

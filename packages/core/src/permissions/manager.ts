@@ -6,6 +6,7 @@ import type {
 } from "@minicode/protocol";
 import type { EventBus } from "../events/event-bus.ts";
 import { ToolError } from "../tools/types.ts";
+import type { PermissionMode } from "../config.ts";
 import {
   evaluatePermission,
   permissionSummary,
@@ -39,13 +40,20 @@ export class PermissionManager {
     params: unknown,
     scope: PermissionScope,
     signal: AbortSignal,
+    mode: PermissionMode = "alwaysask",
   ): Promise<PermissionOutcome> {
     if (signal.aborted || this.#closed)
       throw new ToolError("tool_cancelled", "tool call cancelled");
     const policy = evaluatePermission(name, params);
     if (policy.decision !== "ask")
       return { allowed: policy.decision === "allow", source: "policy" };
-    const risk = policy.cacheable ? policy.riskCategories[0] : undefined;
+    // bypass 只省略人工审批；上面的固定 allow/deny 策略仍然优先执行。
+    if (mode === "bypasspermission") return { allowed: true, source: "policy" };
+    const risk = policy.cacheable
+      ? name.startsWith("mcp__")
+        ? name
+        : policy.riskCategories[0]
+      : undefined;
     const cached = risk === undefined ? undefined : this.#cache.get(scope.sessionId)?.get(risk);
     if (cached !== undefined) return { allowed: cached, source: "session_cache" };
 
@@ -96,6 +104,7 @@ export class PermissionManager {
             durable: true,
             type: "permission.resolved",
             payload: {
+              ...(scope.childRunId === undefined ? {} : { childRunId: scope.childRunId }),
               permissionRequestId: id,
               toolCallId: scope.toolCallId,
               name,
@@ -130,6 +139,7 @@ export class PermissionManager {
         durable: true,
         type: "permission.requested",
         payload: {
+          ...(scope.childRunId === undefined ? {} : { childRunId: scope.childRunId }),
           permissionRequestId: id,
           toolCallId: scope.toolCallId,
           name,

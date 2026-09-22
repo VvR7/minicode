@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { TraceRecordSchema } from "../../src/trace/types.ts";
 import { TraceWriter } from "../../src/trace/writer.ts";
 import { RUN_B, RUN_C, SESSION_A } from "../session/test-helpers.ts";
@@ -148,23 +148,33 @@ describe("TraceWriter", () => {
     expect(third.recordsWritten).toBe(first.recordsWritten);
   });
 
-  test("reports unflushed records when shutdown exceeds the deadline", async () => {
+  test("preserves queued records when the worker observes the deadline first", async () => {
     const storage = new MemoryTraceStorage();
-    storage.writeDelayMs = 5;
-    const writer = new TraceWriter(
-      SESSION_A,
-      RUN_B,
-      { ...fullConfig, shutdownMs: 1 },
-      storage,
-      "/run",
-    );
-    writer.start();
-    for (let index = 0; index < 50; index += 1) {
-      writer.enqueue(makeTraceRecord(index, {}, RUN_B));
+    let releaseOpen!: () => void;
+    storage.openGate = new Promise((resolve) => {
+      releaseOpen = resolve;
+    });
+    const writer = new TraceWriter(SESSION_A, RUN_B, fullConfig, storage, "/run");
+    let now = 1000;
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      writer.start();
+      for (let index = 0; index < 50; index += 1) {
+        writer.enqueue(makeTraceRecord(index, {}, RUN_B));
+      }
+      const stopping = writer.stop();
+      expect(writer.stop()).toBe(stopping);
+      // 只推进 worker 使用的时钟，真实 timeout 尚未触发，队列由 open gate 保持完整。
+      now += fullConfig.shutdownMs;
+      releaseOpen();
+      const report = await stopping;
+      expect(report.timedOut).toBe(true);
+      expect(report.pendingRecords).toBe(50);
+      expect(report.recordsWritten).toBe(0);
+      expect(await writer.stop()).toBe(report);
+    } finally {
+      clock.mockRestore();
     }
-    const report = await writer.stop();
-    expect(report.timedOut).toBe(true);
-    expect(report.pendingRecords).toBeGreaterThan(0);
   });
 
   test("returns within the deadline when open or write never settles", async () => {
@@ -187,6 +197,7 @@ describe("TraceWriter", () => {
       expect(performance.now() - started).toBeLessThan(150);
       expect(report.timedOut).toBe(true);
       expect(report.pendingRecords).toBe(1);
+      expect(await writer.stop()).toBe(report);
     }
   });
 

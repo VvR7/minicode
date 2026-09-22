@@ -37,6 +37,8 @@ describe("layered context files", () => {
     expect(prompt.indexOf("GLOBAL")).toBeLessThan(prompt.indexOf("PROJECT"));
     expect(prompt.indexOf("PROJECT")).toBeLessThan(prompt.indexOf("NOTES"));
     expect(prompt).toContain("Project context takes precedence");
-    expect(composeSystemPrompt("base", { global: "", project: "" }, " \n")).toBe("base");
+    const empty = composeSystemPrompt("base", { global: "", project: "" }, " \n");
+    expect(empty).toStartWith("base\n\n## available skills:\n(none)");
+    expect(empty).not.toContain("Session Notes");
   });
 });

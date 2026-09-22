@@ -318,6 +318,13 @@ export class TuiModel {
     }
   }
 
+  /** 添加本地目录等提示信息，不创建会话 turn。 */
+  addInfo(message: string): readonly LogMutation[] {
+    const mutations: LogMutation[] = [];
+    this.#append(mutations, "info", message);
+    return mutations;
+  }
+
   /** 添加明确的错误行。 */
   addError(message: string): readonly LogMutation[] {
     const mutations: LogMutation[] = [];
@@ -331,7 +338,11 @@ export class TuiModel {
     this.#knownTurns.add(turn.turnId);
     for (const message of turn.messages) {
       if (message.role === "user") {
-        const text = message.content
+        const visibleContent =
+          message.content[0]?.type === "text" && /^\/skill\s/.test(message.content[0].text)
+            ? message.content.slice(0, 1)
+            : message.content;
+        const text = visibleContent
           .filter((block) => block.type === "text")
           .map((block) => block.text)
           .join("\n");
@@ -427,6 +438,20 @@ export class TuiModel {
           mutations,
           event.payload.isError ? "tool-error" : "tool",
           `[TOOL] ${event.payload.isError ? "✗ failed" : "✓ completed"} ${event.payload.name}`,
+        );
+        break;
+      case "subagent.started":
+        this.#append(
+          mutations,
+          "info",
+          `[SUBAGENT] ${event.payload.name} ${event.payload.childRunId} started${event.payload.background ? " in background" : ""}`,
+        );
+        break;
+      case "subagent.finished":
+        this.#append(
+          mutations,
+          event.payload.status === "succeeded" ? "info" : "error",
+          `[SUBAGENT] ${event.payload.name} ${event.payload.childRunId} ${event.payload.status}: ${JSON.stringify(event.payload.summary)}`,
         );
         break;
       case "task.created":

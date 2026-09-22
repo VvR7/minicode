@@ -1,31 +1,42 @@
+import { expandSkillCommand } from "../skills/command.ts";
 import type {
   AgentCancelResult,
   AgentEvent,
   ClientMessageId,
-  SessionCompactResult,
   Environment,
   HistoryMessage,
   HistoryTurn,
   HistoryTurnReason,
   RunId,
+  SessionCompactResult,
   SessionGetHistoryResult,
   SessionListResult,
   SessionMode,
+  SessionId,
   SessionSendMessageResult,
   SessionSummary,
   TurnId,
 } from "@minicode/protocol";
+import {
+  type CompactionCheckpoint,
+  type CompactOptions,
+  type ContextEntry,
+  prepareCompaction,
+} from "../compact/index.ts";
 import type { EventBus } from "../events/event-bus.ts";
-import type { SessionEventBus } from "../events/session-event-bus.ts";
 import type { EventStore } from "../events/event-store.ts";
+import type { SessionEventBus } from "../events/session-event-bus.ts";
+import { LlmError } from "../llm/errors.ts";
 import type { LlmMessage, LlmUsage } from "../llm/types.ts";
-import type { AgentRunOutcome, AgentRunRequest } from "../run/runner.ts";
-import { buildRunSystemPrompt, runToolSchemas } from "../run/runner.ts";
 import type { RunCompletion } from "../run/completion.ts";
 import { toHistoryMessages } from "../run/completion.ts";
 import type { RunMetadataStore } from "../run/metadata.ts";
-import type { RunTraceRegistry } from "../trace/registry.ts";
+import type { AgentRunOutcome, AgentRunRequest } from "../run/runner.ts";
+import { buildRunSnapshot } from "../run/runner.ts";
+import type { RunSnapshot, RunSnapshotRequest } from "../run/snapshot.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
+import type { RunTraceRegistry } from "../trace/registry.ts";
+import { loadCompactionConfig } from "./compaction-config.ts";
 import {
   type ContextBudgetEstimator,
   defaultContextBudgetEstimator,
@@ -38,15 +49,6 @@ import {
   type SessionStore,
 } from "./session-store.ts";
 import type { SessionSnapshot } from "./types.ts";
-
-import {
-  prepareCompaction,
-  type CompactOptions,
-  type ContextEntry,
-  type CompactionCheckpoint,
-} from "../compact/index.ts";
-import { LlmError } from "../llm/errors.ts";
-import { loadCompactionConfig } from "./compaction-config.ts";
 
 const EMPTY_USAGE: LlmUsage = {
   inputTokens: 0,
@@ -61,7 +63,9 @@ export const DEFAULT_SESSION_SHUTDOWN_TIMEOUT_MS = 5_000;
 
 /** SessionManager 对 Runner 的最小依赖，便于隔离编排测试与替换 provider 实现。 */
 export interface SessionRunExecutor {
+  recoverSubagents?(sessionId: SessionId, parentRunId: RunId): Promise<void>;
   run(request: AgentRunRequest, signal: AbortSignal): Promise<AgentRunOutcome>;
+  prepareSnapshot?(request: RunSnapshotRequest): Promise<RunSnapshot>;
   compact?(
     options: CompactOptions,
   ): Promise<{ checkpoint: CompactionCheckpoint; entries: readonly ContextEntry[] } | undefined>;
@@ -105,11 +109,12 @@ interface ActiveExecution {
   readonly runId: RunId;
   readonly clientMessageId: ClientMessageId;
   readonly userMessage: string;
+  readonly userContent?: readonly import("../llm/types.ts").LlmContentPart[];
   readonly workspaceRoot: string;
   readonly history: readonly LlmMessage[];
   readonly contextEntries: readonly ContextEntry[];
   previousCheckpoint: CompactionCheckpoint | undefined;
-  readonly systemPrompt: string;
+  readonly snapshot: RunSnapshot;
   readonly trace: TraceRecorder;
   readonly controller: AbortController;
   readonly settled: Promise<void>;
@@ -164,6 +169,7 @@ export class SessionManager {
   #stopping = false;
   #recoveryFailed = false;
 
+  /** 保存编排依赖并开始恢复已有 session 的持久状态。 */
   constructor(options: SessionManagerOptions) {
     this.#store = options.store;
     this.#runner = options.runner;
@@ -304,15 +310,19 @@ export class SessionManager {
       const snapshot = prepared.value;
       const files = await this.#store.loadContextFiles(snapshot.meta.workspaceRoot);
       if (!files.ok) return this.#internal("failed to read CONTEXT.md");
-      const system = buildRunSystemPrompt(snapshot.notes, files.value);
+      const runSnapshot = await this.#prepareRunSnapshot({
+        workspaceRoot: snapshot.meta.workspaceRoot,
+        notes: snapshot.notes,
+        files: files.value,
+      });
       const entries = buildContextEntries(snapshot.turns, snapshot.compactions);
       const previous = latestCompaction(snapshot.turns, snapshot.compactions)?.checkpoint;
-      const result = await this.#compactEntries(sessionId, system, {
+      const result = await this.#compactEntries(sessionId, runSnapshot, {
         entries,
         reason: "manual",
         tokensBefore:
-          this.#estimator(system) +
-          this.#estimator(runToolSchemas()) +
+          this.#estimator(runSnapshot.systemPrompt) +
+          this.#estimator(runSnapshot.toolSchemas) +
           this.#estimator(entries.map(({ role, content }) => ({ role, content }))),
         signal: this.#manualControllers.get(sessionId)?.signal ?? AbortSignal.abort(),
         ...(focus === undefined ? {} : { focus }),
@@ -335,10 +345,17 @@ export class SessionManager {
     }
   }
 
+  /** 执行器可扩展能力目录；旧测试执行器仍使用内置能力的统一快照。 */
+  async #prepareRunSnapshot(request: RunSnapshotRequest): Promise<RunSnapshot> {
+    return this.#runner.prepareSnapshot === undefined
+      ? buildRunSnapshot(request.notes, request.files)
+      : this.#runner.prepareSnapshot(request);
+  }
+
   /** 生成、校验并落盘 checkpoint，再发布压缩完成事件；失败不安装新视图。 */
   async #compactEntries(
     sessionId: string,
-    system: string,
+    snapshot: RunSnapshot,
     options: CompactOptions,
     ownerRunId?: RunId,
   ) {
@@ -366,8 +383,8 @@ export class SessionManager {
       if (options.signal.aborted) throw new LlmError("aborted", "compaction cancelled");
       if (result === undefined) throw new LlmError("invalid_response", "compaction unavailable");
       const tokensAfter =
-        this.#estimator(system) +
-        this.#estimator(runToolSchemas()) +
+        this.#estimator(snapshot.systemPrompt) +
+        this.#estimator(snapshot.toolSchemas) +
         this.#estimator(result.entries.map(({ role, content }) => ({ role, content })));
       if (tokensAfter + budget.value.maxOutputTokens > budget.value.contextWindowTokens)
         throw new LlmError("context_limit_exceeded", "retained context cannot fit");
@@ -576,7 +593,14 @@ export class SessionManager {
     const history = buildContextMessages(snapshot.turns, snapshot.compactions);
     const files = await this.#store.loadContextFiles(snapshot.meta.workspaceRoot);
     if (!files.ok) return this.#internal("failed to read CONTEXT.md");
-    const systemPrompt = buildRunSystemPrompt(snapshot.notes, files.value);
+    const runSnapshot = await this.#prepareRunSnapshot({
+      workspaceRoot: snapshot.meta.workspaceRoot,
+      notes: snapshot.notes,
+      files: files.value,
+    });
+    const expanded = expandSkillCommand(content, runSnapshot.skillCatalog);
+    if (!expanded.ok)
+      return this.#failure("invalid_params", expanded.message, snapshot.meta.sessionId);
     const budgetConfig = loadContextBudgetConfig(this.#environment);
     if (!budgetConfig.ok) {
       return this.#internal("context budget configuration is invalid");
@@ -585,7 +609,9 @@ export class SessionManager {
     if (!compactionConfig.ok) return this.#internal("compaction configuration is invalid");
     // 固定提示词、工具定义与本轮提问不可压缩；历史在模型调用前按需处理。
     const fixedTokens =
-      this.#estimator(systemPrompt) + this.#estimator(runToolSchemas()) + this.#estimator(content);
+      this.#estimator(runSnapshot.systemPrompt) +
+      this.#estimator(runSnapshot.toolSchemas) +
+      this.#estimator(expanded.userContent ?? content);
     if (fixedTokens + budgetConfig.value.maxOutputTokens > budgetConfig.value.contextWindowTokens) {
       return this.#failure(
         "context_limit_exceeded",
@@ -627,11 +653,12 @@ export class SessionManager {
       runId,
       clientMessageId,
       userMessage: content,
+      ...(expanded.userContent === undefined ? {} : { userContent: expanded.userContent }),
       workspaceRoot: snapshot.meta.workspaceRoot,
       history,
       contextEntries: buildContextEntries(snapshot.turns, snapshot.compactions),
       previousCheckpoint: latestCompaction(snapshot.turns, snapshot.compactions)?.checkpoint,
-      systemPrompt,
+      snapshot: runSnapshot,
       trace: this.#traces.create(snapshot.meta.sessionId, runId),
       controller: new AbortController(),
       settled: deferred.promise,
@@ -750,13 +777,14 @@ export class SessionManager {
           sessionId: execution.sessionId,
           runId: execution.runId,
           goal: execution.userMessage,
+          ...(execution.userContent === undefined ? {} : { userContent: execution.userContent }),
           workspaceRoot: execution.workspaceRoot,
           history: execution.history,
           contextEntries: execution.contextEntries,
           compact: async (entries, tokensBefore, reason, signal) => {
             const result = await this.#compactEntries(
               execution.sessionId,
-              execution.systemPrompt,
+              execution.snapshot,
               {
                 entries,
                 tokensBefore,
@@ -771,7 +799,8 @@ export class SessionManager {
             if (result !== undefined) execution.previousCheckpoint = result.checkpoint;
             return result?.entries;
           },
-          systemPrompt: execution.systemPrompt,
+          systemPrompt: execution.snapshot.systemPrompt,
+          snapshot: execution.snapshot,
           trace: execution.trace,
         };
         outcome = await this.#runner.run(request, execution.controller.signal);
@@ -960,6 +989,7 @@ export class SessionManager {
       return;
     }
     for (const turn of snapshot.turns) {
+      await this.#runner.recoverSubagents?.(snapshot.meta.sessionId, turn.runId);
       const journal = await this.#eventStore.read(snapshot.meta.sessionId, turn.runId);
       if (!journal.ok) {
         this.#corruptedSessions.add(snapshot.meta.sessionId);

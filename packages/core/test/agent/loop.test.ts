@@ -202,7 +202,7 @@ describe("AgentLoop", () => {
     }
   });
 
-  test("executes multiple tool calls sequentially and merges results into one user message", async () => {
+  test("executes multiple tool calls and merges results in request order into one user message", async () => {
     const workspace = await createTempWorkspace();
     try {
       await writeFile(join(workspace, "a.txt"), "AAA\n");

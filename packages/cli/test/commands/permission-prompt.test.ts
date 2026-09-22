@@ -188,3 +188,33 @@ describe("ApprovalQueue", () => {
     expect(prompts).toHaveLength(2);
   });
 });
+
+test("MCP terminal approval displays full tool scope and redacted summary", async () => {
+  const input = new PassThrough();
+  const output = new PassThrough();
+  let ui = "";
+  output.on("data", (chunk) => {
+    ui += chunk.toString();
+  });
+  const request = {
+    ...permissionRequest,
+    payload: {
+      ...permissionRequest.payload,
+      name: "mcp__demo__search",
+      riskCategories: ["mcp" as const],
+      summary: {
+        kind: "mcp" as const,
+        server: "demo",
+        tool: "search",
+        paramsPreview: '{"token":"[REDACTED]"}',
+      },
+    },
+  };
+  const pending = promptPermission(request, new AbortController().signal, input, output);
+  input.write("2\n");
+  expect(await pending).toBe("always_allow");
+  expect(ui).toContain("approval scope: mcp__demo__search");
+  expect(ui).toContain("[REDACTED]");
+  input.destroy();
+  output.destroy();
+});

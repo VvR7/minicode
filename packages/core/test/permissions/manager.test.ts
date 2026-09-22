@@ -40,6 +40,30 @@ async function requestId(events: AgentEvent[], count = 1): Promise<string> {
 }
 
 describe("PermissionManager", () => {
+  test("bypasspermission skips prompts but keeps forced policy decisions", async () => {
+    const f = setup();
+    const signal = new AbortController().signal;
+    expect(
+      await f.manager.check(
+        "bash",
+        { command: "echo allowed" },
+        { ...scope, toolCallId: "bypass" },
+        signal,
+        "bypasspermission",
+      ),
+    ).toEqual({ allowed: true, source: "policy" });
+    expect(
+      await f.manager.check(
+        "bash",
+        { command: "git reset --hard" },
+        { ...scope, toolCallId: "denied" },
+        signal,
+        "bypasspermission",
+      ),
+    ).toEqual({ allowed: false, source: "policy" });
+    expect(f.events.some((event) => event.type === "permission.requested")).toBe(false);
+  });
+
   test.each(["always_allow", "always_deny"] as const)(
     "%s caches only the same session and risk",
     async (decision) => {

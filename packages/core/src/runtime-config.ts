@@ -46,6 +46,10 @@ export const RUNTIME_CONFIG = {
     compactionReserveTokens: 16_384,
     /** 自动压缩后默认保留的近期上下文 token 数。 */
     compactionKeepRecentTokens: 20_000,
+    /** 一次压缩允许重新生成摘要的总次数。 */
+    compactionSummaryAttempts: 2,
+    /** 每次摘要生成内部只发起一次 provider 请求，由压缩层统一决定重试。 */
+    compactionProviderMaxAttempts: 1,
   },
   tool: {
     /** 单个工具结果进入模型上下文前的最大字节数。 */

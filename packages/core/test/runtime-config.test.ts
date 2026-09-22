@@ -20,5 +20,7 @@ test("runtime config is the source of agent and tool compatibility defaults", ()
   expect(DEFAULT_TOOL_TIMEOUT_MS).toBe(RUNTIME_CONFIG.tool.timeoutMs);
   expect(DEFAULT_TOOL_MAX_ATTEMPTS).toBe(RUNTIME_CONFIG.tool.maxAttempts);
   expect(RUNTIME_CONFIG.context.compactionReserveTokens).toBe(16_384);
+  expect(RUNTIME_CONFIG.context.compactionSummaryAttempts).toBe(2);
+  expect(RUNTIME_CONFIG.context.compactionProviderMaxAttempts).toBe(1);
   expect(RUNTIME_CONFIG.mcp.requestTimeoutMs).toBe(10_000);
 });

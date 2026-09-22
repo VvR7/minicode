@@ -469,7 +469,8 @@ export class AnthropicAdapter implements LlmProvider {
           }
 
           const backoffIndex = Math.min(attempt - 1, this.#backoffDelaysMs.length - 1);
-          const delayMs = this.#backoffDelaysMs[backoffIndex] ?? 1000;
+          const delayMs =
+            this.#backoffDelaysMs[backoffIndex] ?? RUNTIME_CONFIG.llm.retryBackoffMs.at(-1) ?? 0;
           yield {
             type: "retrying",
             attempt: attempt + 1,

@@ -182,7 +182,7 @@ export class Compactor {
           signal.aborted ||
           (error instanceof LlmError &&
             (error.code === "aborted" || error.code === "context_limit_exceeded")) ||
-          attempt === 1
+          attempt === RUNTIME_CONFIG.context.compactionSummaryAttempts - 1
         )
           throw error;
       }

@@ -35,7 +35,7 @@ export class EditTool implements Tool<EditParams> {
         ? text.split(params.oldText).join(params.newText)
         : text.replace(params.oldText, () => params.newText);
     if (new TextEncoder().encode(content).byteLength > MAX_WRITE_BYTES) {
-      throw new ToolError("invalid_params", "edited content exceeds 1 MiB");
+      throw new ToolError("invalid_params", `edited content exceeds ${MAX_WRITE_BYTES} bytes`);
     }
     return this.#writer.execute({ path: target, content }, context);
   }

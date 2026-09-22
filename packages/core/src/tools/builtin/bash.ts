@@ -4,11 +4,12 @@ import { z } from "zod";
 import { classifyBashCommand } from "../bash-policy.ts";
 import { ToolError, type Tool, type ToolExecutionContext, type ToolOutput } from "../types.ts";
 
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "../output-budget.ts";
+import { DEFAULT_MAX_LINES, truncateTail } from "../output-budget.ts";
+import { RUNTIME_CONFIG } from "../../runtime-config.ts";
 
-const MAX_COMMAND_CHARS = 8 * 1024;
-const MAX_BASH_OUTPUT_BYTES = DEFAULT_MAX_BYTES;
-const DEFAULT_BASH_TIMEOUT_SECONDS = 120;
+const MAX_COMMAND_CHARS = RUNTIME_CONFIG.tool.bashCommandMaxChars;
+const MAX_BASH_OUTPUT_BYTES = RUNTIME_CONFIG.tool.outputMaxBytes;
+const DEFAULT_BASH_TIMEOUT_SECONDS = RUNTIME_CONFIG.tool.bashTimeoutSeconds;
 
 export const BashParamsSchema = z.strictObject({
   command: z.string().min(1).max(MAX_COMMAND_CHARS),
@@ -21,7 +22,7 @@ export class BashTool implements Tool<BashParams> {
   readonly executeMode = "serial" as const;
   readonly name = "bash";
   readonly description =
-    "Run a command with /bin/bash -lc. timeout is 1..120 seconds and defaults to 120.";
+    `Run a command with /bin/bash -lc. timeout is 1..${DEFAULT_BASH_TIMEOUT_SECONDS} seconds and defaults to ${DEFAULT_BASH_TIMEOUT_SECONDS}.`;
   readonly inputSchema = BashParamsSchema;
 
   /** 按调用参数返回 Bash 专用超时，供 ToolInvoker 统一控制。 */

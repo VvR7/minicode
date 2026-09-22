@@ -17,7 +17,7 @@ export type ReadParams = z.infer<typeof ReadParamsSchema>;
 export class ReadTool implements Tool<ReadParams> {
   readonly name = "read";
   readonly description =
-    "Read UTF-8 text lines from a path. offset is 1-based and limit defaults to 2000 lines.";
+    `Read UTF-8 text lines from a path. offset is 1-based and limit defaults to ${DEFAULT_READ_LIMIT} lines.`;
   readonly inputSchema = ReadParamsSchema;
 
   /** 读取指定行窗口；绝对路径和外部符号链接可用，但显式 `..` 会被拒绝。 */

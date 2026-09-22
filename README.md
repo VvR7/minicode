@@ -212,7 +212,7 @@ allowed_tools = ["read"]
 max_steps = 30
 ```
 
-前三个字段必填，`max_steps` 可选且必须是 1–100 的整数，省略时为 20；内置 `executor` 为 40。`allowed_tools = []` 表示无工具。白名单使用完整工具名称（包括 `mcp__<server>__<tool>`），未知工具或嵌套委派工具会被拒绝。类型使用父 Agent 的模型。
+前三个字段必填，`max_steps` 可选且必须是 1–50 的整数，省略时为 50。`allowed_tools = []` 表示无工具。白名单使用完整工具名称（包括 `mcp__<server>__<tool>`），未知工具或嵌套委派工具会被拒绝。类型使用父 Agent 的模型。主 Agent 单次 run 的上限为 200 步；Core 的 Agent、LLM、工具与 MCP 执行超参数集中在 `packages/core/src/runtime-config.ts`。
 
 MCP 配置可写入 `~/.minicode/config.toml`（或 `MINICODE_HOME/config.toml`）及项目的 `.minicode/config.toml`。项目同名服务器覆盖全局配置；全局配置在 Core 启动时固定，项目配置在首次使用工作区时固定，修改后需重启 Core。
 

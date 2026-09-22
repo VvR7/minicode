@@ -12,13 +12,14 @@ import type {
   LlmToolCall,
 } from "./types.ts";
 import { LlmFinishReasonSchema } from "./types.ts";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 
 /** Anthropic Messages API 版本头。 */
 export const ANTHROPIC_VERSION = "2023-06-01" as const;
-export const DEFAULT_MAX_TOKENS = 8192;
-export const DEFAULT_TIMEOUT_MS = 120_000;
-export const DEFAULT_MAX_ATTEMPTS = 3;
-const RETRY_BACKOFF_MS = [1000, 2000] as const;
+export const DEFAULT_MAX_TOKENS = RUNTIME_CONFIG.llm.maxOutputTokens;
+export const DEFAULT_TIMEOUT_MS = RUNTIME_CONFIG.llm.timeoutMs;
+export const DEFAULT_MAX_ATTEMPTS = RUNTIME_CONFIG.llm.maxAttempts;
+const RETRY_BACKOFF_MS = RUNTIME_CONFIG.llm.retryBackoffMs;
 
 /** 可注入的 HTTP 传输，生产用 fetch，测试注入 mock。 */
 export type FetchLike = (input: string, init: RequestInit) => Promise<Response>;
@@ -56,7 +57,7 @@ function isContextError(type: string | undefined, message: string | undefined): 
 async function rejectedResponseError(response: Response): Promise<LlmError> {
   const reader = response.body?.getReader();
   if (reader === undefined) return httpError(response.status);
-  const limit = 8 * 1024;
+  const limit = RUNTIME_CONFIG.llm.errorBodyMaxBytes;
   const chunks: Uint8Array[] = [];
   let bytes = 0;
   try {

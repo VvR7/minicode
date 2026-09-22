@@ -40,8 +40,8 @@ test("builtin read-only planning/review and independent executor permissions are
   expect(catalog.profiles.find((p) => p.name === "executor")?.allowedTools).toContain(
     "task_create",
   );
-  expect(catalog.profiles.find((p) => p.name === "executor")?.maxSteps).toBe(40);
-  expect(catalog.profiles.find((p) => p.name === "planner")?.maxSteps).toBe(20);
+  expect(catalog.profiles.find((p) => p.name === "executor")?.maxSteps).toBe(50);
+  expect(catalog.profiles.find((p) => p.name === "planner")?.maxSteps).toBe(50);
   expect(runToolSchemas().find((t) => t.name === "list_subagent")?.description).toContain(
     "spawn_agent",
   );
@@ -70,11 +70,11 @@ test("project filenames override builtins and each list/spawn lookup refreshes",
   expect(result.content).not.toContain("custom prompt");
 });
 
-test("project profiles accept bounded max_steps and default to twenty", async () => {
+test("project profiles accept bounded max_steps and default to fifty", async () => {
   const root = await fixture();
   await profile(root, "default", document("default"));
   await profile(root, "extended", `${document("extended")}\nmax_steps=37`);
-  expect((await loadSubagentProfile(root, "default")).maxSteps).toBe(20);
+  expect((await loadSubagentProfile(root, "default")).maxSteps).toBe(50);
   expect((await loadSubagentProfile(root, "extended")).maxSteps).toBe(37);
 });
 
@@ -85,7 +85,7 @@ test("missing required fields and invalid overrides diagnose without falling bac
   await profile(root, "model", `${document("unsupported model")}\nmodel="another-model"`);
   await profile(root, "zero", `${document("zero")}\nmax_steps=0`);
   await profile(root, "fraction", `${document("fraction")}\nmax_steps=2.5`);
-  await profile(root, "excessive", `${document("excessive")}\nmax_steps=101`);
+  await profile(root, "excessive", `${document("excessive")}\nmax_steps=51`);
   const catalog = await listSubagents(root);
   expect(catalog.diagnostics).toHaveLength(6);
   expect(catalog.profiles.find((p) => p.name === "reviewer")).toBeUndefined();

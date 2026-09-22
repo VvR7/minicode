@@ -3,6 +3,7 @@ export * from "./permissions/manager.ts";
 export * from "./permissions/policy.ts";
 export * from "./agent/index.ts";
 export * from "./config.ts";
+export * from "./runtime-config.ts";
 export * from "./events/index.ts";
 export * from "./handlers/index.ts";
 export * from "./llm/index.ts";

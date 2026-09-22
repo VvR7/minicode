@@ -1,11 +1,12 @@
 import { z } from "zod";
 import type { Environment } from "@minicode/protocol";
 import { LlmError } from "../llm/errors.ts";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 import type { ContextBudgetConfig } from "./context-budget.ts";
 
 /** 自动压缩的默认参数；关闭自动压缩仍校验手动压缩所需预算。 */
-export const DEFAULT_RESERVE_TOKENS = 16384;
-export const DEFAULT_KEEP_RECENT_TOKENS = 20000;
+export const DEFAULT_RESERVE_TOKENS = RUNTIME_CONFIG.context.compactionReserveTokens;
+export const DEFAULT_KEEP_RECENT_TOKENS = RUNTIME_CONFIG.context.compactionKeepRecentTokens;
 export const CompactionConfigSchema = z.strictObject({
   enabled: z.boolean(),
   reserveTokens: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),

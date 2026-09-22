@@ -4,6 +4,7 @@ import type { ExtensionDiagnostic } from "@minicode/protocol";
 import { z } from "zod";
 import type { ToolRegistry } from "../tools/registry.ts";
 import { ToolError, type Tool } from "../tools/types.ts";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 import planner from "./builtin/planner.toml";
 import reviewer from "./builtin/reviewer.toml";
 import executor from "./builtin/executor.toml";
@@ -12,7 +13,7 @@ const AgentSettingsSchema = z.strictObject({
   description: z.string().trim().min(1).max(1024),
   system_prompt: z.string().trim().min(1),
   allowed_tools: z.array(z.string().min(1)),
-  max_steps: z.number().int().min(1).max(100).optional(),
+  max_steps: z.number().int().min(1).max(RUNTIME_CONFIG.subagent.maxConfiguredSteps).optional(),
 });
 const DocumentSchema = z.strictObject({ agent: AgentSettingsSchema });
 export interface SubagentProfile {
@@ -40,7 +41,7 @@ function parseProfile(name: string, document: unknown): SubagentProfile {
     description: agent.description,
     systemPrompt: agent.system_prompt,
     allowedTools: agent.allowed_tools,
-    maxSteps: agent.max_steps ?? 20,
+    maxSteps: agent.max_steps ?? RUNTIME_CONFIG.subagent.maxSteps,
   };
 }
 const BUILTINS = [
@@ -81,8 +82,7 @@ export async function listSubagents(workspaceRoot: string): Promise<SubagentCata
       diagnostics.push({
         path,
         code: "invalid_agent_profile",
-        message:
-          "子 Agent 类型需要有效的 description、system_prompt、allowed_tools 和可选 max_steps（1-100）",
+        message: `子 Agent 类型需要有效的 description、system_prompt、allowed_tools 和可选 max_steps（1-${RUNTIME_CONFIG.subagent.maxConfiguredSteps}）`,
       });
     }
   }

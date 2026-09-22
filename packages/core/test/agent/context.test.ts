@@ -28,8 +28,9 @@ describe("ExecutionContext", () => {
     });
   });
 
-  test("defaults maxSteps to 20 and honors overrides", () => {
+  test("defaults main maxSteps to 200 and honors overrides", () => {
     expect(makeContext().maxSteps).toBe(DEFAULT_MAX_STEPS);
+    expect(DEFAULT_MAX_STEPS).toBe(200);
     expect(makeContext({ maxSteps: 3 }).maxSteps).toBe(3);
   });
 

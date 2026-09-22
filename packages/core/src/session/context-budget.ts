@@ -1,13 +1,14 @@
 import { DEFAULT_LLM_CONTEXT_WINDOW_TOKENS, type Environment } from "@minicode/protocol";
 import { LlmError } from "../llm/errors.ts";
 import type { LlmMessage, LlmToolSchema } from "../llm/types.ts";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 
 /** 安全预算比例：只使用 context window 的 90%，为模型输出与估算误差留余量。 */
-export const CONTEXT_SAFE_RATIO = 0.9;
+export const CONTEXT_SAFE_RATIO = RUNTIME_CONFIG.context.safeRatio;
 /** LLM_CONTEXT_WINDOW_TOKENS 的兼容默认值。 */
 export const DEFAULT_CONTEXT_WINDOW_TOKENS = DEFAULT_LLM_CONTEXT_WINDOW_TOKENS;
 /** LLM_MAX_OUTPUT_TOKENS 的默认值。 */
-export const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
+export const DEFAULT_MAX_OUTPUT_TOKENS = RUNTIME_CONFIG.llm.maxOutputTokens;
 
 /** 参与一次请求的上下文预算配置。 */
 export interface ContextBudgetConfig {

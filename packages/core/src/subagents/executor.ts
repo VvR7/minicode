@@ -14,6 +14,7 @@ import { ToolError, type ToolOutput } from "../tools/types.ts";
 import { loadTraceConfig } from "../trace/config.ts";
 import { TraceRecorder } from "../trace/recorder.ts";
 import { nodeTraceStorage } from "../trace/storage.ts";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 import { allowedSubagentTools, loadSubagentProfile } from "./profiles.ts";
 import type { SpawnAgentParams } from "./spawn-tool.ts";
 
@@ -220,7 +221,7 @@ export class SubagentExecutor {
         payload: RunFinishedPayloadSchema.parse({
           status: completion.status,
           reason: completion.reason,
-          finalText: completion.finalText.slice(0, 256 * 1024),
+          finalText: completion.finalText.slice(0, RUNTIME_CONFIG.subagent.finalTextMaxChars),
           steps: completion.steps,
           usage: completion.usage,
           ...(completion.error === undefined ? {} : { error: completion.error }),
@@ -241,7 +242,10 @@ export class SubagentExecutor {
             name: profile.name,
             background: params.background ?? false,
             status: state.status as "succeeded" | "failed" | "cancelled",
-            summary: (completion?.finalText || `subagent ${state.status}`).slice(0, 4096),
+            summary: (completion?.finalText || `subagent ${state.status}`).slice(
+              0,
+              RUNTIME_CONFIG.subagent.summaryMaxChars,
+            ),
             ...(completion?.error === undefined
               ? {}
               : { errorCode: completion.error.code.slice(0, 128) }),
@@ -269,7 +273,10 @@ export class SubagentExecutor {
             ? { errorCode: "internal_error" }
             : {}),
       steps: matchedCompletion?.steps ?? 0,
-      content: (completion?.finalText || `subagent ${status}`).slice(0, 256 * 1024 - 2048),
+      content: (completion?.finalText || `subagent ${status}`).slice(
+        0,
+        RUNTIME_CONFIG.subagent.resultContentMaxChars,
+      ),
     };
   }
 

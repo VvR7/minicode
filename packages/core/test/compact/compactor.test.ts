@@ -10,6 +10,7 @@ import type { ContextEntry, CompactionCheckpoint } from "../../src/compact/types
 import { ContextEntrySchema, CompactionCheckpointSchema } from "../../src/compact/types.ts";
 import { FakeProvider, textResponse, RUN_A, RUN_B, usage } from "../agent/test-helpers.ts";
 import { LlmError } from "../../src/llm/errors.ts";
+import { RUNTIME_CONFIG } from "../../src/runtime-config.ts";
 const config = { enabled: true, reserveTokens: 100, keepRecentTokens: 20 };
 const signal = new AbortController().signal;
 function entry(
@@ -154,13 +155,13 @@ describe("compaction generation", () => {
     expect(
       (await new Compactor(provider, config, 500).compact(options(entries)))?.checkpoint.kind,
     ).toBe("summary");
-    expect(provider.calls).toHaveLength(2);
+    expect(provider.calls).toHaveLength(RUNTIME_CONFIG.context.compactionSummaryAttempts);
     const failed = new FakeProvider([
       { response: textResponse("partial", { finishReason: "max_tokens" }) },
       { response: textResponse("") },
     ]);
     await expect(new Compactor(failed, config, 500).compact(options(entries))).rejects.toThrow();
-    expect(failed.calls).toHaveLength(2);
+    expect(failed.calls).toHaveLength(RUNTIME_CONFIG.context.compactionSummaryAttempts);
     expect(JSON.stringify(entries)).toBe(saved);
   });
   test("summary overflow immediately produces explicit fallback with previous summary and user intent", async () => {

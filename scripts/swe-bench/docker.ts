@@ -1,6 +1,11 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BENCHMARK_LABEL, BENCHMARK_LABEL_VALUE } from "./constants.ts";
+import {
+  BENCHMARK_LABEL,
+  BENCHMARK_LABEL_VALUE,
+  cacheDirectory,
+  usesHostProxy,
+} from "./constants.ts";
 import { runCommand, type CommandResult } from "./process.ts";
 import type { CleanupResult, RunState } from "./types.ts";
 
@@ -15,6 +20,30 @@ export class DockerController {
 
   /** 显式 pull 当前唯一 task image。 */
   async pull(image: string, timeoutMs: number): Promise<void> {
+    const crane = join(cacheDirectory(this.#repositoryRoot), "bin", "crane");
+    if (usesHostProxy() && (await Bun.file(crane).exists())) {
+      const result = await runCommand(
+        [
+          "/bin/bash",
+          "-o",
+          "pipefail",
+          "-c",
+          '"$1" pull --platform linux/amd64 "$2" /dev/stdout | docker load',
+          "minicode-proxy-pull",
+          crane,
+          image,
+        ],
+        { timeoutMs },
+      );
+      if (result.timedOut) throw new Error(`proxy-aware image pull timed out: ${image}`);
+      if (result.exitCode !== 0) {
+        throw new Error(`proxy-aware image pull failed: ${result.stderr}`);
+      }
+      if (!(await this.imageExists(image))) {
+        throw new Error(`proxy-aware image pull did not import the expected reference: ${image}`);
+      }
+      return;
+    }
     const result = await runCommand(["docker", "pull", image], { timeoutMs });
     if (result.timedOut) throw new Error(`image pull timed out: ${image}`);
     if (result.exitCode !== 0) throw new Error(`image pull failed: ${result.stderr}`);

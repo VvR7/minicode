@@ -200,6 +200,9 @@ bun run swe-bench --resume
 默认 Agent、pull、startup、evaluation 超时分别为 30 分钟、30 分钟、2 分钟、30 分钟。
 可使用 `--agent-timeout-minutes`、`--pull-timeout-minutes`、
 `--startup-timeout-seconds`、`--evaluation-timeout-minutes` 覆盖。
+若宿主设置了 HTTP/HTTPS proxy，runner 会使用固定版本、校验 SHA-256 的 `crane` 通过
+该代理流式 pull 并直接交给 `docker load`，避免 Docker daemon 未继承代理时卡在 GHCR，
+也避免在 WSL 磁盘中额外落一个巨大 image tar。
 
 ## 文档
 

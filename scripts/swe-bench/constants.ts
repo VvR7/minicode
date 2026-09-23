@@ -15,6 +15,16 @@ export const DEFAULT_STARTUP_TIMEOUT_MS = 2 * 60 * 1000;
 export const DEFAULT_EVALUATION_TIMEOUT_MS = 30 * 60 * 1000;
 export const BENCHMARK_MAX_STEPS = 1000;
 export const BENCHMARK_CONTEXT_TOKENS = 1_000_000;
+export const CRANE_VERSION = "v0.22.1";
+export const CRANE_LINUX_X86_64_SHA256 =
+  "0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0";
+
+/** 判断宿主是否显式配置了常见 HTTP(S) 代理环境变量。 */
+export function usesHostProxy(): boolean {
+  return ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"].some((name) =>
+    Boolean(Bun.env[name]),
+  );
+}
 
 /** 返回仓库内固定任务数据目录。 */
 export function taskDirectory(repositoryRoot: string): string {

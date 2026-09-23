@@ -5,10 +5,13 @@ import type { ArtifactStore } from "./artifact-store.ts";
 import {
   BENCHMARK_CONTEXT_TOKENS,
   BENCHMARK_MAX_STEPS,
+  CRANE_LINUX_X86_64_SHA256,
+  CRANE_VERSION,
   DATASET_REVISION,
   SWE_BENCH_COMMIT,
   cacheDirectory,
   imageForTask,
+  usesHostProxy,
 } from "./constants.ts";
 import { DockerController } from "./docker.ts";
 import { OfficialHarness } from "./official-harness.ts";
@@ -77,6 +80,7 @@ export class SweBenchRunner {
     }
     const directory = join(cacheDirectory(this.#repositoryRoot), "bin");
     await mkdir(directory, { recursive: true });
+    await this.#prepareProxyPullTool(directory);
     const core = join(directory, "mc-core");
     const cli = join(directory, "mc");
     for (const [entry, output] of [
@@ -99,6 +103,31 @@ export class SweBenchRunner {
       if (result.exitCode !== 0) throw new Error(`standalone build failed: ${result.stderr}`);
     }
     this.#binaries = { core, cli };
+  }
+
+  /** 在宿主使用代理而 Docker daemon 未继承代理时准备固定校验和的 crane。 */
+  async #prepareProxyPullTool(directory: string): Promise<void> {
+    if (!usesHostProxy()) return;
+    const crane = join(directory, "crane");
+    if (await Bun.file(crane).exists()) return;
+    const archive = join(directory, `go-containerregistry-${CRANE_VERSION}.tar.gz`);
+    const url = `https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz`;
+    const download = await runCommand(["curl", "-fL", url, "-o", archive], {
+      timeoutMs: this.#options.startupTimeoutMs,
+    });
+    if (download.exitCode !== 0) throw new Error(`failed to download crane: ${download.stderr}`);
+    const digest = await runCommand(["sha256sum", archive], {
+      timeoutMs: this.#options.startupTimeoutMs,
+    });
+    if (digest.exitCode !== 0 || digest.stdout.split(/\s+/)[0] !== CRANE_LINUX_X86_64_SHA256) {
+      await Bun.file(archive).delete();
+      throw new Error("crane release checksum mismatch");
+    }
+    const extract = await runCommand(["tar", "-xzf", archive, "-C", directory, "crane"], {
+      timeoutMs: this.#options.startupTimeoutMs,
+    });
+    await Bun.file(archive).delete();
+    if (extract.exitCode !== 0) throw new Error(`failed to extract crane: ${extract.stderr}`);
   }
 
   /** 执行单题，并确保所有退出路径最终清理两个容器和 image。 */

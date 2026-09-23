@@ -73,6 +73,7 @@ bun run mc --goal "Read README.md and summarize it"
 Core 默认监听 `127.0.0.1:7437`。可通过 `.env` 中的 `MINICODE_CORE_HOST` 和
 `MINICODE_CORE_PORT` 修改 loopback 地址；当前不允许监听非本机地址。
 `MINICODE_PERMISSION_MODE` 可设为 `bypasspermission`（默认）或 `alwaysask`，在 Core 启动时固定。
+`MINICODE_MAX_STEPS` 可设置主 Agent 单次 run 的正整数步骤上限，默认 200。
 子 Agent 始终默认 bypass，不继承主 Agent 的 `alwaysask`。
 持久化数据默认写入 `~/.minicode`，可通过绝对路径 `MINICODE_HOME` 覆盖。模型上下文预算由
 `LLM_CONTEXT_WINDOW_TOKENS` 和 `LLM_MAX_OUTPUT_TOKENS` 控制，省略时分别使用 200000 和 8192；
@@ -172,6 +173,33 @@ LCOV，并要求整体行覆盖率和函数覆盖率均不低于 81%。`bun run 
 | `@minicode/client` | CLI/TUI 共用的持久 RPC client 与 typed Agent run controller |
 | `@minicode/cli` | `mc-ping` 健康检查与 `mc --goal` 客户端 |
 | `@minicode/tui` | `mc-tui` 交互式终端界面 |
+
+## SWE-bench Verified Mini 评测
+
+评测固定使用 `MariusHobbhahn/swe-bench-verified-mini` 的 50 个任务。首次使用先准备
+固定数据与官方 SWE-bench Python 环境：
+
+```bash
+bun run swe-bench:download
+```
+
+runner 严格串行执行，每题只 pull 当前 image，并在 Agent container 结束后使用同一
+image 创建全新的 evaluation container。单题、前 5 题和完整 50 题分别运行：
+
+```bash
+bun run swe-bench --task django__django-11790
+bun run swe-bench --limit 5 --resume
+bun run swe-bench --resume
+```
+
+首次端到端验证也可使用 `bun run swe-bench --limit 1`，它会按固定 manifest 顺序选择
+`django__django-11790`。结果保存在被 gitignore 的 `benchmark-results/verified-mini/`。
+已有正式终态可用 `--force` 重跑；若异常退出遗留了可验证归属的 Docker 资源，先运行
+`bun run swe-bench --cleanup-stale`。
+
+默认 Agent、pull、startup、evaluation 超时分别为 30 分钟、30 分钟、2 分钟、30 分钟。
+可使用 `--agent-timeout-minutes`、`--pull-timeout-minutes`、
+`--startup-timeout-seconds`、`--evaluation-timeout-minutes` 覆盖。
 
 ## 文档
 

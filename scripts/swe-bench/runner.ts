@@ -15,7 +15,7 @@ import {
 } from "./constants.ts";
 import { DockerController } from "./docker.ts";
 import { OfficialHarness } from "./official-harness.ts";
-import { runCommand } from "./process.ts";
+import { runCommand, type CommandResult } from "./process.ts";
 import type { SecretRedactor } from "./redactor.ts";
 import type {
   CleanupResult,
@@ -29,6 +29,27 @@ import type {
 interface RuntimeBinaries {
   readonly core: string;
   readonly cli: string;
+}
+
+/** 从统一 diff 中提取 test patch 涉及的安全仓库相对路径。 */
+export function testPatchPaths(patch: string): readonly string[] {
+  const paths = new Set<string>();
+  for (const line of patch.split("\n")) {
+    if (!line.startsWith("diff --git ")) continue;
+    const match = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+    if (
+      match?.[1] === undefined ||
+      match[2] === undefined ||
+      match[1] !== match[2] ||
+      match[1].startsWith("/") ||
+      match[1].split("/").includes("..")
+    ) {
+      throw new Error(`unsupported test patch path: ${line}`);
+    }
+    paths.add(match[1]);
+  }
+  if (paths.size === 0) throw new Error("test patch did not contain any file paths");
+  return [...paths];
 }
 
 /** 执行固定 Verified Mini task 的严格串行双容器流程。 */
@@ -479,6 +500,8 @@ export class SweBenchRunner {
       return { attempted: true, resolved: false, reason: "model_patch_apply_failed" };
     }
 
+    const testReset = await this.#resetTestFiles(task, containerId);
+
     const evaluation = await this.#docker.exec(
       containerId,
       ["/bin/bash", "-lc", "/bin/bash /tmp/eval.sh 2>&1"],
@@ -487,7 +510,15 @@ export class SweBenchRunner {
         workdir: "/testbed",
       },
     );
-    const rawLog = `${evaluation.stdout}${evaluation.stderr}`;
+    const rawLog = [
+      ">>>>> Applied Patch",
+      apply.stdout,
+      apply.stderr,
+      testReset.stdout,
+      testReset.stderr,
+      evaluation.stdout,
+      evaluation.stderr,
+    ].join("\n");
     await this.#store.writeTaskText(task.id, "evaluation.log", rawLog);
     if (evaluation.timedOut)
       return { attempted: true, resolved: false, reason: "evaluation_timeout" };
@@ -506,6 +537,27 @@ export class SweBenchRunner {
     } finally {
       await Bun.file(temporary).delete();
     }
+  }
+
+  /** 按官方 test-file reset 语义恢复 tracked 文件并删除 base 中不存在的新测试文件。 */
+  async #resetTestFiles(task: SweBenchTask, containerId: string): Promise<CommandResult> {
+    const paths = testPatchPaths(task.testPatch);
+    const reset = await this.#docker.exec(
+      containerId,
+      [
+        "/bin/bash",
+        "-lc",
+        'base="$1"; shift; for path in "$@"; do if git cat-file -e "$base:$path" 2>/dev/null; then git checkout "$base" -- "$path"; else rm -rf -- "$path"; fi; done',
+        "minicode-test-reset",
+        task.commit,
+        ...paths,
+      ],
+      { timeoutMs: this.#options.startupTimeoutMs, workdir: "/testbed" },
+    );
+    if (reset.exitCode !== 0) {
+      throw new Error(`official test-file reset failed: ${reset.stderr}`);
+    }
+    return reset;
   }
 
   /** 更新 crash 恢复所需的精确资源 metadata。 */

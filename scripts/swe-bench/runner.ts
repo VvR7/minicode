@@ -277,6 +277,7 @@ export class SweBenchRunner {
     const name = `minicode-swe-${role}-${task.id}-${this.#runId.slice(0, 8)}`;
     const id = await this.#docker.create(image, name, this.#runId, this.#options.startupTimeoutMs);
     await this.#docker.start(id, this.#options.startupTimeoutMs);
+    await this.#resetTestbed(id);
     const mkdirResult = await this.#docker.exec(id, ["mkdir", "-p", "/opt/minicode"], {
       timeoutMs: this.#options.startupTimeoutMs,
     });
@@ -306,6 +307,22 @@ export class SweBenchRunner {
       if (chmod.exitCode !== 0) throw new Error(`runtime chmod failed: ${chmod.stderr}`);
     }
     return id;
+  }
+
+  /** 清除 image 构建时遗留的工作树改动，确保 Agent 和 evaluation 都从 HEAD 开始。 */
+  async #resetTestbed(containerId: string): Promise<void> {
+    const reset = await this.#docker.exec(
+      containerId,
+      [
+        "/bin/bash",
+        "-lc",
+        'git reset --hard HEAD && git clean -fdx && test -z "$(git status --porcelain)"',
+      ],
+      { timeoutMs: this.#options.startupTimeoutMs, workdir: "/testbed" },
+    );
+    if (reset.exitCode !== 0) {
+      throw new Error(`testbed reset failed: ${reset.stderr}`);
+    }
   }
 
   /** 在 Agent container 内通过正常 Core 和 mc --goal 执行任务。 */

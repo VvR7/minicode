@@ -19,6 +19,8 @@ export interface Environment {
   readonly MINICODE_LOG_LEVEL?: string;
   /** 主 Agent 权限模式；子 Agent 始终使用 bypasspermission。 */
   readonly MINICODE_PERMISSION_MODE?: string;
+  /** 主 Agent 单次 run 的最大模型步骤数；可选，默认 200。 */
+  readonly MINICODE_MAX_STEPS?: string;
   readonly MINICODE_COMPACTION_ENABLED?: string;
   readonly MINICODE_COMPACTION_RESERVE_TOKENS?: string;
   readonly MINICODE_COMPACTION_KEEP_RECENT_TOKENS?: string;

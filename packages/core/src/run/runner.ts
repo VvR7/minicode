@@ -170,6 +170,8 @@ export interface AgentRunnerOptions {
   readonly permissionMode?: PermissionMode;
   readonly mcp?: McpServerManager;
   readonly environment: Environment;
+  /** 主 run 的步数上限；子 run 仍使用 profile 自身配置。 */
+  readonly mainMaxSteps?: number;
   readonly bus: EventBus;
   /** CoreConfig.homeDirectory，用于构造 run 目录、tasks.json 与 notes.md 路径。 */
   readonly homeDirectory: string;
@@ -199,12 +201,14 @@ export class AgentRunner {
   readonly #permissions: PermissionManager;
   readonly #permissionMode: PermissionMode;
   readonly #mcp: McpServerManager | undefined;
+  readonly #mainMaxSteps: number | undefined;
 
   /** 保存 run 组装所需的环境、存储、事件与可注入依赖。 */
   constructor(options: AgentRunnerOptions) {
     this.#child = options.child;
     this.#mcp = options.mcp;
     this.#environment = options.environment;
+    this.#mainMaxSteps = options.mainMaxSteps;
     this.#bus = options.bus;
     this.#homeDirectory = options.homeDirectory;
     this.#providerFactory = options.providerFactory ?? ((config) => new AnthropicAdapter(config));
@@ -305,6 +309,9 @@ export class AgentRunner {
       ...(request.history === undefined ? {} : { prefillMessages: request.history }),
       ...(request.contextEntries === undefined ? {} : { prefillEntries: request.contextEntries }),
       ...(this.#child === undefined ? {} : { maxSteps: this.#child.maxSteps }),
+      ...(this.#child === undefined && this.#mainMaxSteps !== undefined
+        ? { maxSteps: this.#mainMaxSteps }
+        : {}),
     });
     await this.#publishStarted(context);
     // 等待 RPC response 入队后才继续执行，既保证 durable start，又保持响应先于事件。
@@ -461,6 +468,7 @@ export class AgentRunner {
   ): Promise<RunCompletion> {
     const runner = new AgentRunner({
       environment: this.#environment,
+      ...(this.#mainMaxSteps === undefined ? {} : { mainMaxSteps: this.#mainMaxSteps }),
       bus: child.bus,
       homeDirectory: this.#homeDirectory,
       providerFactory: this.#providerFactory,

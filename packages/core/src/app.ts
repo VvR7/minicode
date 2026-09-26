@@ -84,6 +84,9 @@ export class CoreApp {
       homeDirectory: this.#config.homeDirectory,
       permissions,
       permissionMode: this.#config.permissionMode ?? "bypasspermission",
+      ...(this.#config.agentMaxSteps === undefined
+        ? {}
+        : { mainMaxSteps: this.#config.agentMaxSteps }),
       mcp: this.#mcp,
     });
     const manager = new SessionManager({

@@ -298,7 +298,7 @@ export class SweBenchRunner {
     const name = `minicode-swe-${role}-${task.id}-${this.#runId.slice(0, 8)}`;
     const id = await this.#docker.create(image, name, this.#runId, this.#options.startupTimeoutMs);
     await this.#docker.start(id, this.#options.startupTimeoutMs);
-    await this.#resetTestbed(id);
+    if (role === "agent") await this.#resetAgentTestbed(id);
     const mkdirResult = await this.#docker.exec(id, ["mkdir", "-p", "/opt/minicode"], {
       timeoutMs: this.#options.startupTimeoutMs,
     });
@@ -330,8 +330,8 @@ export class SweBenchRunner {
     return id;
   }
 
-  /** 清除 image 构建时遗留的工作树改动，确保 Agent 和 evaluation 都从 HEAD 开始。 */
-  async #resetTestbed(containerId: string): Promise<void> {
+  /** 清除 image 的判分 instrumentation，确保 Agent 只看到 HEAD/base commit。 */
+  async #resetAgentTestbed(containerId: string): Promise<void> {
     const reset = await this.#docker.exec(
       containerId,
       [

@@ -4,14 +4,15 @@ import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { nodeErrorCode, resolveToolPath, throwIfAborted, toFileToolError } from "../fs-safety.ts";
 import { ToolError, type Tool, type ToolExecutionContext, type ToolOutput } from "../types.ts";
+import { RUNTIME_CONFIG } from "../../runtime-config.ts";
 
-export const MAX_WRITE_BYTES = 1024 * 1024;
+export const MAX_WRITE_BYTES = RUNTIME_CONFIG.tool.writeMaxBytes;
 export const WriteParamsSchema = z.strictObject({
   path: z.string().min(1).max(4096),
   content: z
     .string()
     .refine((value) => new TextEncoder().encode(value).byteLength <= MAX_WRITE_BYTES, {
-      message: "content exceeds 1 MiB",
+      message: `content exceeds ${MAX_WRITE_BYTES} bytes`,
     }),
 });
 export type WriteParams = z.infer<typeof WriteParamsSchema>;

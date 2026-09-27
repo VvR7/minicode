@@ -303,25 +303,25 @@ test("child auto compaction checkpoint remains private and complete history surv
   }
 });
 
-test("child stops at twenty model steps and returns a failure observation", async () => {
+test("child stops at fifty model steps and returns a failure observation", async () => {
   const f = await fixture(
-    Array.from({ length: 20 }, (_, i) => ({
+    Array.from({ length: 50 }, (_, i) => ({
       response: toolResponse([toolCall(`read-${i}`, "read", { path: "missing" })]),
     })),
     '[agent]\ndescription="bounded"\nsystem_prompt="bounded"\nallowed_tools=["read"]\n',
   );
   try {
     await f.run();
-    expect(f.child.calls).toHaveLength(20);
+    expect(f.child.calls).toHaveLength(50);
     const parentObservation = JSON.stringify(f.parent.calls[1]?.messages);
     expect(parentObservation).toContain('\\"reason\\":\\"max_steps\\"');
     expect(parentObservation).toContain('\\"errorCode\\":\\"max_steps\\"');
-    expect(parentObservation).toContain('\\"steps\\":20');
+    expect(parentObservation).toContain('\\"steps\\":50');
     const { directory } = await f.childDirectory();
     expect(JSON.parse(await readFile(join(directory, "history.json"), "utf8"))).toMatchObject({
       status: "failed",
       reason: "max_steps",
-      steps: 20,
+      steps: 50,
     });
     expect(f.observed.events.find((e) => e.type === "subagent.finished")?.payload).toMatchObject({
       status: "failed",

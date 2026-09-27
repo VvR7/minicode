@@ -53,7 +53,7 @@ max_steps = 30
 
 内置 planner/reviewer 仅允许 read，返回文本计划或审核。executor 允许
 read/write/edit/bash/task_create/task_update/task_list/task_get。
-`max_steps` 可选，接受 1–100 的整数，默认 20；内置 executor 使用 40。
+`max_steps` 可选，接受 1–50 的整数，默认 50；主 Agent 单次 run 最多 200 步。
 空白名单表示没有工具；未知工具及 spawn_agent/agent_result/list_subagent 拒绝，禁止嵌套。
 白名单中的工具仍经过参数和固定安全策略，但子 Agent 默认 bypass，不产生人工审批。
 模型、工作区和规则继承父 run，不配置独立模型。

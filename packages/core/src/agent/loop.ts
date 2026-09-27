@@ -15,6 +15,7 @@ import type { CompactionConfig } from "../session/compaction-config.ts";
 import type { PreparedToolInvocation, ToolInvoker } from "../tools/invoker.ts";
 import type { ToolRegistry } from "../tools/registry.ts";
 import type { TraceRecorder } from "../trace/recorder.ts";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 import type {
   ExecutionContext,
   FailedReason,
@@ -36,11 +37,12 @@ export const DEFAULT_SYSTEM_PROMPT =
   "Simple questions and single-step reads do not require a plan.";
 
 /** 协议层 llm.text_delta 的单事件文本上限（字符数），超出时按此分段发布。 */
-const MAX_TEXT_DELTA_CHARS = 16 * 1024;
+const MAX_TEXT_DELTA_CHARS = RUNTIME_CONFIG.agent.textDeltaMaxChars;
 /** run.finished.finalText 的协议层上限（字符数）。 */
-const MAX_FINAL_TEXT_CHARS = 256 * 1024;
+const MAX_FINAL_TEXT_CHARS = RUNTIME_CONFIG.agent.finalTextMaxChars;
 /** 子 Agent 单个并行工具批次回填模型的正文总上限。 */
-export const MAX_SUBAGENT_PARALLEL_TOOL_RESULT_BYTES = 64 * 1024;
+export const MAX_SUBAGENT_PARALLEL_TOOL_RESULT_BYTES =
+  RUNTIME_CONFIG.subagent.parallelToolResultMaxBytes;
 
 type StepOutcome = "continue" | "succeeded" | "failed" | "cancelled";
 

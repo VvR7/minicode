@@ -1,7 +1,8 @@
 import type { ToolOutput } from "./types.ts";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 
-export const DEFAULT_MAX_LINES = 2000;
-export const DEFAULT_MAX_BYTES = 50 * 1024;
+export const DEFAULT_MAX_LINES = RUNTIME_CONFIG.tool.outputMaxLines;
+export const DEFAULT_MAX_BYTES = RUNTIME_CONFIG.tool.outputMaxBytes;
 
 /** 在 UTF-8 字符边界截取头部或尾部，避免产生替换字符。 */
 function sliceUtf8(text: string, maxBytes: number, direction: "head" | "tail"): string {
@@ -52,8 +53,8 @@ function truncate(
 /** read 保留前部；默认包含提示在内最多 2000 行、50 KiB。 */
 export function truncateHead(
   text: string,
-  maxLines = DEFAULT_MAX_LINES,
-  maxBytes = DEFAULT_MAX_BYTES,
+  maxLines: number = DEFAULT_MAX_LINES,
+  maxBytes: number = DEFAULT_MAX_BYTES,
 ): ToolOutput {
   return truncate(text, "head", maxLines, maxBytes, false);
 }
@@ -61,8 +62,8 @@ export function truncateHead(
 /** bash 保留尾部；可声明流式收集阶段已经丢弃了前部内容。 */
 export function truncateTail(
   text: string,
-  maxLines = DEFAULT_MAX_LINES,
-  maxBytes = DEFAULT_MAX_BYTES,
+  maxLines: number = DEFAULT_MAX_LINES,
+  maxBytes: number = DEFAULT_MAX_BYTES,
   alreadyTruncated = false,
 ): ToolOutput {
   return truncate(text, "tail", maxLines, maxBytes, alreadyTruncated);

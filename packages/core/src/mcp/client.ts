@@ -5,6 +5,7 @@ import {
   type Tool as McpToolDefinition,
 } from "@modelcontextprotocol/client";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/client/stdio";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 import type { McpServerConfig } from "./config.ts";
 
 /** 连接管理与工具适配共用的最小 SDK 门面，测试可替换本地 client。 */
@@ -24,7 +25,7 @@ export type McpClientFactory = (config: McpServerConfig, workspaceRoot: string) 
 export const createMcpClient: McpClientFactory = (config, workspaceRoot) => {
   const client = new Client(
     { name: "minicode", version: "0.1.0" },
-    { capabilities: {}, listMaxPages: Number.MAX_SAFE_INTEGER },
+    { capabilities: {}, listMaxPages: RUNTIME_CONFIG.mcp.listMaxPages },
   );
   const transport =
     config.transport === "stdio"
@@ -38,22 +39,30 @@ export const createMcpClient: McpClientFactory = (config, workspaceRoot) => {
       : new StreamableHTTPClientTransport(new URL(config.url), {
           requestInit: { headers: config.headers },
           reconnectionOptions: {
-            initialReconnectionDelay: 1000,
-            maxReconnectionDelay: 1000,
-            reconnectionDelayGrowFactor: 1,
-            maxRetries: 0,
+            initialReconnectionDelay: RUNTIME_CONFIG.mcp.reconnectDelayMs,
+            maxReconnectionDelay: RUNTIME_CONFIG.mcp.reconnectDelayMs,
+            reconnectionDelayGrowFactor: RUNTIME_CONFIG.mcp.reconnectDelayGrowFactor,
+            maxRetries: RUNTIME_CONFIG.mcp.maxReconnectAttempts,
           },
         });
   return {
     async connect(signal) {
-      await client.connect(transport, { signal, timeout: 10000 });
+      await client.connect(transport, { signal, timeout: RUNTIME_CONFIG.mcp.requestTimeoutMs });
     },
     // 官方 SDK 聚合分页；首次请求省略 cursor，避免把空串作为 opaque cursor。
     async listTools(signal) {
-      return (await client.listTools(undefined, { signal, timeout: 10000 })).tools;
+      return (
+        await client.listTools(undefined, {
+          signal,
+          timeout: RUNTIME_CONFIG.mcp.requestTimeoutMs,
+        })
+      ).tools;
     },
     async callTool(name, args, signal) {
-      return client.callTool({ name, arguments: args }, { signal, timeout: 10000 });
+      return client.callTool(
+        { name, arguments: args },
+        { signal, timeout: RUNTIME_CONFIG.mcp.requestTimeoutMs },
+      );
     },
     async close() {
       await client.close();

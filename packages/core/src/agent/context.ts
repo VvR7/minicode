@@ -4,8 +4,10 @@ import type { LlmContentPart, LlmMessage, LlmUsage } from "../llm/types.ts";
 import type { ContextEntry } from "../compact/types.ts";
 import { toProviderMessages } from "../compact/compactor.ts";
 import { defaultContextBudgetEstimator } from "../session/context-budget.ts";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 
-export const DEFAULT_MAX_STEPS = 20;
+/** @deprecated 请直接使用 RUNTIME_CONFIG.agent.maxSteps。 */
+export const DEFAULT_MAX_STEPS = RUNTIME_CONFIG.agent.maxSteps;
 
 export type RunStatus = "running" | "succeeded" | "cancelled" | "failed";
 

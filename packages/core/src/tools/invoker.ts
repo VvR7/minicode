@@ -1,6 +1,7 @@
 import type { PermissionManager } from "../permissions/manager.ts";
 import type { PermissionScope } from "../permissions/policy.ts";
 import type { PermissionMode } from "../config.ts";
+import { RUNTIME_CONFIG } from "../runtime-config.ts";
 import type { ToolRegistry } from "./registry.ts";
 import {
   DEFAULT_TOOL_MAX_ATTEMPTS,
@@ -15,7 +16,7 @@ import {
   type ToolRetry,
 } from "./types.ts";
 
-const DEFAULT_RETRY_DELAYS_MS = [2_000, 4_000] as const;
+const DEFAULT_RETRY_DELAYS_MS = RUNTIME_CONFIG.tool.retryDelaysMs;
 
 export interface ToolInvokerOptions {
   readonly permissions?: PermissionManager;
@@ -160,7 +161,10 @@ export class ToolInvoker {
     this.#permissions = options.permissions;
     this.#permissionMode = options.permissionMode ?? "alwaysask";
     this.#timeoutMs = options.timeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
-    this.#maxAttempts = Math.min(3, Math.max(1, options.maxAttempts ?? DEFAULT_TOOL_MAX_ATTEMPTS));
+    this.#maxAttempts = Math.min(
+      RUNTIME_CONFIG.tool.maxAttempts,
+      Math.max(1, options.maxAttempts ?? DEFAULT_TOOL_MAX_ATTEMPTS),
+    );
     this.#retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
   }
 
@@ -317,7 +321,9 @@ export class ToolInvoker {
           }
 
           const delayMs =
-            this.#retryDelaysMs[Math.min(attempt - 1, this.#retryDelaysMs.length - 1)] ?? 4_000;
+            this.#retryDelaysMs[Math.min(attempt - 1, this.#retryDelaysMs.length - 1)] ??
+            RUNTIME_CONFIG.tool.retryDelaysMs.at(-1) ??
+            0;
           const retry = {
             attempt: attempt + 1,
             maxAttempts: this.#maxAttempts,

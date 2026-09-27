@@ -50,7 +50,28 @@ export class DockerController {
   }
 
   /** 创建带专用 label 的休眠容器，并返回精确 container ID。 */
-  async create(image: string, name: string, runId: string, timeoutMs: number): Promise<string> {
+  async create(
+    image: string,
+    name: string,
+    runId: string,
+    timeoutMs: number,
+    enableEvaluationProxy = false,
+  ): Promise<string> {
+    const proxyArgs =
+      enableEvaluationProxy && usesHostProxy()
+        ? [
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "--env",
+            "HTTP_PROXY=http://host.docker.internal:7890",
+            "--env",
+            "HTTPS_PROXY=http://host.docker.internal:7890",
+            "--env",
+            "http_proxy=http://host.docker.internal:7890",
+            "--env",
+            "https_proxy=http://host.docker.internal:7890",
+          ]
+        : [];
     const result = await runCommand(
       [
         "docker",
@@ -61,6 +82,7 @@ export class DockerController {
         `${BENCHMARK_LABEL}=${BENCHMARK_LABEL_VALUE}`,
         "--label",
         `dev.minicode.swe-bench.run=${runId}`,
+        ...proxyArgs,
         image,
         "sleep",
         "infinity",

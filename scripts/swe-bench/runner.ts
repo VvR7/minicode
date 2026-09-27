@@ -294,9 +294,19 @@ export class SweBenchRunner {
   }
 
   /** 创建、启动 task container，并把 standalone runtime 注入固定路径。 */
-  async #createContainer(task: SweBenchTask, image: string, role: string): Promise<string> {
+  async #createContainer(
+    task: SweBenchTask,
+    image: string,
+    role: "agent" | "evaluation",
+  ): Promise<string> {
     const name = `minicode-swe-${role}-${task.id}-${this.#runId.slice(0, 8)}`;
-    const id = await this.#docker.create(image, name, this.#runId, this.#options.startupTimeoutMs);
+    const id = await this.#docker.create(
+      image,
+      name,
+      this.#runId,
+      this.#options.startupTimeoutMs,
+      role === "evaluation",
+    );
     await this.#docker.start(id, this.#options.startupTimeoutMs);
     if (role === "agent") await this.#resetAgentTestbed(id);
     const mkdirResult = await this.#docker.exec(id, ["mkdir", "-p", "/opt/minicode"], {

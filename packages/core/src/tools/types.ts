@@ -1,13 +1,12 @@
 import type { PermissionSource, ToolFailureCategory } from "@minicode/protocol";
 import type { z } from "zod";
-import { RUNTIME_CONFIG } from "../runtime-config.ts";
 
 /** 单个工具结果的内容上限，超出部分截断并标记 truncated。 */
-export const MAX_TOOL_RESULT_BYTES = RUNTIME_CONFIG.tool.resultMaxBytes;
+export const MAX_TOOL_RESULT_BYTES = 256 * 1024;
 /** 工具调用的默认超时毫秒数。 */
-export const DEFAULT_TOOL_TIMEOUT_MS = RUNTIME_CONFIG.tool.timeoutMs;
+export const DEFAULT_TOOL_TIMEOUT_MS = 10_000;
 /** 工具调用的默认最大尝试次数。 */
-export const DEFAULT_TOOL_MAX_ATTEMPTS = RUNTIME_CONFIG.tool.maxAttempts;
+export const DEFAULT_TOOL_MAX_ATTEMPTS = 3;
 
 /** 单个工具参与模型回复批次时的调度模式；省略时按 parallel 处理。 */
 export type ToolExecuteMode = "serial" | "parallel";

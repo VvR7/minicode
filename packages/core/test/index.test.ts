@@ -7,6 +7,5 @@ describe("core public exports", () => {
     expect(core.CoreApp).toBeDefined();
     expect(core.createRpcDispatcher).toBeDefined();
     expect(core.NdjsonRpcServer).toBeDefined();
-    expect(core.RUNTIME_CONFIG.agent.maxSteps).toBe(200);
   });
 });

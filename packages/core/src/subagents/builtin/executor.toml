@@ -2,3 +2,4 @@
 description = "执行独立编码任务，可修改文件、运行命令并管理自己的任务图"
 system_prompt = "你是执行专家。根据父 Agent 明确提供的目标与上下文完成独立任务，验证结果并返回改动、测试和限制。任务图仅属于你的执行，不共享父 Agent 的任务状态。"
 allowed_tools = ["read", "write", "edit", "bash", "task_create", "task_update", "task_list", "task_get"]
+max_steps = 40

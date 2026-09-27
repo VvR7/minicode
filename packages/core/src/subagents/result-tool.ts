@@ -1,7 +1,6 @@
 import { z } from "zod";
 import type { RunId, SessionId } from "@minicode/protocol";
 import { RunIdSchema } from "@minicode/protocol";
-import { RUNTIME_CONFIG } from "../runtime-config.ts";
 import type { Tool } from "../tools/types.ts";
 import type { SubagentRegistry } from "./registry.ts";
 export const AgentResultParamsSchema = z.strictObject({
@@ -23,7 +22,7 @@ export function createAgentResultTool(
     inputSchema: AgentResultParamsSchema,
     /** 显式等待不应用普通工具时限，仍接受父取消。 */
     timeoutMs(params) {
-      return params.wait ? null : RUNTIME_CONFIG.tool.timeoutMs;
+      return params.wait ? null : 10000;
     },
     /** 查询终态后只在对应 tool_result 中交付一次结果。 */
     execute(params, context) {

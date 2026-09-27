@@ -3,7 +3,6 @@ import { isAbsolute, join } from "node:path";
 import type { CoreEndpoint, Environment } from "@minicode/protocol";
 import { ConfigurationError, parseCoreEndpoint } from "@minicode/protocol";
 import { z } from "zod";
-import { RUNTIME_CONFIG } from "./runtime-config.ts";
 
 export const LogLevelSchema = z.enum(["debug", "info", "warn", "error"]);
 export type LogLevel = z.infer<typeof LogLevelSchema>;
@@ -22,7 +21,7 @@ export interface CoreConfig extends CoreEndpoint {
 /** 解析主 Agent 步数上限，保持旧环境未配置时的 200 步默认值。 */
 export function parseAgentMaxSteps(environment: Environment): number {
   const raw = environment.MINICODE_MAX_STEPS;
-  if (raw === undefined || raw === "") return RUNTIME_CONFIG.agent.maxSteps;
+  if (raw === undefined || raw === "") return 200;
   if (!/^\d+$/.test(raw)) {
     throw new ConfigurationError("invalid MINICODE_MAX_STEPS (expected a positive integer)");
   }

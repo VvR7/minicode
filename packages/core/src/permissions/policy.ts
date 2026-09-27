@@ -1,7 +1,6 @@
 import { redact } from "../trace/redact.ts";
 import type { PermissionRequestSummary } from "@minicode/protocol";
 import { classifyBashCommand, type BashPolicyResult } from "../tools/bash-policy.ts";
-import { RUNTIME_CONFIG } from "../runtime-config.ts";
 
 /** 仅对已通过工具 schema 校验的参数做纯策略判断，不访问缓存或文件系统。 */
 export function evaluatePermission(name: string, params: unknown): BashPolicyResult {
@@ -39,7 +38,7 @@ export function permissionSummary(name: string, params: unknown): PermissionRequ
     return {
       kind: "bash",
       command: data.command,
-      timeoutSeconds: data.timeout ?? RUNTIME_CONFIG.tool.bashTimeoutSeconds,
+      timeoutSeconds: data.timeout ?? 120,
     };
   }
   const path = data.path;

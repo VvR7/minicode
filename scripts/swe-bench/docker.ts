@@ -70,6 +70,10 @@ export class DockerController {
             "http_proxy=http://host.docker.internal:7890",
             "--env",
             "https_proxy=http://host.docker.internal:7890",
+            "--env",
+            "NO_PROXY=127.0.0.1,localhost,::1",
+            "--env",
+            "no_proxy=127.0.0.1,localhost,::1",
           ]
         : [];
     const result = await runCommand(

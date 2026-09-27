@@ -209,7 +209,14 @@ export class DockerController {
   /** 列出所有带 benchmark 专用 label 的遗留容器 ID。 */
   async labeledContainers(): Promise<readonly string[]> {
     const result = await runCommand(
-      ["docker", "ps", "-aq", "--filter", `label=${BENCHMARK_LABEL}=${BENCHMARK_LABEL_VALUE}`],
+      [
+        "docker",
+        "ps",
+        "-aq",
+        "--no-trunc",
+        "--filter",
+        `label=${BENCHMARK_LABEL}=${BENCHMARK_LABEL_VALUE}`,
+      ],
       { timeoutMs: 10_000 },
     );
     if (result.exitCode !== 0)

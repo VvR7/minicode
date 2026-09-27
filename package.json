@@ -18,6 +18,8 @@
     "ping": "bun run packages/cli/src/bin.ts",
     "protocol:docs": "bun run packages/protocol/scripts/generate-wire-protocol.ts",
     "protocol:docs:check": "bun run packages/protocol/scripts/generate-wire-protocol.ts --check",
+    "swe-bench": "bun run scripts/swe-bench.ts",
+    "swe-bench:download": "bash scripts/download-swe-mini.sh",
     "test": "bun test packages scripts tests/integration",
     "test:coverage": "bun test packages scripts tests/integration --coverage",
     "test:integration": "bun test tests/integration",

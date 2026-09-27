@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { ConfigurationError } from "@minicode/protocol";
 
-import { loadCoreConfig } from "../src/config.ts";
+import { loadCoreConfig, parseAgentMaxSteps } from "../src/config.ts";
 
 describe("core configuration", () => {
   test("uses default log level", () => {
@@ -32,5 +32,14 @@ describe("core configuration", () => {
       "/var/tmp/minicode",
     );
     expect(() => loadCoreConfig({ MINICODE_HOME: "relative/path" })).toThrow(ConfigurationError);
+  });
+
+  test("loads a configurable main agent step limit", () => {
+    expect(parseAgentMaxSteps({})).toBe(200);
+    expect(parseAgentMaxSteps({ MINICODE_MAX_STEPS: "1000" })).toBe(1000);
+    expect(() => parseAgentMaxSteps({ MINICODE_MAX_STEPS: "0" })).toThrow(ConfigurationError);
+    expect(() => parseAgentMaxSteps({ MINICODE_MAX_STEPS: "unlimited" })).toThrow(
+      ConfigurationError,
+    );
   });
 });

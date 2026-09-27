@@ -9,6 +9,8 @@ bun-error.log*
 dist/
 coverage/
 *.tsbuildinfo
+benchmark-results/
+.cache/swe-bench/
 
 # Local runtime state
 .minicode/

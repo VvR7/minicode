@@ -1,0 +1,31 @@
+{
+  "id": "sphinx-doc__sphinx-8475",
+  "repo": "sphinx-doc/sphinx",
+  "commit": "3ea1ec84cc610f7a9f4f6b354e264565254923ff",
+  "prompt": "Extend linkchecker GET fallback logic to handle Too Many Redirects\nSubject: linkcheck - fallback to GET requests when HEAD requests returns Too Many Redirects\r\n\r\n### Feature or Bugfix\r\n\r\n- Bugfix\r\n\r\n### Purpose\r\n\r\nSome websites will enter infinite redirect loops with HEAD requests. In this case, the GET fallback is ignored as the exception is of type `TooManyRedirects` and the link is reported as broken.\r\nThis extends the except clause to retry with a GET request for such scenarios.\r\n\r\n### Detail\r\n\r\nClassifying this as a bug fix as URLs like https://idr.openmicroscopy.org/webclient/?show=well-119093 used to pass the linkchecking prior to Sphinx 3.2.0 but are now failing as HEAD requests have been enforced (#7936).\r\n\r\n/cc @mtbc @jburel @manics @joshmoore\r\n\n",
+  "testPatch": "diff --git a/tests/test_build_linkcheck.py b/tests/test_build_linkcheck.py\n--- a/tests/test_build_linkcheck.py\n+++ b/tests/test_build_linkcheck.py\n@@ -382,3 +382,31 @@ def test_connect_to_selfsigned_nonexistent_cert_file(app):\n         \"uri\": \"https://localhost:7777/\",\n         \"info\": \"Could not find a suitable TLS CA certificate bundle, invalid path: does/not/exist\",\n     }\n+\n+\n+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)\n+def test_TooManyRedirects_on_HEAD(app):\n+    class InfiniteRedirectOnHeadHandler(http.server.BaseHTTPRequestHandler):\n+        def do_HEAD(self):\n+            self.send_response(302, \"Found\")\n+            self.send_header(\"Location\", \"http://localhost:7777/\")\n+            self.end_headers()\n+\n+        def do_GET(self):\n+            self.send_response(200, \"OK\")\n+            self.end_headers()\n+            self.wfile.write(b\"ok\\n\")\n+\n+    with http_server(InfiniteRedirectOnHeadHandler):\n+        app.builder.build_all()\n+\n+    with open(app.outdir / 'output.json') as fp:\n+        content = json.load(fp)\n+    assert content == {\n+        \"code\": 0,\n+        \"status\": \"working\",\n+        \"filename\": \"index.rst\",\n+        \"lineno\": 1,\n+        \"uri\": \"http://localhost:7777/\",\n+        \"info\": \"\",\n+    }\n",
+  "failToPass": ["tests/test_build_linkcheck.py::test_TooManyRedirects_on_HEAD"],
+  "passToPass": [
+    "tests/test_build_linkcheck.py::test_defaults",
+    "tests/test_build_linkcheck.py::test_defaults_json",
+    "tests/test_build_linkcheck.py::test_anchors_ignored",
+    "tests/test_build_linkcheck.py::test_raises_for_invalid_status",
+    "tests/test_build_linkcheck.py::test_auth_header_uses_first_match",
+    "tests/test_build_linkcheck.py::test_auth_header_no_match",
+    "tests/test_build_linkcheck.py::test_linkcheck_request_headers",
+    "tests/test_build_linkcheck.py::test_linkcheck_request_headers_no_slash",
+    "tests/test_build_linkcheck.py::test_linkcheck_request_headers_default",
+    "tests/test_build_linkcheck.py::test_follows_redirects_on_HEAD",
+    "tests/test_build_linkcheck.py::test_follows_redirects_on_GET",
+    "tests/test_build_linkcheck.py::test_invalid_ssl",
+    "tests/test_build_linkcheck.py::test_connect_to_selfsigned_fails",
+    "tests/test_build_linkcheck.py::test_connect_to_selfsigned_with_tls_verify_false",
+    "tests/test_build_linkcheck.py::test_connect_to_selfsigned_with_tls_cacerts",
+    "tests/test_build_linkcheck.py::test_connect_to_selfsigned_with_requests_env_var",
+    "tests/test_build_linkcheck.py::test_connect_to_selfsigned_nonexistent_cert_file"
+  ],
+  "version": "3.4",
+  "evalScript": "#!/bin/bash\nset -uxo pipefail\nsource /opt/miniconda3/bin/activate\nconda activate testbed\ncd /testbed\ngit config --global --add safe.directory /testbed\ncd /testbed\ngit status\ngit show\ngit -c core.fileMode=false diff 3ea1ec84cc610f7a9f4f6b354e264565254923ff\nsource /opt/miniconda3/bin/activate\nconda activate testbed\npython -m pip install -e .[test]\ngit checkout 3ea1ec84cc610f7a9f4f6b354e264565254923ff tests/test_build_linkcheck.py\ngit apply -v - <<'EOF_114329324912'\ndiff --git a/tests/test_build_linkcheck.py b/tests/test_build_linkcheck.py\n--- a/tests/test_build_linkcheck.py\n+++ b/tests/test_build_linkcheck.py\n@@ -382,3 +382,31 @@ def test_connect_to_selfsigned_nonexistent_cert_file(app):\n         \"uri\": \"https://localhost:7777/\",\n         \"info\": \"Could not find a suitable TLS CA certificate bundle, invalid path: does/not/exist\",\n     }\n+\n+\n+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)\n+def test_TooManyRedirects_on_HEAD(app):\n+    class InfiniteRedirectOnHeadHandler(http.server.BaseHTTPRequestHandler):\n+        def do_HEAD(self):\n+            self.send_response(302, \"Found\")\n+            self.send_header(\"Location\", \"http://localhost:7777/\")\n+            self.end_headers()\n+\n+        def do_GET(self):\n+            self.send_response(200, \"OK\")\n+            self.end_headers()\n+            self.wfile.write(b\"ok\\n\")\n+\n+    with http_server(InfiniteRedirectOnHeadHandler):\n+        app.builder.build_all()\n+\n+    with open(app.outdir / 'output.json') as fp:\n+        content = json.load(fp)\n+    assert content == {\n+        \"code\": 0,\n+        \"status\": \"working\",\n+        \"filename\": \"index.rst\",\n+        \"lineno\": 1,\n+        \"uri\": \"http://localhost:7777/\",\n+        \"info\": \"\",\n+    }\n\nEOF_114329324912\n: '>>>>> Start Test Output'\ntox --current-env -epy39 -v -- tests/test_build_linkcheck.py\n: '>>>>> End Test Output'\ngit checkout 3ea1ec84cc610f7a9f4f6b354e264565254923ff tests/test_build_linkcheck.py\n",
+  "logParser": "parse_log_sphinx",
+  "evalType": "pass_and_fail"
+}
